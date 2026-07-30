@@ -99,10 +99,17 @@ SERVER_ERROR_MAX_RETRIES = 3
 SERVER_ERROR_RETRY_DELAY = 2  # seconds
 
 
+def _estimate_context_tokens(messages: list) -> int:
+    """Rough token estimate (~4 chars/token) of the current message list."""
+    chars = sum(len(str(msg.get('content') or '')) for msg in messages)
+    return chars // 4
+
+
 def run_turn(messages: list) -> str:
     server_error_retries = 0
     while True:
         print('...')
+        print(f'[info] estimated context size: ~{_estimate_context_tokens(messages)} tokens')
         try:
             response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS)
         except ResponseError as e:
