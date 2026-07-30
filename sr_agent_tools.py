@@ -29,3 +29,19 @@ def fetch_url(url: str) -> str:
         return result.stdout
     except Exception as e:
         return f'error: {e}'
+
+
+def install_package(package: str) -> str:
+    try:
+        result = subprocess.run(['apt-get', 'install', '-y', package], capture_output=True, text=True, check=True)
+        return result.stdout
+    except Exception as e:
+        return f'error: {e}'
+
+
+def update_package_list() -> str:
+    try:
+        result = subprocess.run(['apt-get', 'update'], capture_output=True, text=True, check=True)
+        return result.stdout
+    except Exception as e:
+        return f'error: {e}'

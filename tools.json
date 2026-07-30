@@ -71,5 +71,27 @@
         "required": ["url"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "install_package",
+      "description": "Install a package via apt-get (apt-get install -y <package>).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "package": {"type": "string", "description": "The apt package name to install, e.g. jq"}
+        },
+        "required": ["package"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_package_list",
+      "description": "Refresh the apt package index (apt-get update). Run this before installing a package if it might not be found.",
+      "parameters": {"type": "object", "properties": {}}
+    }
   }
 ]

@@ -55,6 +55,8 @@ TOOLS = {
     'read_file': sr_agent_tools.read_file,
     'write_file': sr_agent_tools.write_file,
     'fetch_url': sr_agent_tools.fetch_url,
+    'install_package': sr_agent_tools.install_package,
+    'update_package_list': sr_agent_tools.update_package_list,
 }
 
 with open(TOOLS_FILE) as f:
