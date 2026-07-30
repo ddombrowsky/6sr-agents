@@ -81,6 +81,20 @@ def get_current_time() -> str:
     return datetime.now().isoformat()
 
 
+def exec(command: str) -> str:
+    try:
+        result = subprocess.run(
+            ['/bin/sh', '-c', command],
+            capture_output=True, text=True,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode != 0:
+            output += f'\n[exit code {result.returncode}]'
+        return output
+    except Exception as e:
+        return f'error: {e}'
+
+
 TOOLS = {
     'calculate': calculate,
     'get_current_time': get_current_time,
@@ -90,4 +104,5 @@ TOOLS = {
     'fetch_url': fetch_url,
     'install_package': install_package,
     'update_package_list': update_package_list,
+    'exec': exec,
 }

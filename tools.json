@@ -93,5 +93,19 @@
       "description": "Refresh the apt package index (apt-get update). Run this before installing a package if it might not be found.",
       "parameters": {"type": "object", "properties": {}}
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "exec",
+      "description": "Execute a shell command via `/bin/sh -c <command>` and return its combined stdout/stderr. Use for anything not covered by a more specific tool (e.g. process management, piping, shell built-ins). Not sandboxed beyond the container itself, so avoid destructive commands.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "The shell command to run, e.g. \"ls -la /opt\""}
+        },
+        "required": ["command"]
+      }
+    }
   }
 ]
