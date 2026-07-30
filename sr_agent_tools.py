@@ -21,3 +21,11 @@ def write_file(path: str, content: str) -> str:
         return f'wrote {len(content)} bytes to {path}'
     except Exception as e:
         return f'error: {e}'
+
+
+def fetch_url(url: str) -> str:
+    try:
+        result = subprocess.run(['curl', '-sL', url], capture_output=True, text=True, check=True)
+        return result.stdout
+    except Exception as e:
+        return f'error: {e}'

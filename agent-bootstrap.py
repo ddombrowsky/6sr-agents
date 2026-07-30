@@ -54,6 +54,7 @@ TOOLS = {
     'get_uptime': sr_agent_tools.get_uptime,
     'read_file': sr_agent_tools.read_file,
     'write_file': sr_agent_tools.write_file,
+    'fetch_url': sr_agent_tools.fetch_url,
 }
 
 with open(TOOLS_FILE) as f:
