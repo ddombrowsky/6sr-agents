@@ -3,6 +3,7 @@ import json
 import operator
 import os
 import re
+import time
 from datetime import datetime
 
 from ollama import Client, ResponseError
@@ -110,15 +111,31 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
     return True
 
 
+SERVER_ERROR_MAX_RETRIES = 3
+SERVER_ERROR_RETRY_DELAY = 2  # seconds
+
+
 def run_turn(messages: list) -> str:
+    server_error_retries = 0
     while True:
         print('...')
         try:
             response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS)
         except ResponseError as e:
-            if 'prompt too long' in str(e).lower() and _truncate_messages(messages, str(e)):
+            error_text = str(e)
+            if 'prompt too long' in error_text.lower() and _truncate_messages(messages, error_text):
+                server_error_retries = 0
+                continue
+            if e.status_code >= 500:
+                server_error_retries += 1
+                if server_error_retries > SERVER_ERROR_MAX_RETRIES:
+                    print(f'[warning] server error persisted after {SERVER_ERROR_MAX_RETRIES} retries, giving up on this turn: {error_text}')
+                    return f'[error: server returned "{error_text}" after {SERVER_ERROR_MAX_RETRIES} retries — try again]'
+                print(f'[warning] server error ({error_text}); retrying in {SERVER_ERROR_RETRY_DELAY}s ({server_error_retries}/{SERVER_ERROR_MAX_RETRIES})...')
+                time.sleep(SERVER_ERROR_RETRY_DELAY)
                 continue
             raise
+        server_error_retries = 0
         message = response['message']
         messages.append(message)
 
