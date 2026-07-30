@@ -9,6 +9,7 @@ from ollama import Client
 import sr_agent_tools
 
 MODEL = 'gpt-oss:120b-cloud'
+#MODEL = 'qwen3.5'
 TOOLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools.json')
 
 client = Client(
@@ -51,6 +52,8 @@ TOOLS = {
     'calculate': calculate,
     'get_current_time': get_current_time,
     'get_uptime': sr_agent_tools.get_uptime,
+    'read_file': sr_agent_tools.read_file,
+    'write_file': sr_agent_tools.write_file,
 }
 
 with open(TOOLS_FILE) as f:
