@@ -2,9 +2,10 @@ import ast
 import json
 import operator
 import os
+import re
 from datetime import datetime
 
-from ollama import Client
+from ollama import Client, ResponseError
 
 import sr_agent_tools
 
@@ -66,14 +67,58 @@ with open(TOOLS_FILE) as f:
 def dispatch(tool_call) -> dict:
     name = tool_call['function']['name']
     args = tool_call['function']['arguments']
+    print(f'  -> {name}({", ".join(f"{k}={v!r}" for k, v in args.items())})')
     fn = TOOLS.get(name)
     result = fn(**args) if fn else f'error: unknown tool {name}'
-    return {'role': 'tool', 'name': name, 'content': str(result)}
+    result = str(result)
+    shown = result if len(result) <= 200 else result[:200] + '...'
+    print(f'  <- {shown}')
+    return {'role': 'tool', 'name': name, 'content': result}
+
+
+_OVERFLOW_RE = re.compile(r'exceeded max context length by (\d+) tokens')
+
+
+def _truncate_messages(messages: list, error_text: str) -> bool:
+    """Drop the oldest non-system messages to shrink the prompt.
+
+    Keeps the system message (if any) and the most recent message (the one
+    that triggered this turn) intact. Returns False if there's nothing left
+    to drop.
+    """
+    keep_from = 1 if messages and messages[0].get('role') == 'system' else 0
+    droppable = len(messages) - 1 - keep_from  # never drop the last message
+    if droppable <= 0:
+        return False
+
+    match = _OVERFLOW_RE.search(error_text)
+    if match:
+        # ~4 chars/token, with a margin since this is a rough estimate.
+        target_chars = int(match.group(1)) * 4 * 1.2
+        removed_chars = 0
+        removed = 0
+        for msg in messages[keep_from:keep_from + droppable]:
+            removed_chars += len(str(msg.get('content') or ''))
+            removed += 1
+            if removed_chars >= target_chars:
+                break
+    else:
+        removed = max(1, droppable // 2)
+
+    del messages[keep_from:keep_from + removed]
+    print(f'[warning] prompt too long; dropped {removed} older message(s) and retrying')
+    return True
 
 
 def run_turn(messages: list) -> str:
     while True:
-        response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS)
+        print('...')
+        try:
+            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS)
+        except ResponseError as e:
+            if 'prompt too long' in str(e).lower() and _truncate_messages(messages, str(e)):
+                continue
+            raise
         message = response['message']
         messages.append(message)
 
