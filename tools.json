@@ -1,0 +1,24 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "calculate",
+      "description": "Evaluate a basic arithmetic expression (+, -, *, /, **)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {"type": "string", "description": "e.g. (3 + 4) * 2"}
+        },
+        "required": ["expression"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_current_time",
+      "description": "Get the current local date and time",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  }
+]

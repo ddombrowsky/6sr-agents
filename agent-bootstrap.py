@@ -1,4 +1,5 @@
 import ast
+import json
 import operator
 import os
 from datetime import datetime
@@ -6,6 +7,7 @@ from datetime import datetime
 from ollama import Client
 
 MODEL = 'gpt-oss:120b-cloud'
+TOOLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools.json')
 
 client = Client(
     host="http://127.0.0.1:11434",
@@ -48,30 +50,8 @@ TOOLS = {
     'get_current_time': get_current_time,
 }
 
-TOOL_SCHEMAS = [
-    {
-        'type': 'function',
-        'function': {
-            'name': 'calculate',
-            'description': 'Evaluate a basic arithmetic expression (+, -, *, /, **)',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'expression': {'type': 'string', 'description': 'e.g. (3 + 4) * 2'},
-                },
-                'required': ['expression'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'get_current_time',
-            'description': 'Get the current local date and time',
-            'parameters': {'type': 'object', 'properties': {}},
-        },
-    },
-]
+with open(TOOLS_FILE) as f:
+    TOOL_SCHEMAS = json.load(f)
 
 
 def dispatch(tool_call) -> dict:
