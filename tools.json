@@ -25,7 +25,7 @@
     "type": "function",
     "function": {
       "name": "get_uptime",
-      "description": "Get the current system uptime, as reported by the uptime(1) utility",
+      "description": "Report system uptime, logged-in user count, and the 1/5/15-minute load averages. Use for any question about system load, how busy the machine is, or how long it has been running.",
       "parameters": {"type": "object", "properties": {}}
     }
   }
