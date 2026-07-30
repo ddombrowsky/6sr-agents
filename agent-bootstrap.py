@@ -13,7 +13,7 @@ MODEL = 'gpt-oss:120b-cloud'
 TOOLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools.json')
 
 client = Client(
-    host="http://127.0.0.1:11434",
+    host="http://172.17.0.1:11434",
     headers={'Authorization': 'Bearer ' + os.environ.get('OLLAMA_API_KEY')}
 )
 
