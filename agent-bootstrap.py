@@ -167,12 +167,19 @@ def main():
             )
         }]
     print("Agent ready. Type 'exit' to quit.")
+    continue_forever=False
     while True:
-        user_input = input('> ')
+        if continue_forever:
+            user_input = 'You are in control.  Continue.'
+        else:
+            user_input = input('> ')
         if not user_input.strip():
             continue
         if user_input.strip().lower() in ('exit', 'quit'):
             break
+        if user_input.strip().lower() == 'continue_forever':
+            user_input = 'continue task'
+            continue_forever = True
         messages.append({'role': 'user', 'content': user_input})
         reply = run_turn(messages)
         print(reply)
