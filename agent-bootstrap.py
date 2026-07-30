@@ -58,7 +58,13 @@ def dispatch(tool_call) -> dict:
     args = tool_call['function']['arguments']
     print(f'  -> {name}({", ".join(f"{k}={v!r}" for k, v in args.items())})')
     fn = TOOLS.get(name)
-    result = fn(**args) if fn else f'error: unknown tool {name}'
+    if not fn:
+        result = f'error: unknown tool {name}'
+    else:
+        try:
+            result = fn(**args)
+        except Exception as e:
+            result = f'error: {type(e).__name__}: {e}'
     result = str(result)
     shown = result if len(result) <= 200 else result[:200] + '...'
     print(f'  <- {shown}')
