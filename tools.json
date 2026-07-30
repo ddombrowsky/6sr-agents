@@ -20,5 +20,13 @@
       "description": "Get the current local date and time",
       "parameters": {"type": "object", "properties": {}}
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_uptime",
+      "description": "Get the current system uptime, as reported by the uptime(1) utility",
+      "parameters": {"type": "object", "properties": {}}
+    }
   }
 ]

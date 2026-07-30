@@ -6,6 +6,8 @@ from datetime import datetime
 
 from ollama import Client
 
+import sr_agent_tools
+
 MODEL = 'gpt-oss:120b-cloud'
 TOOLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools.json')
 
@@ -48,6 +50,7 @@ def get_current_time() -> str:
 TOOLS = {
     'calculate': calculate,
     'get_current_time': get_current_time,
+    'get_uptime': sr_agent_tools.get_uptime,
 }
 
 with open(TOOLS_FILE) as f:

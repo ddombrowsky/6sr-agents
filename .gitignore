@@ -1,3 +1,4 @@
 env.sh
 venv
 v
+__pycache__
