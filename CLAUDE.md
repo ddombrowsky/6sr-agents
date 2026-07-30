@@ -33,10 +33,12 @@ python agent-bootstrap.py
 
 `create.sh` starts a detached `ubuntu` container (`docker run -d --name agenttest
 --volume ./v:/opt ubuntu sleep infinity`) with the `v/` directory bind-mounted to
-`/opt`. `v/` is gitignored and holds a working copy of the agent scripts for
-execution/testing inside that container, separate from the tracked root copies —
-expect it to drift from the root scripts (e.g. it's missing the `get_uptime` tool)
-and don't try to keep the two in sync automatically.
+`/opt`. `v/` is gitignored; `v/agents/` holds a working copy of the agent scripts for
+execution/testing inside that container, refreshed from the root copies by `copy.sh`
+(which backs up the previous copy into `v/agents/bak.<random>/` first) — don't assume
+it's in sync unless `copy.sh` has been run recently. `v/` has since grown well beyond
+a script mirror into a separate multi-repo trading-agent system (`master_agent/`,
+`template_repo/`, `tools/`, `trades/`); see `v/CLAUDE.md` for that.
 
 ## Architecture: tool-calling loop
 
