@@ -89,6 +89,8 @@ def main():
     print("Agent ready. Type 'exit' to quit.")
     while True:
         user_input = input('> ')
+        if not user_input.strip():
+            continue
         if user_input.strip().lower() in ('exit', 'quit'):
             break
         messages.append({'role': 'user', 'content': user_input})
