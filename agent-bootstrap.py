@@ -8,8 +8,12 @@ from ollama import Client, ResponseError
 
 import sr_agent_tools
 
-MODEL = 'gpt-oss:120b-cloud'
-#MODEL = 'qwen3.5'
+MODEL_NICKNAMES = {
+    'gpt': 'gpt-oss:120b-cloud',
+    'qwen': 'qwen3.5',
+    'buck': 'wonderful_buck_321/sixsr',
+}
+MODEL = MODEL_NICKNAMES['gpt']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
@@ -139,6 +143,25 @@ def run_turn(messages: list) -> str:
             _reexec_if_tools_changed(messages)
 
 
+def _handle_model_command(user_input: str) -> bool:
+    """If user_input is a `/model <nickname>` command, apply it and return True."""
+    global MODEL
+    parts = user_input.strip().split()
+    if not parts or parts[0] != '/model':
+        return False
+    if len(parts) != 2:
+        print(f'usage: /model <nickname>  (available: {", ".join(MODEL_NICKNAMES)})')
+        return True
+    nickname = parts[1]
+    model = MODEL_NICKNAMES.get(nickname)
+    if model is None:
+        print(f'[error] unknown model nickname {nickname!r} (available: {", ".join(MODEL_NICKNAMES)})')
+        return True
+    MODEL = model
+    print(f'[info] switched model to {nickname!r} ({MODEL})')
+    return True
+
+
 def main():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -177,6 +200,8 @@ def main():
             continue
         if user_input.strip().lower() in ('exit', 'quit'):
             break
+        if _handle_model_command(user_input):
+            continue
         if user_input.strip().lower() == 'continue_forever':
             user_input = 'continue task'
             continue_forever = True
