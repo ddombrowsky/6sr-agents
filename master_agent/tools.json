@@ -1,0 +1,111 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "calculate",
+      "description": "Evaluate a basic arithmetic expression (+, -, *, /, **)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {"type": "string", "description": "e.g. (3 + 4) * 2"}
+        },
+        "required": ["expression"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_current_time",
+      "description": "Get the current local date and time",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_uptime",
+      "description": "Report system uptime, logged-in user count, and the 1/5/15-minute load averages. Use for any question about system load, how busy the machine is, or how long it has been running.",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read and return the full contents of a file at the given path.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Absolute or relative path to the file to read"}
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "Write content to a file at the given path, creating it if it doesn't exist and overwriting it if it does.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Absolute or relative path to the file to write"},
+          "content": {"type": "string", "description": "Text content to write to the file"}
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "fetch_url",
+      "description": "Fetch the contents of a URL via curl (follows redirects) and return the response body.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {"type": "string", "description": "The URL to fetch, e.g. https://example.com"}
+        },
+        "required": ["url"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "install_package",
+      "description": "Install a package via apt-get (apt-get install -y <package>).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "package": {"type": "string", "description": "The apt package name to install, e.g. jq"}
+        },
+        "required": ["package"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_package_list",
+      "description": "Refresh the apt package index (apt-get update). Run this before installing a package if it might not be found.",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "exec",
+      "description": "Execute a shell command via `/bin/sh -c <command>` and return its combined stdout/stderr. Use for anything not covered by a more specific tool (e.g. process management, piping, shell built-ins). Not sandboxed beyond the container itself, so avoid destructive commands.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "The shell command to run, e.g. \"ls -la /opt\""}
+        },
+        "required": ["command"]
+      }
+    }
+  }
+]
