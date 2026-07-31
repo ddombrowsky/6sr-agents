@@ -168,6 +168,33 @@ def _handle_model_command(user_input: str) -> bool:
     return True
 
 
+def _process_turn(messages: list, user_input: str) -> None:
+    if not user_input.strip():
+        return
+    if _handle_model_command(user_input):
+        return
+    messages.append({'role': 'user', 'content': user_input})
+    reply = run_turn(messages)
+    print(reply)
+
+
+def _read_piped_turn() -> str:
+    """Collapse all of piped stdin into a single turn's content.
+
+    emperor.sh (and similar callers) pipe a whole multi-line document as one
+    coherent prompt, followed by a trailing `exit`/`quit` line so the REPL
+    terminates afterward. Looping on input() would instead split that
+    document into one turn per line, so non-interactive stdin is read in one
+    shot here instead.
+    """
+    lines = sys.stdin.read().splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].strip().lower() in ('exit', 'quit'):
+        lines.pop()
+    return '\n'.join(lines).strip()
+
+
 def main():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -196,17 +223,19 @@ def main():
             )
         }]
     print("Agent ready. Type 'exit' to quit.")
+
+    if not sys.stdin.isatty():
+        _process_turn(messages, _read_piped_turn())
+        return
+
     while True:
-        user_input = input('> ')
-        if not user_input.strip():
-            continue
+        try:
+            user_input = input('> ')
+        except EOFError:
+            break
         if user_input.strip().lower() in ('exit', 'quit'):
             break
-        if _handle_model_command(user_input):
-            continue
-        messages.append({'role': 'user', 'content': user_input})
-        reply = run_turn(messages)
-        print(reply)
+        _process_turn(messages, user_input)
 
 
 if __name__ == '__main__':
