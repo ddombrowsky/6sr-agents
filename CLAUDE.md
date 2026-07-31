@@ -10,8 +10,8 @@ test suite, or linter — it's a handful of standalone scripts.
 
 ## Setup and running
 
-Dependencies live in `venv` (already created; no `requirements.txt` — installed
-packages are `ollama`, `httpx`, `pydantic`, etc.). Activate it before running scripts:
+Dependencies live in `venv` (already created; versions pinned in `requirements.txt`:
+`ollama`, `httpx`, `pydantic`, `requests`). Activate it before running scripts:
 
 ```
 source venv/bin/activate
@@ -35,10 +35,18 @@ python agent-bootstrap.py
 --volume ./v:/opt ubuntu sleep infinity`) with the `v/` directory bind-mounted to
 `/opt`. `v/` is gitignored; `v/agents/` holds a working copy of the agent scripts for
 execution/testing inside that container, refreshed from the root copies by `copy.sh`
-(which backs up the previous copy into `v/agents/bak.<random>/` first) — don't assume
-it's in sync unless `copy.sh` has been run recently. `v/` has since grown well beyond
-a script mirror into a separate multi-repo trading-agent system (`master_agent/`,
+(which copies `requirements.txt`, `agent-bootstrap.py`, `sr_agent_tools.py`, and
+`tools.json`, backing up the previous copy into `v/agents/bak.<random>/` first) — don't
+assume it's in sync unless `copy.sh` has been run recently. `v/` has since grown well
+beyond a script mirror into a separate multi-repo trading-agent system (`master_agent/`,
 `template_repo/`, `tools/`, `trades/`); see `v/CLAUDE.md` for that.
+
+The top-level `master_agent/`, `template_repo/`, and `tools/` directories in *this* repo
+(not `v/`) are a git-tracked, point-in-time snapshot of their `v/` counterparts, added in
+one commit for reference/backup. They are not kept in sync automatically — the live
+versions are the ones under `v/`, which are separate repos that get rewritten by the
+self-modifying agent while the container runs. Don't edit the root-level copies expecting
+it to affect a running system, and don't assume they reflect current behavior.
 
 ## Architecture: tool-calling loop
 
