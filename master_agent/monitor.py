@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Monitor script for XLM paper trading strategies.
 Runs an infinite loop checking strategy performance every hour.
-It stops the two worst performing strategies, clones the two best strategies with
-slightly tweaked thresholds, and starts the new clones.
+Every cycle it ranks *all* known strategies (running or stopped) by net worth,
+stops anything ranked below KEEP_TOP_N, clones the top two with slightly
+tweaked/revised thresholds, and makes sure the new clones plus the rest of the
+top N are running.
 """
 import json
 import os
@@ -19,6 +21,7 @@ STRATEGIES_DIR = Path('/opt/strategies')
 TEMPLATE_REPO = 'file:///opt/template_repo'
 MASTER_AGENT_SCRIPT = Path('/opt/master_agent/master-agent.py')
 REVISION_TIMEOUT = 6000 # seconds allotted for the LLM to revise a clone before falling back
+KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycle
 
 def load_state():
     if STATE_FILE.exists():
@@ -136,22 +139,27 @@ def run():
         print('Strategy performances (net worth USD):')
         for name, net in performances:
             print(f'  {name}: {net:.2f}')
-        # Stop worst two (if they are running)
-        worst_two = performances[-2:]
-        for name, _ in worst_two:
+        # Stop everything ranked below KEEP_TOP_N (no-op if already
+        # stopped). Re-derived from full-population rank every cycle, so a
+        # stopped strategy can't get stuck occupying a "cull" slot forever the
+        # way a fixed "worst two" window could.
+        for name, _ in performances[KEEP_TOP_N:]:
             info = state.get(name)
             if info and info.get('status') == 'running':
-                print(f'Stopping worst strategy {name}')
+                print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'stop', name])
-        # Clone best two and hand each clone to the master agent to revise before starting
-        best_two = performances[:2]
+
+        # Clone the top two and hand each clone to the master agent to revise
+        top_two = performances[:2]
         leaderboard = json.dumps({n: net for n, net in performances})
-        for name, net in best_two:
+        new_clone_names = []
+        for name, net in top_two:
             # create a new unique name (not derived from the parent's name, so it
             # doesn't keep growing across generations of clones-of-clones)
             new_name = f"clone_{uuid.uuid4().hex[:12]}"
             print(f'Cloning best strategy {name} as {new_name}')
             subprocess.run(['/opt/strat_manager.py', 'clone', new_name, TEMPLATE_REPO])
+            new_clone_names.append(new_name)
             parent_cfg = Path(state[name]['path']) / 'config.json'
             new_cfg = Path(STRATEGIES_DIR) / new_name / 'config.json'
 
@@ -175,8 +183,18 @@ def run():
                 print(f'Falling back to random tweak for {new_name}')
                 apply_random_tweak(parent_cfg, new_cfg, new_name)
 
-            # start the new clone
+        # Start the new clones, plus any top-N strategy that's currently stopped
+        # (reload state first since strat_manager.py clone/stop wrote to disk)
+        for new_name in new_clone_names:
             subprocess.run(['/opt/strat_manager.py', 'start', new_name])
+
+        fresh_state = load_state()
+        for name, _ in performances[:KEEP_TOP_N]:
+            info = fresh_state.get(name)
+            if info and info.get('status') == 'stopped':
+                print(f'Restarting top-{KEEP_TOP_N} strategy that was stopped: {name}')
+                subprocess.run(['/opt/strat_manager.py', 'start', name])
+
         # Wait an hour before next cycle
         print('Sleeping for 1 hour...')
         time.sleep(3600)

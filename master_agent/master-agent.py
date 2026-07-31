@@ -101,8 +101,8 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
     return True
 
 
-SERVER_ERROR_MAX_RETRIES = 3
-SERVER_ERROR_RETRY_DELAY = 2  # seconds
+SERVER_ERROR_MAX_RETRIES = 10
+SERVER_ERROR_RETRY_DELAY = 10  # seconds
 
 
 def _estimate_context_tokens(messages: list) -> int:
