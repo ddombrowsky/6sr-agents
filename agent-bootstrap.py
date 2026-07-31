@@ -13,7 +13,7 @@ MODEL_NICKNAMES = {
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
 }
-MODEL = MODEL_NICKNAMES['gpt']
+MODEL = MODEL_NICKNAMES['qwen']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
@@ -196,21 +196,14 @@ def main():
             )
         }]
     print("Agent ready. Type 'exit' to quit.")
-    continue_forever=False
     while True:
-        if continue_forever:
-            user_input = 'You are in control.  Continue.'
-        else:
-            user_input = input('> ')
+        user_input = input('> ')
         if not user_input.strip():
             continue
         if user_input.strip().lower() in ('exit', 'quit'):
             break
         if _handle_model_command(user_input):
             continue
-        if user_input.strip().lower() == 'continue_forever':
-            user_input = 'continue task'
-            continue_forever = True
         messages.append({'role': 'user', 'content': user_input})
         reply = run_turn(messages)
         print(reply)
