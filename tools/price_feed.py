@@ -1,19 +1,84 @@
 #!/usr/bin/env python3
-"""Simple price feed for Stellar (XLM) using CoinGecko API.
+"""Price feed for Stellar (XLM), USD.
 Provides a single function ``get_price()`` returning the current USD price as a float.
-Rate limiting: CoinGecko free tier allows 50 calls/minute; callers should space out requests.
+
+Tries multiple keyless sources in order and returns the first that succeeds, so a
+single API outage/rate-limit doesn't take down the trading loop. Each source has its
+own response shape, so each gets its own small parser.
+
+Note: Reflector Network (reflector.network) was considered but isn't used here — it's
+an on-chain Soroban oracle, not a REST API. Querying it needs the `stellar-sdk`
+dependency plus a verified mainnet oracle contract address, neither of which this
+sandbox has confirmed; hardcoding an unverified contract address would risk silently
+feeding bad prices into a live trading system.
 """
 import requests
 
-_API_URL = "https://api.coingecko.com/api/v3/simple/price"
-_PARAMS = {"ids": "stellar", "vs_currencies": "usd"}
+_TIMEOUT = 10
+
+
+def _from_coingecko():
+    resp = requests.get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={"ids": "stellar", "vs_currencies": "usd"},
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return float(resp.json()["stellar"]["usd"])
+
+
+def _from_coinbase():
+    resp = requests.get("https://api.coinbase.com/v2/prices/XLM-USD/spot", timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return float(resp.json()["data"]["amount"])
+
+
+def _from_kraken():
+    resp = requests.get(
+        "https://api.kraken.com/0/public/Ticker",
+        params={"pair": "XLMUSD"},
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+    result = data["result"]
+    pair_data = next(iter(result.values()))
+    return float(pair_data["c"][0])  # last trade closeout price
+
+
+def _from_bitstamp():
+    resp = requests.get("https://www.bitstamp.net/api/v2/ticker/xlmusd/", timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return float(resp.json()["last"])
+
+
+def _from_binance():
+    resp = requests.get(
+        "https://api.binance.com/api/v3/ticker/price",
+        params={"symbol": "XLMUSDT"},
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return float(resp.json()["price"])
+
+
+# Order matters: earlier sources are preferred, later ones are fallbacks.
+_SOURCES = [
+    ("coingecko", _from_coingecko),
+    ("coinbase", _from_coinbase),
+    ("kraken", _from_kraken),
+    ("bitstamp", _from_bitstamp),
+    ("binance", _from_binance),
+]
+
 
 def get_price():
-    try:
-        resp = requests.get(_API_URL, params=_PARAMS, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return float(data["stellar"]["usd"])
-    except Exception as e:
-        print(f"[price_feed] error fetching price: {e}")
-        return None
+    for name, fetch in _SOURCES:
+        try:
+            return fetch()
+        except Exception as e:
+            print(f"[price_feed] {name} error: {e}")
+    print("[price_feed] all sources failed")
+    return None
