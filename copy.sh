@@ -8,7 +8,8 @@ if [ "$1" == "--to" ] ; then
     cp -v requirements.txt agent-bootstrap.py sr_agent_tools.py \
         tools.json ./v/agents/
 else
-    cp -v ./v/master_agent/* ./master_agent/
-    cp -v ./v/tools/* ./tools/
-    cp -v ./v/template_repo/* ./template_repo/
+    cp -v ./v/agents/* ./ 2>/dev/null
+    cp -v ./v/master_agent/* ./master_agent/ 2>/dev/null
+    cp -v ./v/tools/* ./tools/ 2>/dev/null
+    cp -v ./v/template_repo/* ./template_repo/ 2>/dev/null
 fi
