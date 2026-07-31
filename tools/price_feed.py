@@ -6,11 +6,6 @@ Tries multiple keyless sources in order and returns the first that succeeds, so 
 single API outage/rate-limit doesn't take down the trading loop. Each source has its
 own response shape, so each gets its own small parser.
 
-Note: Reflector Network (reflector.network) was considered but isn't used here — it's
-an on-chain Soroban oracle, not a REST API. Querying it needs the `stellar-sdk`
-dependency plus a verified mainnet oracle contract address, neither of which this
-sandbox has confirmed; hardcoding an unverified contract address would risk silently
-feeding bad prices into a live trading system.
 """
 import requests
 
@@ -66,8 +61,8 @@ def _from_binance():
 
 # Order matters: earlier sources are preferred, later ones are fallbacks.
 _SOURCES = [
-    ("coingecko", _from_coingecko),
     ("coinbase", _from_coinbase),
+    ("coingecko", _from_coingecko),
     ("kraken", _from_kraken),
     ("bitstamp", _from_bitstamp),
     ("binance", _from_binance),
