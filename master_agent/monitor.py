@@ -11,13 +11,14 @@ import sys
 import time
 import datetime
 import random
+import uuid
 from pathlib import Path
 
 STATE_FILE = Path('/opt/strategy_state.json')
 STRATEGIES_DIR = Path('/opt/strategies')
 TEMPLATE_REPO = 'file:///opt/template_repo'
 MASTER_AGENT_SCRIPT = Path('/opt/master_agent/master-agent.py')
-REVISION_TIMEOUT = 600  # seconds allotted for the LLM to revise a clone before falling back
+REVISION_TIMEOUT = 6000 # seconds allotted for the LLM to revise a clone before falling back
 
 def load_state():
     if STATE_FILE.exists():
@@ -83,7 +84,7 @@ def bootstrap_initial_strategies(price, count=2):
             try:
                 result = subprocess.run(
                     ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
-                     name, name, '1000.0', '{}'],
+                     name, name, '1000.0', '{}', str(price)],
                     capture_output=True, text=True, timeout=REVISION_TIMEOUT,
                 )
                 if result.returncode == 0:
@@ -146,9 +147,9 @@ def run():
         best_two = performances[:2]
         leaderboard = json.dumps({n: net for n, net in performances})
         for name, net in best_two:
-            # create a new unique name
-            timestamp = int(time.time())
-            new_name = f"{name}_clone_{timestamp}"
+            # create a new unique name (not derived from the parent's name, so it
+            # doesn't keep growing across generations of clones-of-clones)
+            new_name = f"clone_{uuid.uuid4().hex[:12]}"
             print(f'Cloning best strategy {name} as {new_name}')
             subprocess.run(['/opt/strat_manager.py', 'clone', new_name, TEMPLATE_REPO])
             parent_cfg = Path(state[name]['path']) / 'config.json'
@@ -159,7 +160,7 @@ def run():
                 try:
                     result = subprocess.run(
                         ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
-                         new_name, name, str(net), leaderboard],
+                         new_name, name, str(net), leaderboard, str(price)],
                         capture_output=True, text=True, timeout=REVISION_TIMEOUT,
                     )
                     if result.returncode == 0:

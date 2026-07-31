@@ -14,15 +14,15 @@ MODEL_NICKNAMES = {
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
 }
-MODEL = MODEL_NICKNAMES['qwen']
+MODEL = MODEL_NICKNAMES['gpt']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
-STATE_FILE = os.path.join(os.path.dirname(SELF_FILE), '.agent-state.json')
 
 STRATEGIES_DIR = Path('/opt/strategies')
 TRADES_DIR = Path('/opt/trades')
-REVISION_HISTORY_FILE = os.path.join(os.path.dirname(SELF_FILE), '.strategy-revision-history.json')
+REVISION_HISTORY_FILENAME = '.strategy-revision-history.json'
+REVISION_HISTORY_MAX_MESSAGES = 5
 
 client = Client(
     host="http://172.17.0.1:11434",
@@ -47,15 +47,6 @@ def _watched_mtimes() -> dict:
 
 
 _STARTUP_MTIMES = _watched_mtimes()
-
-
-def _reexec_if_tools_changed(messages: list) -> None:
-    if _watched_mtimes() == _STARTUP_MTIMES:
-        return
-    print('[info] tools.json or sr_agent_tools.py changed on disk; re-executing to reload them...')
-    with open(STATE_FILE, 'w') as f:
-        json.dump(messages, f)
-    os.execv(sys.executable, [sys.executable, SELF_FILE])
 
 
 def dispatch(tool_call) -> dict:
@@ -143,6 +134,8 @@ def run_turn(messages: list) -> str:
             raise
         server_error_retries = 0
         message = response['message']
+        if hasattr(message, 'model_dump'):
+            message = message.model_dump(exclude_none=True)
         messages.append(message)
 
         tool_calls = message.get('tool_calls')
@@ -151,7 +144,6 @@ def run_turn(messages: list) -> str:
 
         for call in tool_calls:
             messages.append(dispatch(call))
-            _reexec_if_tools_changed(messages)
 
 
 def _handle_model_command(user_input: str) -> bool:
@@ -180,6 +172,29 @@ REVISION_SYSTEM_PROMPT = (
     "the clone's directory and may change anything about it: config.json thresholds, "
     "main.py's trading logic, or add new files entirely. Use what you know about how this "
     'strategy and its ancestors have performed to decide what to change and why.\n\n'
+    "Do not default to only nudging buy_below/sell_above. Threshold tweaks are the "
+    "weakest lever available to you -- treat them as a last resort, not the first move. "
+    "/opt/tools has indicator modules you can import from a strategy's main.py: "
+    'ema_sma.py / ema_sma_complete.py (EMA/SMA crossovers), rsi.py (RSI), '
+    'moving_averages.py, price_history_fetcher.py (cached historical prices to compute '
+    'over), and reflector_oracle.py (an alternate on-chain price source, unwired -- '
+    "reads Reflector's Soroban oracle via the `stellar` CLI). None of these are wired "
+    "into template_repo's main.py yet. Prefer changes like: wiring in an indicator to "
+    'gate or size trades, adding a stop-loss/take-profit rule, changing position sizing '
+    'or order cadence, combining signals, or trying a structurally different strategy '
+    "shape -- something that would show up as a real diff in main.py, not just its "
+    'config.json numbers. Look at the leaderboard and this strategy lineage\'s revision '
+    'history (recent messages below, if any) to avoid repeating a variant that a sibling '
+    'clone already tried.\n\n'
+    'Every revision prompt includes the real current XLM/USD price, freshly fetched by '
+    'monitor.py right before invoking you. Treat that number as ground truth and set '
+    'buy_below/sell_above relative to it -- do NOT rely on your own training-data notion '
+    "of what XLM \"typically\" costs; that knowledge may be stale or wrong, and thresholds "
+    'set far away from the real current price will simply never trigger a trade (or will '
+    "trigger on every single tick). If you ever need to double check the price yourself "
+    '(e.g. to look at recent history or trend, not just the single spot value you were '
+    "given), you have `exec` (curl, or run /opt/tools/price_feed.py) and `fetch_url` -- "
+    'use them rather than guessing.\n\n'
     'When you are done, you MUST commit your changes on a new git branch inside the '
     "strategy's own directory (e.g. `git checkout -b auto/<timestamp>` then `git add -A "
     '&& git commit -m ...`) so the revision is tracked -- an unmodified or uncommitted '
@@ -196,6 +211,14 @@ def _read_json(path, default=None):
         return default
 
 
+def _read_text(path) -> str:
+    try:
+        with open(path) as f:
+            return f.read()
+    except Exception:
+        return '(could not read file)'
+
+
 def _tail_lines(path, n=20) -> str:
     try:
         with open(path) as f:
@@ -204,20 +227,28 @@ def _tail_lines(path, n=20) -> str:
         return '(no trade log yet)'
 
 
-def _load_revision_history() -> list:
-    if os.path.exists(REVISION_HISTORY_FILE):
-        with open(REVISION_HISTORY_FILE) as f:
+def _load_revision_history(strategy_path: Path) -> list:
+    history_file = strategy_path / REVISION_HISTORY_FILENAME
+    if history_file.exists():
+        with open(history_file) as f:
             return json.load(f)
     return [{'role': 'system', 'content': REVISION_SYSTEM_PROMPT}]
 
 
-def _save_revision_history(messages: list) -> None:
-    with open(REVISION_HISTORY_FILE, 'w') as f:
-        json.dump(messages, f)
+def _save_revision_history(strategy_path: Path, messages: list) -> None:
+    """Persist history to the strategy's own directory, capped to the last
+    REVISION_HISTORY_MAX_MESSAGES messages (plus the leading system message,
+    if present) so it doesn't grow unbounded across revision cycles.
+    """
+    keep_from = 1 if messages and messages[0].get('role') == 'system' else 0
+    trimmed = messages[:keep_from] + messages[keep_from:][-REVISION_HISTORY_MAX_MESSAGES:]
+    history_file = strategy_path / REVISION_HISTORY_FILENAME
+    with open(history_file, 'w') as f:
+        json.dump(trimmed, f)
 
 
 def revise_strategy(strategy_name: str, parent_name: str, parent_net_worth: str = '',
-                     leaderboard_json: str = '{}') -> None:
+                     leaderboard_json: str = '{}', current_price: str = '') -> None:
     """One-shot entry point invoked by monitor.py's tweak stage.
 
     Hands a freshly-cloned, not-yet-started strategy directory to the LLM with full
@@ -229,49 +260,57 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_net_worth: str 
     parent_config = _read_json(parent_path / 'config.json', {})
     parent_state = _read_json(parent_path / 'state.json', {})
     trade_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
+    clone_main_py = _read_text(strategy_path / 'main.py')
     try:
         leaderboard = json.loads(leaderboard_json)
     except Exception:
         leaderboard = {}
 
+    price_line = (
+        f'Current XLM/USD price (fetched from CoinGecko by monitor.py moments ago, '
+        f'this is ground truth -- not a historical or typical price): ${current_price}\n'
+        if current_price else
+        'Current XLM/USD price: NOT PROVIDED for this cycle -- fetch it yourself '
+        '(exec curl, or /opt/tools/price_feed.py) before setting any thresholds.\n'
+    )
+
     prompt = (
         f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
         f'`{strategy_path}` (a git checkout of the strategy code). It has not started '
         f'trading yet.\n\n'
+        f'{price_line}'
         f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
         f"Parent `{parent_name}`'s current state.json: {json.dumps(parent_state)}\n"
         f"Parent `{parent_name}`'s net worth this cycle: {parent_net_worth}\n"
         f"Parent `{parent_name}`'s most recent trades:\n{trade_tail}\n\n"
+        f"The clone's main.py (identical to the parent's right now -- this is what you'd "
+        f"edit to change trading logic, not just config.json):\n```python\n{clone_main_py}\n```\n\n"
         f'Current leaderboard (strategy name -> net worth USD, all strategies currently '
         f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
         f'Revise the clone at `{strategy_path}` however you think will improve on its '
-        f'parent, then commit your changes to a new git branch inside that directory.'
+        f'parent, then commit your changes to a new git branch inside that directory. '
+        f'Any buy_below/sell_above you set must be anchored to the current price above, '
+        f'not to an assumed or remembered price level.'
     )
 
-    messages = _load_revision_history()
+    messages = _load_revision_history(strategy_path)
     messages.append({'role': 'user', 'content': prompt})
     reply = run_turn(messages)
-    _save_revision_history(messages)
+    _save_revision_history(strategy_path, messages)
     print(reply)
 
 
 def main():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            messages = json.load(f)
-        os.remove(STATE_FILE)
-        print('[info] reloaded tools; conversation resumed.')
-    else:
-        messages = [{
-            'role': 'system',
-            'content': (
-                'You are a monitoring agent.  Your job is to monitor the trading bots '
-                'that are successful, and update the strategies to optimize income. '
-                'You can use any tool at your disposal, including fetching information '
-                'from the internet to predict price movement.  You may update yourself '
-                'as well.'
-            )
-        }]
+    messages = [{
+          'role': 'system',
+          'content': (
+              'You are a monitoring agent.  Your job is to monitor the trading bots '
+              'that are successful, and update the strategies to optimize income. '
+              'You can use any tool at your disposal, including fetching information '
+              'from the internet to predict price movement.  You may update yourself '
+              'as well.'
+          )
+    }]
     print("Agent ready. Type 'exit' to quit.")
     while True:
         user_input = input('> ')

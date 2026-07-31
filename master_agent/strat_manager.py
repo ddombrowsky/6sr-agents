@@ -27,6 +27,19 @@ def clone_strategy(name, repo_url):
         return
     subprocess.check_call(['git', 'clone', repo_url, str(target)])
     print(f"Cloned strategy '{name}' into {target}")
+    # The cloned config.json still carries the source repo's "name" (e.g. the
+    # template's "template_agent"), which main.py uses as the trade-log
+    # filename. Rewrite it to the clone's own name immediately so trades never
+    # collide with the parent's or a sibling clone's log file, regardless of
+    # whether a later revision step (LLM or random tweak) also touches it.
+    cfg_path = target / 'config.json'
+    if cfg_path.exists():
+        try:
+            cfg = json.load(cfg_path.open())
+            cfg['name'] = name
+            json.dump(cfg, cfg_path.open('w'), indent=2)
+        except Exception as e:
+            print(f"Warning: could not update config.json name for '{name}': {e}")
     state = load_state()
     state[name] = {'path': str(target), 'pid': None, 'status': 'stopped'}
     save_state(state)
