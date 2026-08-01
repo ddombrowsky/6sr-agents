@@ -48,6 +48,25 @@ def compute_strategy_score(strategy_name, state_entry, price):
         return -float('inf')
     return score
 
+def _config_is_sane(cfg, price):
+    # Guards against a revision that "succeeds" (subprocess returncode 0) but
+    # leaves the clone dead-on-arrival: unset/inverted thresholds never
+    # trade, and thresholds set implausibly far from the real fetched price
+    # (e.g. a stale training-data price assumption slipping through despite
+    # being told the ground truth) will functionally never trade either.
+    try:
+        buy_below = float(cfg['buy_below'])
+        sell_above = float(cfg['sell_above'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if buy_below <= 0 or sell_above <= 0:
+        return False
+    if buy_below >= sell_above:
+        return False
+    if price and (buy_below < price * 0.5 or sell_above > price * 1.5):
+        return False
+    return True
+
 def apply_seed_thresholds(cfg_path, name, price):
     # Used only for bootstrapping: the template's config.json ships with
     # buy_below=sell_above=0.0, which never trades and can't be nudged by
@@ -93,6 +112,12 @@ def bootstrap_initial_strategies(price, count=2):
                     print(f'Master agent revision failed for {name}: {result.stderr.strip()}')
             except Exception as e:
                 print(f'Master agent revision errored for {name}: {e}')
+
+        if revised and cfg_path.exists():
+            cfg = json.load(open(cfg_path))
+            if not _config_is_sane(cfg, price):
+                print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
+                revised = False
 
         if not revised and cfg_path.exists():
             print(f'Falling back to seeded thresholds for {name}')
@@ -172,6 +197,12 @@ def run():
             print('Could not fetch price, skipping this cycle')
             time.sleep(3600)
             continue
+
+        # Correct any strategy left with a stale 'running' status from a
+        # crash between cycles (nothing else ever notices this), so the
+        # restart-self-heal loop below can pick it back up if it's top-N.
+        subprocess.run(['/opt/strat_manager.py', 'reconcile'])
+
         state = load_state()
         if not state:
             bootstrap_initial_strategies(price)
@@ -236,6 +267,12 @@ def run():
                         print(f'Master agent revision failed for {new_name}: {result.stderr.strip()}')
                 except Exception as e:
                     print(f'Master agent revision errored for {new_name}: {e}')
+
+            if revised and new_cfg.exists():
+                cfg = json.load(open(new_cfg))
+                if not _config_is_sane(cfg, price):
+                    print(f'Revised config for {new_name} failed sanity check ({cfg}); treating as unrevised')
+                    revised = False
 
             if not revised and parent_cfg.exists() and new_cfg.exists():
                 print(f'Falling back to random tweak for {new_name}')

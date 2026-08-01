@@ -174,14 +174,23 @@ REVISION_SYSTEM_PROMPT = (
     'strategy and its ancestors have performed to decide what to change and why.\n\n'
     "Do not default to only nudging buy_below/sell_above. Threshold tweaks are the "
     "weakest lever available to you -- treat them as a last resort, not the first move. "
-    "/opt/tools has indicator modules you can import from a strategy's main.py: "
-    'ema_sma.py / ema_sma_complete.py (EMA/SMA crossovers), rsi.py (RSI), '
-    'moving_averages.py, price_history_fetcher.py (cached historical prices to compute '
-    'over), and reflector_oracle.py (an alternate on-chain price source, unwired -- '
-    "reads Reflector's Soroban oracle via the `stellar` CLI). None of these are wired "
-    "into template_repo's main.py yet. Prefer changes like: wiring in an indicator to "
-    'gate or size trades, adding a stop-loss/take-profit rule, changing position sizing '
-    'or order cadence, combining signals, or trying a structurally different strategy '
+    "/opt/tools has indicator and signal modules you can import from a strategy's "
+    "main.py, all working (fixed/added by a recent emperor pass, so trust them rather "
+    "than re-deriving your own): ema_sma.py (SMA, `sma(prices, period)`), "
+    'moving_averages.py (EMA, `exponential_moving_average(prices, period)`), rsi.py '
+    '(`rsi(prices, period)`), price_history_fetcher.py (`get_price_samples(lookback_cycles)` '
+    '-- a shared, cached price history so you don\'t need to build your own rolling '
+    'buffer or hit the price APIs directly), news_feed.py (`get_headlines()` / '
+    '`sentiment_score()` -- keyword-heuristic bullish/bearish scoring from recent crypto '
+    'news, a coarse but genuinely different signal from price alone), and '
+    "reflector_oracle.py (an alternate on-chain price source -- now wired as a fallback "
+    "inside price_feed.py itself, so you don't need to call it directly unless you "
+    'specifically want to cross-check the DEX-oracle price against the CEX-aggregate '
+    'one). None of the indicator/signal modules are wired into template_repo\'s main.py '
+    'by default -- that wiring is exactly the kind of change you should be making. Prefer '
+    'changes like: wiring in an indicator or the news sentiment score to gate or size '
+    'trades, adding a stop-loss/take-profit rule, changing position sizing or order '
+    'cadence, combining multiple signals, or trying a structurally different strategy '
     "shape -- something that would show up as a real diff in main.py, not just its "
     'config.json numbers. Look at the leaderboard and this strategy lineage\'s revision '
     'history (recent messages below, if any) to avoid repeating a variant that a sibling '

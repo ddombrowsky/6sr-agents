@@ -46,12 +46,43 @@ def clone_strategy(name, repo_url):
     state[name] = {'path': str(target), 'pid': None, 'status': 'stopped'}
     save_state(state)
 
+def _is_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone else -- still alive.
+        return True
+
+def reconcile_state():
+    # A strategy that crashes (as opposed to being stopped via stop_strategy)
+    # leaves state.json saying status='running' with a now-dead pid forever,
+    # since nothing else ever rewrites that entry. monitor.py's self-heal
+    # loop only restarts entries explicitly marked 'stopped', so a crashed
+    # strategy would otherwise never be noticed or restarted. Call this once
+    # per cycle to correct any such stale entries before ranking/restarting.
+    state = load_state()
+    changed = False
+    for name, info in state.items():
+        if info.get('status') == 'running' and not _is_alive(info.get('pid')):
+            print(f"Strategy '{name}' has a dead pid ({info.get('pid')}); marking stopped.")
+            info['pid'] = None
+            info['status'] = 'stopped'
+            changed = True
+    if changed:
+        save_state(state)
+    return state
+
 def start_strategy(name, command=None):
     state = load_state()
     if name not in state:
         print(f"Strategy '{name}' not known. Clone it first.")
         return
-    if state[name].get('pid'):
+    if state[name].get('pid') and _is_alive(state[name]['pid']):
         print(f"Strategy '{name}' already running (pid {state[name]['pid']}).")
         return
     strategy_path = Path(state[name]['path'])
@@ -118,6 +149,7 @@ def usage():
     print("  start <name> [cmd]         Start strategy (optional custom command)")
     print("  stop <name>                Stop running strategy")
     print("  list                       List known strategies and status")
+    print("  reconcile                  Fix state entries stuck 'running' with a dead pid")
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
@@ -135,6 +167,8 @@ if __name__ == '__main__':
         stop_strategy(sys.argv[2])
     elif cmd == 'list':
         list_strategies()
+    elif cmd == 'reconcile':
+        reconcile_state()
     else:
         usage()
         sys.exit(1)

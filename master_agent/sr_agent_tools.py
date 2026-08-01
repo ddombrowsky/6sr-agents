@@ -28,24 +28,30 @@ def write_file(path: str, content: str) -> str:
 
 def fetch_url(url: str) -> str:
     try:
-        result = subprocess.run(['curl', '-sL', url], capture_output=True, text=True, check=True)
+        result = subprocess.run(['curl', '-sL', url], capture_output=True, text=True, check=True, timeout=20)
         return result.stdout
+    except subprocess.TimeoutExpired:
+        return 'error: timed out after 20s'
     except Exception as e:
         return f'error: {e}'
 
 
 def install_package(package: str) -> str:
     try:
-        result = subprocess.run(['apt-get', 'install', '-y', package], capture_output=True, text=True, check=True)
+        result = subprocess.run(['apt-get', 'install', '-y', package], capture_output=True, text=True, check=True, timeout=300)
         return result.stdout
+    except subprocess.TimeoutExpired:
+        return 'error: timed out after 300s'
     except Exception as e:
         return f'error: {e}'
 
 
 def update_package_list() -> str:
     try:
-        result = subprocess.run(['apt-get', 'update'], capture_output=True, text=True, check=True)
+        result = subprocess.run(['apt-get', 'update'], capture_output=True, text=True, check=True, timeout=300)
         return result.stdout
+    except subprocess.TimeoutExpired:
+        return 'error: timed out after 300s'
     except Exception as e:
         return f'error: {e}'
 
@@ -85,12 +91,14 @@ def exec(command: str) -> str:
     try:
         result = subprocess.run(
             ['/bin/sh', '-c', command],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=120,
         )
         output = result.stdout + result.stderr
         if result.returncode != 0:
             output += f'\n[exit code {result.returncode}]'
         return output
+    except subprocess.TimeoutExpired:
+        return 'error: timed out after 120s'
     except Exception as e:
         return f'error: {e}'
 

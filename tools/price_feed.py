@@ -59,6 +59,18 @@ def _from_binance():
     return float(resp.json()["price"])
 
 
+def _from_reflector():
+    # On-chain Soroban oracle, not subject to the centralized-exchange REST
+    # rate limits above. Slower (~20s CLI subprocess call, 5-min tick
+    # resolution) so it's kept last: a fallback for when all REST sources
+    # are simultaneously rate-limited/down, not a primary source.
+    import reflector_oracle
+    price = reflector_oracle.get_price()
+    if price is None:
+        raise RuntimeError("reflector oracle returned no price")
+    return price
+
+
 # Order matters: earlier sources are preferred, later ones are fallbacks.
 _SOURCES = [
     ("coinbase", _from_coinbase),
@@ -66,6 +78,7 @@ _SOURCES = [
     ("kraken", _from_kraken),
     ("bitstamp", _from_bitstamp),
     ("binance", _from_binance),
+    ("reflector", _from_reflector),
 ]
 
 
