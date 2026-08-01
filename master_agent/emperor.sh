@@ -64,10 +64,11 @@ Your job, using your read_file/write_file/exec tools:
    to any of those four files that would improve the system. Use write_file to
    apply them. If nothing meaningfully needs to change, it's fine to make no
    edits.
-3. If you changed anything, commit it inside /opt/master_agent (it is its own
-   git repo) e.g. via exec:
+3. If any new utility scripts are needed, add them to the /opt/tools directory.
+4. If you changed master_agent scripts, commit it inside /opt/master_agent
+   (it is its own git repo) e.g. via exec:
      cd /opt/master_agent && git add -A && git commit -m "..."
-4. Finally, update /opt/SYSTEM_STATE.md: read it first, then revise it in
+5. Finally, update /opt/SYSTEM_STATE.md: read it first, then revise it in
    place to reflect the current system state (don't just replace it with an
    unrelated fresh draft -- preserve continuity across emperor runs). Write
    concise bullet points rather than long run-on paragraphs. Use write_file to
