@@ -202,6 +202,11 @@ def run():
         # crash between cycles (nothing else ever notices this), so the
         # restart-self-heal loop below can pick it back up if it's top-N.
         subprocess.run(['/opt/strat_manager.py', 'reconcile'])
+        # Drop clones that were cloned but never actually started (e.g. monitor.py
+        # got killed mid-cycle between the clone and start steps) -- these can
+        # never be scored and would otherwise print "Error reading state" and
+        # sort to -inf every cycle forever.
+        subprocess.run(['/opt/strat_manager.py', 'prune'])
 
         state = load_state()
         if not state:

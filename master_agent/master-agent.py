@@ -196,11 +196,15 @@ REVISION_SYSTEM_PROMPT = (
     '-- a shared, cached price history so you don\'t need to build your own rolling '
     'buffer or hit the price APIs directly), news_feed.py (`get_headlines()` / '
     '`sentiment_score()` -- keyword-heuristic bullish/bearish scoring from recent crypto '
-    'news, a coarse but genuinely different signal from price alone), and '
+    'news, a coarse but genuinely different signal from price alone), '
     "reflector_oracle.py (an alternate on-chain price source -- now wired as a fallback "
     "inside price_feed.py itself, so you don't need to call it directly unless you "
     'specifically want to cross-check the DEX-oracle price against the CEX-aggregate '
-    'one). None of the indicator/signal modules are wired into template_repo\'s main.py '
+    "one), and orderbook_depth.py (`get_orderbook_metrics()` -- live XLM/USDC order "
+    'book from the Stellar DEX: best bid/ask, spread, and USD depth/imbalance on each '
+    'side, a liquidity signal distinct from price or sentiment; a wide spread means '
+    'higher slippage risk right now, a lopsided imbalance means resting supply/demand '
+    'is skewed). None of the indicator/signal modules are wired into template_repo\'s main.py '
     'by default -- that wiring is exactly the kind of change you should be making. Prefer '
     'changes like: wiring in an indicator or the news sentiment score to gate or size '
     'trades, adding a stop-loss/take-profit rule, changing position sizing or order '

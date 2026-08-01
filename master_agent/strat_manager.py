@@ -86,6 +86,31 @@ def reconcile_state():
         save_state(state)
     return state
 
+def prune_zombies():
+    # A strategy whose clone/revise step got cut short (e.g. monitor.py's whole
+    # process group killed mid-cycle by emperor.sh's window timeout while a
+    # revise-strategy subprocess was still running) ends up fully checked out on
+    # disk but never actually started: status='stopped', pid=None, and no
+    # state.json ever written since main.py never ran once. Nothing else ever
+    # notices or removes these -- they can't be scored (score_from_strategy_path
+    # returns None forever), so they just print "Error reading state" and sort to
+    # -inf every single cycle indefinitely. Drop any such entry from tracking;
+    # the checked-out directory itself is left on disk for forensics.
+    state = load_state()
+    zombies = []
+    for name, info in state.items():
+        if info.get('status') != 'stopped' or info.get('pid'):
+            continue
+        state_path = Path(info['path']) / 'state.json'
+        if not state_path.exists():
+            zombies.append(name)
+    for name in zombies:
+        print(f"Strategy '{name}' was cloned but never started (no state.json); pruning from tracking.")
+        del state[name]
+    if zombies:
+        save_state(state)
+    return zombies
+
 def start_strategy(name, command=None):
     state = load_state()
     if name not in state:
@@ -173,6 +198,7 @@ def usage():
     print("  stopall                    Stop all running strategies")
     print("  list                       List known strategies and status")
     print("  reconcile                  Fix state entries stuck 'running' with a dead pid")
+    print("  prune                      Remove clones that were never successfully started")
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
@@ -194,6 +220,8 @@ if __name__ == '__main__':
         list_strategies()
     elif cmd == 'reconcile':
         reconcile_state()
+    elif cmd == 'prune':
+        prune_zombies()
     else:
         usage()
         sys.exit(1)
