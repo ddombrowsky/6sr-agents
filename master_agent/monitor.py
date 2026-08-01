@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Monitor script for XLM paper trading strategies.
 Runs an infinite loop checking strategy performance every hour.
-Every cycle it ranks *all* known strategies (running or stopped) by net worth,
+Every cycle it ranks *all* known strategies (running or stopped) by score,
 stops anything ranked below KEEP_TOP_N, clones the top two with slightly
 tweaked/revised thresholds, and makes sure the new clones plus the rest of the
 top N are running.
@@ -15,6 +15,8 @@ import datetime
 import random
 import uuid
 from pathlib import Path
+
+from score import score_from_strategy_path
 
 STATE_FILE = Path('/opt/strategy_state.json')
 STRATEGIES_DIR = Path('/opt/strategies')
@@ -39,19 +41,12 @@ def get_current_price():
     from price_feed import get_price
     return get_price()
 
-def compute_net_worth(strategy_name, state_entry, price):
-    strategy_path = Path(state_entry['path'])
-    state_path = strategy_path / 'state.json'
-    if not state_path.exists():
+def compute_strategy_score(strategy_name, state_entry, price):
+    score = score_from_strategy_path(state_entry['path'], price)
+    if score is None:
+        print(f'Error reading state for {strategy_name}')
         return -float('inf')
-    try:
-        data = json.load(state_path.open())
-        usd = data.get('balance_usd', 0.0)
-        xlm = data.get('balance_xlm', 0.0)
-        return usd + xlm * price
-    except Exception as e:
-        print(f'Error reading state for {strategy_name}: {e}')
-        return -float('inf')
+    return score
 
 def apply_seed_thresholds(cfg_path, name, price):
     # Used only for bootstrapping: the template's config.json ships with
@@ -185,12 +180,12 @@ def run():
             continue
         performances = []
         for name, info in state.items():
-            net = compute_net_worth(name, info, price)
-            performances.append((name, net))
+            score = compute_strategy_score(name, info, price)
+            performances.append((name, score))
         performances.sort(key=lambda x: x[1], reverse=True)
-        print('Strategy performances (net worth USD):')
-        for name, net in performances:
-            print(f'  {name}: {net:.2f}')
+        print('Strategy performances (score):')
+        for name, score in performances:
+            print(f'  {name}: {score:.2f}')
 
         current_leader = performances[0][0]
         promote_live_strategy(current_leader)
@@ -214,9 +209,9 @@ def run():
 
         # Clone the top two and hand each clone to the master agent to revise
         top_two = performances[:2]
-        leaderboard = json.dumps({n: net for n, net in performances})
+        leaderboard = json.dumps({n: score for n, score in performances})
         new_clone_names = []
-        for name, net in top_two:
+        for name, score in top_two:
             # create a new unique name (not derived from the parent's name, so it
             # doesn't keep growing across generations of clones-of-clones)
             new_name = f"clone_{uuid.uuid4().hex[:12]}"
@@ -231,7 +226,7 @@ def run():
                 try:
                     result = subprocess.run(
                         ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
-                         new_name, name, str(net), leaderboard, str(price)],
+                         new_name, name, str(score), leaderboard, str(price)],
                         capture_output=True, text=True, timeout=REVISION_TIMEOUT,
                     )
                     if result.returncode == 0:

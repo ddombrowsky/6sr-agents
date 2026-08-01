@@ -247,7 +247,7 @@ def _save_revision_history(strategy_path: Path, messages: list) -> None:
         json.dump(trimmed, f)
 
 
-def revise_strategy(strategy_name: str, parent_name: str, parent_net_worth: str = '',
+def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
                      leaderboard_json: str = '{}', current_price: str = '') -> None:
     """One-shot entry point invoked by monitor.py's tweak stage.
 
@@ -281,11 +281,11 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_net_worth: str 
         f'{price_line}'
         f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
         f"Parent `{parent_name}`'s current state.json: {json.dumps(parent_state)}\n"
-        f"Parent `{parent_name}`'s net worth this cycle: {parent_net_worth}\n"
+        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
         f"Parent `{parent_name}`'s most recent trades:\n{trade_tail}\n\n"
         f"The clone's main.py (identical to the parent's right now -- this is what you'd "
         f"edit to change trading logic, not just config.json):\n```python\n{clone_main_py}\n```\n\n"
-        f'Current leaderboard (strategy name -> net worth USD, all strategies currently '
+        f'Current leaderboard (strategy name -> score, all strategies currently '
         f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
         f'Revise the clone at `{strategy_path}` however you think will improve on its '
         f'parent, then commit your changes to a new git branch inside that directory. '
