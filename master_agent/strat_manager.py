@@ -11,6 +11,15 @@ STRATEGIES_DIR = Path('/opt/strategies')
 STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
 TRADES_DIR = Path('/opt/trades')  # also where run.log lives, alongside the trade logs
 TRADES_DIR.mkdir(parents=True, exist_ok=True)
+LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json')  # written by monitor.py (pubnet-plan.md)
+
+def load_live_strategy():
+    if LIVE_STRATEGY_FILE.exists():
+        try:
+            return json.load(LIVE_STRATEGY_FILE.open())
+        except Exception:
+            return None
+    return None
 
 def load_state():
     if STATE_FILE.exists():
@@ -139,8 +148,11 @@ def list_strategies():
     if not state:
         print("No strategies registered.")
         return
+    live = load_live_strategy()
+    live_name = live.get('name') if live else None
     for name, info in state.items():
-        print(f"{name}: path={info['path']}, status={info['status']}, pid={info.get('pid')}" )
+        flag = ' **LIVE**' if name == live_name else ''
+        print(f"{name}: path={info['path']}, status={info['status']}, pid={info.get('pid')}{flag}")
 
 def usage():
     print("Usage: strat_manager.py <command> [args]")
