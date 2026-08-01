@@ -9,6 +9,8 @@ from pathlib import Path
 STATE_FILE = Path('/opt/strategy_state.json')
 STRATEGIES_DIR = Path('/opt/strategies')
 STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
+TRADES_DIR = Path('/opt/trades')  # also where run.log lives, alongside the trade logs
+TRADES_DIR.mkdir(parents=True, exist_ok=True)
 
 def load_state():
     if STATE_FILE.exists():
@@ -68,12 +70,16 @@ def start_strategy(name, command=None):
     else:
         # split command string into list for subprocess
         cmd = command if isinstance(command, list) else command.split()
-    # Start process detached
-    proc = subprocess.Popen(cmd, cwd=str(strategy_path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+    # Start process detached. stdout/stderr go to a per-strategy log file, not
+    # /dev/null — now that a strategy can trigger real pubnet trades (submit_trade),
+    # discarding its output would make live-trade failures permanently invisible.
+    log_path = TRADES_DIR / f'{name}.run.log'
+    log_file = open(log_path, 'a')
+    proc = subprocess.Popen(cmd, cwd=str(strategy_path), stdout=log_file, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
     state[name]['pid'] = proc.pid
     state[name]['status'] = 'running'
     save_state(state)
-    print(f"Started strategy '{name}' with PID {proc.pid}")
+    print(f"Started strategy '{name}' with PID {proc.pid}, logging to {log_path}")
 
 def stop_strategy(name):
     state = load_state()

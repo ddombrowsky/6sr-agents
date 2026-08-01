@@ -22,6 +22,7 @@ TEMPLATE_REPO = 'file:///opt/template_repo'
 MASTER_AGENT_SCRIPT = Path('/opt/master_agent/master-agent.py')
 REVISION_TIMEOUT = 6000 # seconds allotted for the LLM to revise a clone before falling back
 KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycle
+LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money (pubnet-plan.md)
 
 def load_state():
     if STATE_FILE.exists():
@@ -117,6 +118,57 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     }
     json.dump(new_cfg_data, open(new_cfg_path, 'w'), indent=2)
 
+def load_live_strategy():
+    if LIVE_STRATEGY_FILE.exists():
+        try:
+            return json.load(LIVE_STRATEGY_FILE.open())
+        except Exception:
+            return None
+    return None
+
+def save_live_strategy(name):
+    LIVE_STRATEGY_FILE.write_text(json.dumps({'name': name, 'since': time.time()}, indent=2))
+
+def set_live_flag(name, live):
+    # Plain marker file main.py polls for, not a config.json key, so it survives a
+    # revision rewriting config.json from scratch. monitor.py alone writes/deletes it
+    # — a strategy's own code never decides it's live (pubnet-plan.md).
+    flag_path = STRATEGIES_DIR / name / 'live.flag'
+    if live:
+        flag_path.touch()
+    else:
+        flag_path.unlink(missing_ok=True)
+
+def promote_live_strategy(current_leader):
+    """Ensure `current_leader` (this cycle's #1 by net worth) is the one strategy
+    marked live. On a leader change, the flip is gated on stellar_trader.wind_down()
+    fully liquidating the outgoing strategy's real pubnet position first — if it can't
+    finish in one cycle, the old leader simply stays live and this retries next cycle
+    (safe: run()'s cull loop exempts the live strategy from KEEP_TOP_N below).
+    """
+    live = load_live_strategy()
+    if live and live.get('name') == current_leader:
+        return
+
+    if live and live.get('name'):
+        old_name = live['name']
+        print(f'Live strategy changing from {old_name} to {current_leader}; winding down {old_name} first')
+        import sys as _sys
+        _sys.path.append('/opt/tools')
+        from stellar_trader import wind_down
+        result = wind_down()
+        if not result['liquidated']:
+            print(f"wind_down did not fully flatten {old_name} this cycle "
+                  f"(remaining_xlm={result['remaining_xlm']}, reason={result['reason']}); "
+                  f"{old_name} stays live, retrying next cycle")
+            return
+        print(f"wind_down flattened {old_name} ({result['chunks']} chunk(s))")
+        set_live_flag(old_name, False)
+
+    print(f'Promoting {current_leader} to live')
+    set_live_flag(current_leader, True)
+    save_live_strategy(current_leader)
+
 def run():
     while True:
         print('--- Monitoring cycle', datetime.datetime.now(), '---')
@@ -139,13 +191,24 @@ def run():
         print('Strategy performances (net worth USD):')
         for name, net in performances:
             print(f'  {name}: {net:.2f}')
+
+        current_leader = performances[0][0]
+        promote_live_strategy(current_leader)
+        live_state = load_live_strategy()
+        live_name = live_state['name'] if live_state else None
+
         # Stop everything ranked below KEEP_TOP_N (no-op if already
         # stopped). Re-derived from full-population rank every cycle, so a
         # stopped strategy can't get stuck occupying a "cull" slot forever the
-        # way a fixed "worst two" window could.
+        # way a fixed "worst two" window could. The live strategy is exempt even if
+        # it falls out of the top N — it must not be killed while holding a real
+        # pubnet position (pubnet-plan.md).
         for name, _ in performances[KEEP_TOP_N:]:
             info = state.get(name)
             if info and info.get('status') == 'running':
+                if name == live_name:
+                    print(f'Skipping cull for {name}: currently the live pubnet strategy')
+                    continue
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'stop', name])
 
