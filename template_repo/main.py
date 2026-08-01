@@ -8,15 +8,7 @@ from pathlib import Path
 # Add tools directory to path
 sys.path.append('/opt/tools')
 from price_feed import get_price
-from trade_logger import record_trade
-from stellar_trader import submit_trade
-
-# Rollout phase 3 (pubnet-plan.md): monitor.py may mark this strategy live via
-# live.flag. When live, submit_trade() fires for real, in addition to the paper
-# math below — its result is logged separately (stellar_trader.py writes
-# <name>.pubnet.log) and never written back into balance_usd/balance_xlm, which stay
-# the ranking signal regardless of live status.
-LIVE_FLAG = Path('live.flag')
+from trade_logger import execute_trade
 
 # Load configuration
 CONFIG_PATH = Path('config.json')
@@ -49,30 +41,22 @@ while True:
     if price is None:
         time.sleep(30)
         continue
-    # Decision making — paper math always runs, live or not (pubnet-plan.md); it's
-    # what feeds state.json/net-worth ranking regardless of live status.
-    is_live = LIVE_FLAG.exists()
-    if price <= buy_below and state['balance_usd'] >= trade_amount_usd:
-        # Buy XLM with trade_amount_usd
-        amount_xlm = trade_amount_usd / price
-        state['balance_usd'] -= trade_amount_usd
-        state['balance_xlm'] += amount_xlm
-        record_trade(agent_name, 'buy', price, trade_amount_usd, amount_xlm, state['balance_usd'], state['balance_xlm'])
-        print(f"[{agent_name}] Bought {amount_xlm:.4f} XLM at ${price:.4f}")
-        if is_live:
-            result = submit_trade('buy', trade_amount_usd)
-            print(f"[{agent_name}] LIVE: submit_trade('buy', {trade_amount_usd}) -> {result}")
-    elif price >= sell_above and state['balance_xlm'] > 0:
-        # Sell all XLM (or a portion)
-        amount_xlm = min(state['balance_xlm'], trade_amount_usd / price)  # sell up to trade_amount_usd worth
-        usd_gained = amount_xlm * price
-        state['balance_xlm'] -= amount_xlm
-        state['balance_usd'] += usd_gained
-        record_trade(agent_name, 'sell', price, usd_gained, amount_xlm, state['balance_usd'], state['balance_xlm'])
-        print(f"[{agent_name}] Sold {amount_xlm:.4f} XLM at ${price:.4f}")
-        if is_live:
-            result = submit_trade('sell', usd_gained)
-            print(f"[{agent_name}] LIVE: submit_trade('sell', {usd_gained:.4f}) -> {result}")
+
+    # Decide: side/action/requested_usd, or None if no trade this tick. Execution
+    # (balance mutation, clamping, logging, live submission) is handled by
+    # execute_trade in trade_logger.py -- this is the only part a strategy revision
+    # should need to touch.
+    side = action = requested_usd = None
+    if price <= buy_below:
+        side = action = 'buy'
+        requested_usd = trade_amount_usd
+    elif price >= sell_above:
+        side = action = 'sell'
+        requested_usd = trade_amount_usd
+
+    if side is not None:
+        state = execute_trade(agent_name, action, side, price, requested_usd, state)
+
     # Save state
     with open(STATE_PATH, 'w') as f:
         json.dump(state, f)
