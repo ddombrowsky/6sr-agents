@@ -4,7 +4,9 @@ Runs an infinite loop checking strategy performance every hour.
 Every cycle it ranks *all* known strategies (running or stopped) by score,
 stops anything ranked below KEEP_TOP_N, clones the top two with slightly
 tweaked/revised thresholds, and makes sure the new clones plus the rest of the
-top N are running.
+top N are running. If the population is below KEEP_TOP_N (e.g. after strategies
+were removed via `strat_manager.py rm`), it backfills the shortfall with fresh
+clones from template_repo before scoring.
 """
 import json
 import os
@@ -22,7 +24,7 @@ STATE_FILE = Path('/opt/strategy_state.json')
 STRATEGIES_DIR = Path('/opt/strategies')
 TEMPLATE_REPO = 'file:///opt/template_repo'
 MASTER_AGENT_SCRIPT = Path('/opt/master_agent/master-agent.py')
-REVISION_TIMEOUT = 6000 # seconds allotted for the LLM to revise a clone before falling back
+REVISION_TIMEOUT = 60000 # seconds allotted for the LLM to revise a clone before falling back
 KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycle
 LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money (pubnet-plan.md)
 
@@ -214,6 +216,13 @@ def run():
             print('Sleeping for 1 hour...')
             time.sleep(3600)
             continue
+
+        if len(state) < KEEP_TOP_N:
+            shortfall = KEEP_TOP_N - len(state)
+            print(f'Only {len(state)} strategies known (< {KEEP_TOP_N}); backfilling {shortfall} from template.')
+            bootstrap_initial_strategies(price, count=shortfall)
+            state = load_state()
+
         performances = []
         for name, info in state.items():
             score = compute_strategy_score(name, info, price)

@@ -111,6 +111,19 @@ def prune_zombies():
         save_state(state)
     return zombies
 
+def rm_strategy(name):
+    state = load_state()
+    if name not in state:
+        print(f"Strategy '{name}' not known.")
+        return
+    if state[name].get('status') == 'running':
+        print(f"Strategy '{name}' is running; stop it first with 'stop {name}'.")
+        return
+    path = state[name]['path']
+    del state[name]
+    save_state(state)
+    print(f"Removed strategy '{name}' from tracking (files left on disk at {path}).")
+
 def start_strategy(name, command=None):
     state = load_state()
     if name not in state:
@@ -196,6 +209,7 @@ def usage():
     print("  start <name> [cmd]         Start strategy (optional custom command)")
     print("  stop <name>                Stop running strategy")
     print("  stopall                    Stop all running strategies")
+    print("  rm <name>                  Remove strategy from tracking (keeps files on disk; must be stopped first)")
     print("  list                       List known strategies and status")
     print("  reconcile                  Fix state entries stuck 'running' with a dead pid")
     print("  prune                      Remove clones that were never successfully started")
@@ -216,6 +230,8 @@ if __name__ == '__main__':
         stop_strategy(sys.argv[2])
     elif cmd == 'stopall':
         stop_all_strategies()
+    elif cmd == 'rm' and len(sys.argv) == 3:
+        rm_strategy(sys.argv[2])
     elif cmd == 'list':
         list_strategies()
     elif cmd == 'reconcile':

@@ -14,7 +14,7 @@ MODEL_NICKNAMES = {
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
 }
-MODEL = MODEL_NICKNAMES['gpt']
+MODEL = MODEL_NICKNAMES['qwen']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
