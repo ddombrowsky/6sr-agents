@@ -8,10 +8,14 @@ top N are running. If the population is below KEEP_TOP_N (e.g. after strategies
 were removed via `strat_manager.py rm`), it backfills the shortfall with fresh
 clones from template_repo before scoring.
 """
+import ast
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import datetime
 import random
@@ -41,6 +45,11 @@ LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy tra
 MIN_LIVE_TRADES = 20        # trades logged before a strategy may go live
 MIN_LIVE_AGE_S = 2 * 3600   # seconds between its first and last trade
 MIN_LIVE_SCORE = 1000.0     # must actually be up on its starting balance
+
+# How long a revised main.py gets to prove it runs and persists state before the gate
+# gives up on it. Must comfortably exceed one loop iteration (the template fetches a
+# price, then writes state.json, then sleeps 30s) plus a slow price-feed failover.
+SMOKE_TEST_SECONDS = int(os.environ.get('SMOKE_TEST_SECONDS', 75))
 
 PRICE_FETCH_ATTEMPTS = 3
 PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
@@ -153,6 +162,201 @@ def _config_is_sane(cfg, price):
         return False
     return True
 
+def main_py_is_sane(strategy_dir, name, price):
+    """Check that a revised main.py actually parses, runs, and persists state.
+
+    _config_is_sane only ever looked at config.json, so a revision that gutted
+    main.py sailed straight through and got started. On 2026-08-01 seed_0_1785619070
+    was handed to a model that wrote main.py eight times, each attempt a syntax
+    error, shrinking 3892 -> 377 bytes until the file finally *parsed* -- a stub
+    with no trading loop that exits immediately and never writes state.json. It
+    scored -inf (0 trades) forever after, and the config-only gate never noticed.
+
+    Returns (ok, reason).
+
+    The smoke run happens in a throwaway copy, never the real directory:
+    trade_logger.execute_trade submits a REAL order when a live.flag exists in cwd,
+    and record_trade appends to /opt/trades/<agent_name>.log -- which feeds the
+    trade counts gating real-money promotion. So the copy drops live.flag and
+    trades under a scratch name whose log is deleted afterwards.
+    """
+    main_py = Path(strategy_dir) / 'main.py'
+    if not main_py.exists():
+        return False, 'main.py is missing'
+
+    source = main_py.read_text()
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        return False, f'main.py has a syntax error: {e.msg} (line {e.lineno})'
+
+    scratch_name = f'smoketest_{uuid.uuid4().hex[:12]}'
+    tmp_root = tempfile.mkdtemp(prefix='smoketest_')
+    tmp_dir = Path(tmp_root) / 'strategy'
+    try:
+        shutil.copytree(strategy_dir, tmp_dir,
+                        ignore=shutil.ignore_patterns('.git', 'live.flag', 'state.json'))
+        (tmp_dir / 'live.flag').unlink(missing_ok=True)  # belt and braces: never trade live
+
+        cfg = {}
+        try:
+            cfg = json.load(open(tmp_dir / 'config.json'))
+        except Exception:
+            pass
+        cfg['name'] = scratch_name
+        if not _config_is_sane(cfg, price):
+            # Thresholds are validated separately; don't let a bad config mask a
+            # main.py that would run fine once the fallback fixes them.
+            cfg['buy_below'] = round(price * 0.98, 6)
+            cfg['sell_above'] = round(price * 1.02, 6)
+        json.dump(cfg, open(tmp_dir / 'config.json', 'w'), indent=2)
+
+        proc = subprocess.Popen(['python3', '-u', 'main.py'], cwd=str(tmp_dir),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, preexec_fn=os.setsid)
+        try:
+            out, _ = proc.communicate(timeout=SMOKE_TEST_SECONDS)
+            # Exiting on its own is fatal: strat_manager starts main.py once, so a
+            # strategy that returns is simply dead and can never trade again.
+            tail = ' | '.join(out.strip().splitlines()[-3:]) or '(no output)'
+            return False, (f'main.py exited on its own after '
+                           f'<{SMOKE_TEST_SECONDS}s (rc={proc.returncode}): {tail}')
+        except subprocess.TimeoutExpired:
+            pass  # still running, which is what a trading loop should do
+        finally:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                out, _ = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out = ''
+
+        state_path = tmp_dir / 'state.json'
+        if not state_path.exists():
+            tail = ' | '.join((out or '').strip().splitlines()[-3:]) or '(no output)'
+            return False, (f'main.py ran for {SMOKE_TEST_SECONDS}s without ever writing '
+                           f'state.json: {tail}')
+        try:
+            st = json.load(open(state_path))
+            usd = float(st['balance_usd'])
+            xlm = float(st['balance_xlm'])
+        except Exception as e:
+            return False, f'main.py wrote an unreadable state.json: {e}'
+        if usd < 0 or xlm < 0:
+            return False, f'main.py wrote negative balances (usd={usd}, xlm={xlm})'
+        if usd + xlm * price <= 0:
+            return False, f'main.py wrote a zero/negative net worth (usd={usd}, xlm={xlm})'
+        return True, f'ran {SMOKE_TEST_SECONDS}s, net worth {usd + xlm * price:.2f}'
+    except Exception as e:
+        return False, f'smoke test errored: {e}'
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        (TRADES_DIR / f'{scratch_name}.log').unlink(missing_ok=True)
+
+def revert_main_py(strategy_dir, before_head, name):
+    """Restore the parent's main.py after a failed gate, keeping any other revision.
+
+    Reverts to the commit the clone started at rather than HEAD, since the model may
+    have already committed the broken main.py onto its own branch.
+    """
+    r = _git(strategy_dir, 'checkout', before_head, '--', 'main.py')
+    if r.returncode != 0:
+        print(f'Could not restore main.py for {name}: {r.stderr.strip()}')
+        return False
+    print(f"Restored {name}'s main.py to its parent's version")
+    return True
+
+# Files a strategy rewrites constantly at runtime, which must never be committed:
+# main.py rewrites state.json every 30s, and master-agent.py drops its revision
+# transcript next to it. Clones descended from a pre-2026-07-31 ancestor predate the
+# template's .gitignore and don't list either, so `git add -A` below would commit
+# them and leave the repo permanently dirty from the next tick onward.
+REVISION_IGNORES = ('state.json', '.strategy-revision-history.json')
+
+def _git(path, *args):
+    return subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True)
+
+def _git_head(path):
+    r = _git(path, 'rev-parse', 'HEAD')
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def _git_is_dirty(path):
+    r = _git(path, 'status', '--porcelain')
+    return bool(r.stdout.strip()) if r.returncode == 0 else False
+
+def revision_changed_anything(path, before_head):
+    """True if anything at all happened to `path` since it was cloned.
+
+    A revise-strategy subprocess can exit 0 having done nothing (the model
+    answers in prose and never calls a tool), which used to start the clone as a
+    byte-identical copy of its parent -- a wasted revision slot indistinguishable
+    from a successful one in the logs.
+    """
+    return _git_is_dirty(path) or _git_head(path) != before_head
+
+def _ensure_revision_gitignore(path):
+    gi = Path(path) / '.gitignore'
+    text = gi.read_text() if gi.exists() else ''
+    missing = [p for p in REVISION_IGNORES if p not in text.split()]
+    if not missing:
+        return
+    if text and not text.endswith('\n'):
+        text += '\n'
+    gi.write_text(text + '\n'.join(missing) + '\n')
+
+def commit_revision(path, name, message):
+    """Commit whatever is in `path`'s working tree, on its own branch.
+
+    monitor.py judged a revision solely by the subprocess exit code and
+    _config_is_sane, neither of which notices that the model edited files and
+    never ran git -- the commit requirement lived only as prompt text in
+    master-agent.py, and was ignored often enough that most strategies on disk
+    sat on master with an uncommitted config.json. That doesn't hurt the clone
+    itself (main.py reads the working tree) but it silently breaks the next
+    generation: strat_manager.py clones a parent with plain `git clone`, which
+    copies committed history only, so the winning thresholds are replaced by
+    whatever HEAD still holds -- usually the template's never-trading 0.0s.
+
+    Commit unconditionally, whoever wrote the change (LLM or a tweak fallback),
+    so the working tree and HEAD can never disagree. Returns True if `path` ends
+    up clean and committed.
+    """
+    if not (Path(path) / '.git').exists():
+        print(f'Cannot commit revision for {name}: {path} is not a git repo')
+        return False
+
+    _ensure_revision_gitignore(path)
+
+    # Keep the branch the model made if it made one; otherwise put the revision on
+    # its own branch so the parent's master stays a clean ancestor line. `git clone`
+    # follows the source repo's checked-out HEAD, so either way children inherit it.
+    branch = _git(path, 'branch', '--show-current').stdout.strip()
+    if branch in ('master', 'main', ''):
+        new_branch = f'auto/{name}_{int(time.time())}'
+        r = _git(path, 'checkout', '-b', new_branch)
+        if r.returncode != 0:
+            print(f'Could not branch {name} to {new_branch}: {r.stderr.strip()}')
+
+    if not _git_is_dirty(path):
+        return True  # model already committed everything it touched
+
+    _git(path, 'add', '-A')
+    commit_args = ['commit', '-m', message]
+    if not _git(path, 'config', 'user.email').stdout.strip():
+        # Fresh container: git has no identity configured and commit would abort.
+        commit_args = ['-c', 'user.email=monitor@localhost',
+                       '-c', 'user.name=monitor.py'] + commit_args
+    r = _git(path, *commit_args)
+    if r.returncode != 0:
+        print(f'Failed to commit revision for {name}: {r.stderr.strip() or r.stdout.strip()}')
+        return False
+    print(f'Committed revision for {name} on branch '
+          f'{_git(path, "branch", "--show-current").stdout.strip()}')
+    return True
+
 def apply_seed_thresholds(cfg_path, name, price):
     # Used only for bootstrapping: the template's config.json ships with
     # buy_below=sell_above=0.0, which never trades and can't be nudged by
@@ -181,7 +385,9 @@ def bootstrap_initial_strategies(price, count=2):
         name = f'seed_{i}_{int(time.time())}'
         print(f'Bootstrapping strategy {name}')
         subprocess.run(['/opt/strat_manager.py', 'clone', name, TEMPLATE_REPO])
-        cfg_path = STRATEGIES_DIR / name / 'config.json'
+        strategy_dir = STRATEGIES_DIR / name
+        cfg_path = strategy_dir / 'config.json'
+        before_head = _git_head(strategy_dir)
 
         revised = False
         if MASTER_AGENT_SCRIPT.exists():
@@ -199,6 +405,21 @@ def bootstrap_initial_strategies(price, count=2):
             except Exception as e:
                 print(f'Master agent revision errored for {name}: {e}')
 
+        touched = revision_changed_anything(strategy_dir, before_head)
+        if revised and not touched:
+            print(f'Revision for {name} left the clone untouched; treating as unrevised')
+            revised = False
+
+        # Runs whenever the model touched the repo, even if `revised` is already False:
+        # both fallbacks only rewrite config.json, so a gutted main.py would otherwise
+        # survive a failed config check and get started anyway (seed_0_1785619070).
+        if touched:
+            ok, reason = main_py_is_sane(strategy_dir, name, price)
+            print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
+            if not ok:
+                revert_main_py(strategy_dir, before_head, name)
+                revised = False
+
         if revised and cfg_path.exists():
             cfg = json.load(open(cfg_path))
             if not _config_is_sane(cfg, price):
@@ -208,6 +429,9 @@ def bootstrap_initial_strategies(price, count=2):
         if not revised and cfg_path.exists():
             print(f'Falling back to seeded thresholds for {name}')
             apply_seed_thresholds(cfg_path, name, price)
+
+        commit_revision(strategy_dir, name,
+                        f'auto: seed {name} ({"llm" if revised else "seeded thresholds"})')
 
         subprocess.run(['/opt/strat_manager.py', 'start', name])
 
@@ -438,7 +662,9 @@ def run():
             subprocess.run(['/opt/strat_manager.py', 'clone', new_name, parent_repo])
             new_clone_names.append(new_name)
             parent_cfg = Path(parent_repo) / 'config.json'
-            new_cfg = Path(STRATEGIES_DIR) / new_name / 'config.json'
+            new_dir = Path(STRATEGIES_DIR) / new_name
+            new_cfg = new_dir / 'config.json'
+            before_head = _git_head(new_dir)
 
             revised = False
             if MASTER_AGENT_SCRIPT.exists():
@@ -456,6 +682,20 @@ def run():
                 except Exception as e:
                     print(f'Master agent revision errored for {new_name}: {e}')
 
+            touched = revision_changed_anything(new_dir, before_head)
+            if revised and not touched:
+                print(f'Revision for {new_name} left the clone identical to {name}; treating as unrevised')
+                revised = False
+
+            # See bootstrap_initial_strategies: this must run even when `revised` is
+            # already False, since the random-tweak fallback only rewrites config.json.
+            if touched:
+                ok, reason = main_py_is_sane(new_dir, new_name, price)
+                print(f'main.py check for {new_name}: {"passed" if ok else "FAILED"} -- {reason}')
+                if not ok:
+                    revert_main_py(new_dir, before_head, new_name)
+                    revised = False
+
             if revised and new_cfg.exists():
                 cfg = json.load(open(new_cfg))
                 if not _config_is_sane(cfg, price):
@@ -465,6 +705,10 @@ def run():
             if not revised and parent_cfg.exists() and new_cfg.exists():
                 print(f'Falling back to random tweak for {new_name}')
                 apply_random_tweak(parent_cfg, new_cfg, new_name)
+
+            commit_revision(new_dir, new_name,
+                            f'auto: revise {new_name} from {name} '
+                            f'({"llm" if revised else "random tweak"})')
 
         # Start the new clones, plus any top-N strategy that's currently stopped
         # (reload state first since strat_manager.py clone/stop wrote to disk)
