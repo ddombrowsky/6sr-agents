@@ -35,7 +35,7 @@ done
 cd /opt
 . ./env.sh
 
-RUN_HOURS=${EMPEROR_RUN_HOURS:-6h}
+RUN_HOURS=${EMPEROR_RUN_HOURS:-2.5h}
 LOG_DIR=/opt/emperor_logs
 mkdir -p "$LOG_DIR"
 

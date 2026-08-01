@@ -63,7 +63,10 @@ def start_strategy(name, command=None):
         # try python main.py
         main_py = strategy_path / 'main.py'
         if main_py.exists():
-            cmd = ['python3', str(main_py)]
+            # -u: unbuffered stdout/stderr. Without it, Python fully buffers output when
+            # it isn't a TTY, and SIGTERM (how stop_strategy ends a process) doesn't flush
+            # that buffer — run.log would stay empty even though the process did real work.
+            cmd = ['python3', '-u', str(main_py)]
         else:
             print(f"No command supplied and no main.py found for strategy '{name}'.")
             return
