@@ -21,6 +21,10 @@ def load_live_strategy():
             return None
     return None
 
+def live_strategy_name():
+    live = load_live_strategy()
+    return live.get('name') if live else None
+
 def load_state():
     if STATE_FILE.exists():
         with STATE_FILE.open('r') as f:
@@ -97,10 +101,13 @@ def prune_zombies():
     # -inf every single cycle indefinitely. Drop any such entry from tracking;
     # the checked-out directory itself is left on disk for forensics.
     state = load_state()
+    live = live_strategy_name()
     zombies = []
     for name, info in state.items():
         if info.get('status') != 'stopped' or info.get('pid'):
             continue
+        if name == live:
+            continue  # never untrack the strategy holding a real pubnet position
         state_path = Path(info['path']) / 'state.json'
         if not state_path.exists():
             zombies.append(name)
@@ -118,6 +125,11 @@ def rm_strategy(name):
         return
     if state[name].get('status') == 'running':
         print(f"Strategy '{name}' is running; stop it first with 'stop {name}'.")
+        return
+    if name == live_strategy_name():
+        # Untracking the live strategy would strand a real pubnet position: monitor.py
+        # could no longer score it, and nothing would ever wind it down (pubnet-plan.md).
+        print(f"Strategy '{name}' is the live pubnet strategy; refusing to remove it.")
         return
     path = state[name]['path']
     del state[name]

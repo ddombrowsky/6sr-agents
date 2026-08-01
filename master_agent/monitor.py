@@ -22,11 +22,30 @@ from score import score_from_strategy_path
 
 STATE_FILE = Path('/opt/strategy_state.json')
 STRATEGIES_DIR = Path('/opt/strategies')
+TRADES_DIR = Path('/opt/trades')
 TEMPLATE_REPO = 'file:///opt/template_repo'
 MASTER_AGENT_SCRIPT = Path('/opt/master_agent/master-agent.py')
-REVISION_TIMEOUT = 60000 # seconds allotted for the LLM to revise a clone before falling back
+# Override with the REVISION_TIMEOUT env var rather than editing this literal -- it has
+# been flipped back and forth by successive emperor passes. The right value depends on
+# which model master-agent.py is pointed at (see MASTER_AGENT_MODEL there): the cloud
+# model fails or answers in minutes, the local ones can take hours.
+REVISION_TIMEOUT = int(os.environ.get('REVISION_TIMEOUT', 60000))
 KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycle
+RETIRE_BELOW_RANK = KEEP_TOP_N * 3 # stopped, never-traded strategies below this get untracked
 LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money (pubnet-plan.md)
+
+# Guardrails on handing a strategy the real-money live flag. On 2026-08-01 the live flag
+# was given to a clone with zero trades and zero track record, purely because 45 clones
+# that had never traded were tied at the top of a broken ranking. Rank alone is not
+# enough evidence to trade real money on: require a demonstrated, profitable history.
+MIN_LIVE_TRADES = 20        # trades logged before a strategy may go live
+MIN_LIVE_AGE_S = 2 * 3600   # seconds between its first and last trade
+MIN_LIVE_SCORE = 1000.0     # must actually be up on its starting balance
+
+PRICE_FETCH_ATTEMPTS = 3
+PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
+PRICE_FAILURE_SLEEP = 300   # seconds to wait before retrying a cycle that got no price
+CYCLE_SLEEP = 3600
 
 def load_state():
     if STATE_FILE.exists():
@@ -43,12 +62,77 @@ def get_current_price():
     from price_feed import get_price
     return get_price()
 
+def fetch_price_with_retry():
+    # price_feed already tries 6 sources, but they all share one network path: when the
+    # container's DNS flapped on 2026-08-01 every source failed at once. Retrying a few
+    # times beats throwing away a whole hour of trading on a transient outage.
+    for attempt in range(1, PRICE_FETCH_ATTEMPTS + 1):
+        price = get_current_price()
+        if price is not None:
+            return price
+        if attempt < PRICE_FETCH_ATTEMPTS:
+            print(f'Price fetch failed (attempt {attempt}/{PRICE_FETCH_ATTEMPTS}); '
+                  f'retrying in {PRICE_RETRY_DELAY}s')
+            time.sleep(PRICE_RETRY_DELAY)
+    return None
+
 def compute_strategy_score(strategy_name, state_entry, price):
     score = score_from_strategy_path(state_entry['path'], price)
     if score is None:
         print(f'Error reading state for {strategy_name}')
         return -float('inf')
     return score
+
+def trade_log_path(name):
+    """Where `name`'s trades actually got logged.
+
+    Normally /opt/trades/<name>.log, but trade_logger names the file after config.json's
+    "name" field, which a revision is free to rewrite -- clone_916b729411ab logs to
+    clone_916b729411ab_modified.log for exactly that reason. Fall back to whatever the
+    config says so a renamed strategy doesn't look like it has never traded.
+    """
+    log_path = TRADES_DIR / f'{name}.log'
+    if log_path.exists():
+        return log_path
+    try:
+        entry = load_state().get(name)
+        cfg = json.load(open(Path(entry['path']) / 'config.json'))
+        alt = TRADES_DIR / f"{cfg['name']}.log"
+        if alt.exists():
+            return alt
+    except Exception:
+        pass
+    return log_path
+
+def trade_stats(name):
+    """(trade_count, first_timestamp, last_timestamp) from this strategy's trade log.
+
+    Used both to break ranking ties and to decide whether a strategy has enough of a
+    track record to be trusted with the live pubnet flag. Returns zeros if the strategy
+    has never traded, which is the common case for a fresh clone.
+    """
+    log_path = trade_log_path(name)
+    if not log_path.exists():
+        return 0, 0.0, 0.0
+    first = last = 0.0
+    count = 0
+    try:
+        with log_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                count += 1
+                try:
+                    ts = json.loads(line).get('timestamp', 0.0)
+                except Exception:
+                    continue
+                if not first:
+                    first = ts
+                last = ts
+    except Exception as e:
+        print(f'Could not read trade log for {name}: {e}')
+    return count, first, last
 
 def _config_is_sane(cfg, price):
     # Guards against a revision that "succeeds" (subprocess returncode 0) but
@@ -140,6 +224,43 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     }
     json.dump(new_cfg_data, open(new_cfg_path, 'w'), indent=2)
 
+def _config_signature(state_entry):
+    """The parameters that actually define a strategy's behaviour, for dedup."""
+    try:
+        cfg = json.load(open(Path(state_entry['path']) / 'config.json'))
+    except Exception:
+        return None
+    return (cfg.get('buy_below'), cfg.get('sell_above'), cfg.get('trade_amount_usd'))
+
+def select_parents(performances, state, count=2):
+    """Pick `count` distinct strategies to clone and revise this cycle.
+
+    Taking performances[:count] outright kept picking two clones with byte-identical
+    configs (the monitor logs show the same one or two parents cloned hour after hour),
+    which spends both revision slots exploring the same point. Prefer the best scorer,
+    then the best remaining one whose config actually differs; fall back to plain rank
+    order if everything looks the same.
+    """
+    chosen = []
+    seen_signatures = []
+    for name, score in performances:
+        if name not in state:
+            continue
+        signature = _config_signature(state[name])
+        if signature is not None and signature in seen_signatures:
+            continue
+        chosen.append((name, score))
+        seen_signatures.append(signature)
+        if len(chosen) == count:
+            return chosen
+    # Not enough distinct configs -- top up by rank so a cycle is never skipped.
+    for entry in performances:
+        if entry not in chosen and entry[0] in state:
+            chosen.append(entry)
+            if len(chosen) == count:
+                break
+    return chosen
+
 def load_live_strategy():
     if LIVE_STRATEGY_FILE.exists():
         try:
@@ -161,16 +282,43 @@ def set_live_flag(name, live):
     else:
         flag_path.unlink(missing_ok=True)
 
-def promote_live_strategy(current_leader):
-    """Ensure `current_leader` (this cycle's #1 by net worth) is the one strategy
-    marked live. On a leader change, the flip is gated on stellar_trader.wind_down()
-    fully liquidating the outgoing strategy's real pubnet position first — if it can't
-    finish in one cycle, the old leader simply stays live and this retries next cycle
-    (safe: run()'s cull loop exempts the live strategy from KEEP_TOP_N below).
+def qualifies_for_live(name, score):
+    """Whether `name` has earned the right to trade real money. (ok, reason)
+
+    Being ranked #1 is necessary but nowhere near sufficient: a brand-new clone that
+    has never traded sits at exactly its starting balance, which can top the ranking
+    on any quiet day. Real money only goes to a strategy with a real, profitable
+    track record. If nothing qualifies, nothing is promoted and no live trading
+    happens this cycle -- that is the intended safe default.
+    """
+    count, first, last = trade_stats(name)
+    if count < MIN_LIVE_TRADES:
+        return False, f'only {count} trades logged (need {MIN_LIVE_TRADES})'
+    age = last - first
+    if age < MIN_LIVE_AGE_S:
+        return False, f'trade history spans only {age / 3600:.1f}h (need {MIN_LIVE_AGE_S / 3600:.1f}h)'
+    if score <= MIN_LIVE_SCORE:
+        return False, f'score {score:.2f} is not above the {MIN_LIVE_SCORE:.2f} starting baseline'
+    return True, f'{count} trades over {age / 3600:.1f}h, score {score:.2f}'
+
+def promote_live_strategy(current_leader, leader_score):
+    """Ensure `current_leader` (this cycle's #1 by score) is the one strategy
+    marked live, provided it passes qualifies_for_live(). On a leader change, the flip
+    is gated on stellar_trader.wind_down() fully liquidating the outgoing strategy's
+    real pubnet position first — if it can't finish in one cycle, the old leader simply
+    stays live and this retries next cycle (safe: run()'s cull loop exempts the live
+    strategy from KEEP_TOP_N below).
     """
     live = load_live_strategy()
     if live and live.get('name') == current_leader:
         return
+
+    ok, reason = qualifies_for_live(current_leader, leader_score)
+    if not ok:
+        held = live.get('name') if live else 'nothing'
+        print(f'Not promoting {current_leader} to live: {reason}. Leaving {held} live.')
+        return
+    print(f'{current_leader} qualifies for live: {reason}')
 
     if live and live.get('name'):
         old_name = live['name']
@@ -194,10 +342,11 @@ def promote_live_strategy(current_leader):
 def run():
     while True:
         print('--- Monitoring cycle', datetime.datetime.now(), '---')
-        price = get_current_price()
+        price = fetch_price_with_retry()
         if price is None:
-            print('Could not fetch price, skipping this cycle')
-            time.sleep(3600)
+            print(f'Could not fetch price after {PRICE_FETCH_ATTEMPTS} attempts; '
+                  f'retrying this cycle in {PRICE_FAILURE_SLEEP}s')
+            time.sleep(PRICE_FAILURE_SLEEP)
             continue
 
         # Correct any strategy left with a stale 'running' status from a
@@ -213,8 +362,8 @@ def run():
         state = load_state()
         if not state:
             bootstrap_initial_strategies(price)
-            print('Sleeping for 1 hour...')
-            time.sleep(3600)
+            print(f'Sleeping for {CYCLE_SLEEP}s...')
+            time.sleep(CYCLE_SLEEP)
             continue
 
         if len(state) < KEEP_TOP_N:
@@ -224,16 +373,23 @@ def run():
             state = load_state()
 
         performances = []
+        trade_counts = {}
         for name, info in state.items():
             score = compute_strategy_score(name, info, price)
+            trade_counts[name] = trade_stats(name)[0]
             performances.append((name, score))
-        performances.sort(key=lambda x: x[1], reverse=True)
+        # Tie-break on trade count. Strategies that have never traded all sit at exactly
+        # their starting balance, so without this the ordering of a 45-way tie is just
+        # the insertion order of strategy_state.json -- the same names won and lost every
+        # cycle, and the "best" strategy handed to the revision agent was arbitrary.
+        # Among equals, prefer the one that has actually demonstrated something.
+        performances.sort(key=lambda x: (x[1], trade_counts.get(x[0], 0)), reverse=True)
         print('Strategy performances (score):')
         for name, score in performances:
-            print(f'  {name}: {score:.2f}')
+            print(f'  {name}: {score:.2f} ({trade_counts.get(name, 0)} trades)')
 
-        current_leader = performances[0][0]
-        promote_live_strategy(current_leader)
+        current_leader, leader_score = performances[0]
+        promote_live_strategy(current_leader, leader_score)
         live_state = load_live_strategy()
         live_name = live_state['name'] if live_state else None
 
@@ -252,8 +408,24 @@ def run():
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'stop', name])
 
+        # Two clones are created every cycle and nothing ever removed them, so the
+        # tracked population grew ~2/hour forever (74 tracked / 88 directories by
+        # 2026-08-01) and every cycle re-scored dozens of identical never-traded
+        # clones. Untrack the deep tail: stopped, never traded, nothing to learn from.
+        # Files stay on disk; the live strategy and anything with a trade history are
+        # never touched.
+        retire_state = load_state()
+        for name, _ in performances[RETIRE_BELOW_RANK:]:
+            info = retire_state.get(name)
+            if not info or info.get('status') != 'stopped' or info.get('pid'):
+                continue
+            if name == live_name or trade_counts.get(name, 0) > 0:
+                continue
+            print(f'Retiring never-traded strategy ranked below {RETIRE_BELOW_RANK}: {name}')
+            subprocess.run(['/opt/strat_manager.py', 'rm', name])
+
         # Clone the top two and hand each clone to the master agent to revise
-        top_two = performances[:2]
+        top_two = select_parents(performances, state)
         leaderboard = json.dumps({n: score for n, score in performances})
         new_clone_names = []
         for name, score in top_two:
@@ -307,8 +479,8 @@ def run():
                 subprocess.run(['/opt/strat_manager.py', 'start', name])
 
         # Wait an hour before next cycle
-        print('Sleeping for 1 hour...')
-        time.sleep(3600)
+        print(f'Sleeping for {CYCLE_SLEEP}s...')
+        time.sleep(CYCLE_SLEEP)
 
 if __name__ == '__main__':
     run()

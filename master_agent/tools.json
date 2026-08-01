@@ -2,6 +2,36 @@
   {
     "type": "function",
     "function": {
+      "name": "backtest_strategy",
+      "description": "Replay a trading strategy over ~30 days of real historical hourly XLM/USD candles and return a JSON summary: return_pct, buy_hold_pct, beats_buy_hold, trades, sells, win_rate, max_drawdown_pct, final_net_worth, and decide_source. Use this to check whether a strategy revision is actually an improvement BEFORE starting it or committing it -- it takes a second or two, versus an hour of live paper trading for one very noisy sample. `beats_buy_hold: false` means the strategy loses to simply holding XLM and should be reworked. If decide_source comes back as \"config-thresholds\" the strategy's main.py does not expose a top-level decide(price, history, state, config) function, so the backtest is only measuring its config.json thresholds, not any custom logic you wrote.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {"type": "string", "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"},
+          "days": {"type": "integer", "description": "How many days of history to replay (default 30, max useful ~30)"},
+          "ticks_per_candle": {"type": "integer", "description": "Decision points per candle. 1 (default) evaluates once per hour; pass 120 to approximate the live loop's 30-second polling cadence, which matters for strategies that fire repeatedly while a threshold is standing."}
+        },
+        "required": ["strategy_path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_price_history",
+      "description": "Return recent XLM/USD closing prices as a JSON list, oldest first, from real exchange candles (Kraken with a Coinbase fallback, cached and shared). Use when you want to look at the actual recent trend, volatility, or price range before choosing thresholds or indicator periods -- not the single spot price. Defaults to 720 hourly closes (~30 days).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "hours": {"type": "integer", "description": "How many hours of history to return (default 720)"},
+          "interval": {"type": "integer", "description": "Candle size in minutes: 1, 5, 15, 60 (default), 240, or 1440"}
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "calculate",
       "description": "Evaluate a basic arithmetic expression (+, -, *, /, **)",
       "parameters": {

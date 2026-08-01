@@ -14,7 +14,10 @@ MODEL_NICKNAMES = {
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
 }
-MODEL = MODEL_NICKNAMES['qwen']
+# Pick the model with the MASTER_AGENT_MODEL env var (a nickname above) rather than
+# editing this literal: successive emperor passes kept flipping it between 'gpt' and
+# 'qwen' and overwriting each other's choice. 'qwen' is the current deliberate default.
+MODEL = MODEL_NICKNAMES.get(os.environ.get('MASTER_AGENT_MODEL', 'qwen'), MODEL_NICKNAMES['qwen'])
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
@@ -123,6 +126,13 @@ def run_turn(messages: list) -> str:
             if 'prompt too long' in error_text.lower() and _truncate_messages(messages, error_text):
                 server_error_retries = 0
                 continue
+            if e.status_code == 429:
+                # Ollama cloud's weekly quota. Nothing to retry against -- it resets on
+                # its own schedule. monitor.py already falls back to a random tweak when
+                # a revision fails, so return a one-line reason instead of letting a
+                # 25-line traceback per clone per cycle fill the monitor log.
+                print(f'[warning] model quota/rate limit hit: {error_text}')
+                return f'[error: model quota exhausted ({error_text})]'
             if e.status_code >= 500:
                 server_error_retries += 1
                 if server_error_retries > SERVER_ERROR_MAX_RETRIES:
@@ -186,15 +196,41 @@ REVISION_SYSTEM_PROMPT = (
     "read/write live.flag directly from main.py -- that plumbing is intentionally kept "
     "outside the clone you're editing; reimplementing or routing around it risks "
     "double-submitting real trades or bypassing stellar_trader.py's safety caps.\n\n"
+    'You are scored on net worth: `balance_usd + balance_xlm * price * 0.999` (see '
+    '/opt/master_agent/score.py). The 0.1% haircut on the XLM leg is only a tie-break '
+    'nudge toward realizing gains -- it is not worth distorting the strategy for. '
+    'Growing net worth is the entire objective; sitting in cash and never trading '
+    'scores exactly the starting balance and gets you nowhere.\n\n'
+    'You can and should test a revision before committing it. '
+    '`backtest_strategy(strategy_path)` replays the strategy over 30 days of real '
+    'hourly candles and returns return_pct, buy_hold_pct, beats_buy_hold, trades, '
+    'win_rate and max_drawdown_pct in a second or two -- use it as your fitness check '
+    'instead of guessing, and iterate until the numbers improve. Treat '
+    '`beats_buy_hold: false` as a failed revision and try something else: a strategy '
+    'that loses to simply holding XLM is not worth starting. The backtester picks up '
+    "your logic automatically if main.py exposes a top-level "
+    '`decide(price, history, state, config)` returning `(side, action, requested_usd)` '
+    "or None; if it doesn't, it falls back to the plain buy_below/sell_above rule and "
+    'will not see your changes at all. So structure main.py that way: put the decide '
+    'step in that function and have the trading loop call it. `history` is the list of '
+    'recent close prices, oldest first, so indicators work unchanged in both live and '
+    'backtest paths.\n\n'
     "Do not default to only nudging buy_below/sell_above. Threshold tweaks are the "
     "weakest lever available to you -- treat them as a last resort, not the first move. "
     "/opt/tools has indicator and signal modules you can import from a strategy's "
     "main.py, all working (fixed/added by a recent emperor pass, so trust them rather "
     "than re-deriving your own): ema_sma.py (SMA, `sma(prices, period)`), "
     'moving_averages.py (EMA, `exponential_moving_average(prices, period)`), rsi.py '
-    '(`rsi(prices, period)`), price_history_fetcher.py (`get_price_samples(lookback_cycles)` '
-    '-- a shared, cached price history so you don\'t need to build your own rolling '
-    'buffer or hit the price APIs directly), news_feed.py (`get_headlines()` / '
+    '(`rsi(prices, period)`), ohlc_history.py (`closes(hours=720)` / '
+    '`get_candles(hours, interval)` -- ~30 days of REAL historical hourly OHLCV candles '
+    'from Kraken/Coinbase, cached and shared. Reach for this whenever an indicator needs '
+    'lookback: a freshly-cloned strategy has no price history of its own, so an EMA/RSI '
+    'fed from the live sample buffer returns nan for hours after it starts, while this '
+    'gives it 720 usable bars on its very first tick), '
+    'price_history_fetcher.py (`get_price_samples(lookback_cycles)` '
+    '-- a shared, cached buffer of recent *live* spot samples; fine for the last few '
+    'ticks, but too short for indicator lookback -- use ohlc_history.py for that), '
+    'news_feed.py (`get_headlines()` / '
     '`sentiment_score()` -- keyword-heuristic bullish/bearish scoring from recent crypto '
     'news, a coarse but genuinely different signal from price alone), '
     "reflector_oracle.py (an alternate on-chain price source -- now wired as a fallback "
@@ -325,6 +361,13 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     reply = run_turn(messages)
     _save_revision_history(strategy_path, messages)
     print(reply)
+    if reply.startswith('[error:'):
+        # run_turn gave up (quota exhausted, or server errors past the retry budget)
+        # rather than actually revising anything. Exit non-zero so monitor.py's caller
+        # applies its random-tweak fallback -- without this the clone would silently
+        # start as a byte-identical copy of its parent.
+        print(reply, file=sys.stderr)  # monitor.py logs stderr for a failed revision
+        sys.exit(1)
 
 
 def main():

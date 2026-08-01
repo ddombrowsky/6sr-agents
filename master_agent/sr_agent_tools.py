@@ -1,7 +1,11 @@
 import ast
+import json
 import operator
 import subprocess
+import sys
 from datetime import datetime
+
+sys.path.append('/opt/tools')
 
 
 def get_uptime() -> str:
@@ -103,7 +107,32 @@ def exec(command: str) -> str:
         return f'error: {e}'
 
 
+def backtest_strategy(strategy_path: str, days: int = 30, ticks_per_candle: int = 1) -> str:
+    """Replay a strategy over real historical candles and return a JSON result summary.
+
+    Imported lazily so a broken/missing /opt/tools module can never stop the agent from
+    starting -- the same reason the price feed is imported inside monitor.py's helper.
+    """
+    try:
+        from backtest import backtest
+        return json.dumps(backtest(strategy_path, days=int(days),
+                                   ticks_per_candle=int(ticks_per_candle)))
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
+def get_price_history(hours: int = 720, interval: int = 60) -> str:
+    """Recent XLM/USD close prices as a JSON list, oldest first."""
+    try:
+        from ohlc_history import closes
+        return json.dumps(closes(hours=int(hours), interval=int(interval)))
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 TOOLS = {
+    'backtest_strategy': backtest_strategy,
+    'get_price_history': get_price_history,
     'calculate': calculate,
     'get_current_time': get_current_time,
     'get_uptime': get_uptime,
