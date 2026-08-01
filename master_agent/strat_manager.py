@@ -143,6 +143,16 @@ def stop_strategy(name):
     state[name]['status'] = 'stopped'
     save_state(state)
 
+def stop_all_strategies():
+    state = load_state()
+    running = [name for name, info in state.items() if info.get('status') == 'running']
+    if not running:
+        print("No running strategies.")
+        return
+    for name in running:
+        stop_strategy(name)
+    print(f"Stopped {len(running)} strategy(ies).")
+
 def list_strategies():
     state = load_state()
     if not state:
@@ -160,6 +170,7 @@ def usage():
     print("  clone <name> <repo_url>    Clone strategy repository")
     print("  start <name> [cmd]         Start strategy (optional custom command)")
     print("  stop <name>                Stop running strategy")
+    print("  stopall                    Stop all running strategies")
     print("  list                       List known strategies and status")
     print("  reconcile                  Fix state entries stuck 'running' with a dead pid")
 
@@ -177,6 +188,8 @@ if __name__ == '__main__':
         start_strategy(name, custom_cmd)
     elif cmd == 'stop' and len(sys.argv) == 3:
         stop_strategy(sys.argv[2])
+    elif cmd == 'stopall':
+        stop_all_strategies()
     elif cmd == 'list':
         list_strategies()
     elif cmd == 'reconcile':
