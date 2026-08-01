@@ -243,13 +243,15 @@ def run():
         leaderboard = json.dumps({n: score for n, score in performances})
         new_clone_names = []
         for name, score in top_two:
-            # create a new unique name (not derived from the parent's name, so it
-            # doesn't keep growing across generations of clones-of-clones)
+            # Only the name is intentionally not derived from the parent (so it
+            # doesn't keep growing across generations of clones-of-clones); the
+            # git clone itself still pulls the winning strategy's own repo.
             new_name = f"clone_{uuid.uuid4().hex[:12]}"
+            parent_repo = state[name]['path']
             print(f'Cloning best strategy {name} as {new_name}')
-            subprocess.run(['/opt/strat_manager.py', 'clone', new_name, TEMPLATE_REPO])
+            subprocess.run(['/opt/strat_manager.py', 'clone', new_name, parent_repo])
             new_clone_names.append(new_name)
-            parent_cfg = Path(state[name]['path']) / 'config.json'
+            parent_cfg = Path(parent_repo) / 'config.json'
             new_cfg = Path(STRATEGIES_DIR) / new_name / 'config.json'
 
             revised = False
