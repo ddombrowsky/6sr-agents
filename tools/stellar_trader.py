@@ -53,11 +53,10 @@ _USDC_CODE = "USDC"
 _USDC_ISSUER = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
 _USDC_ASSET = f"{_USDC_CODE}:{_USDC_ISSUER}"
 
-# Rollout phase 1 starter values (pubnet-plan.md) — deliberately tiny until behavior is
-# trusted, then raised by a human editing this file directly. Never read from any
-# strategy's config.json.
-MAX_TRADE_USD = 1.0
-MAX_DAILY_USD = 5.0
+# starter values raised by a human editing this file directly. Never read
+# from any strategy's config.json.
+MAX_TRADE_USD = 2.0
+MAX_DAILY_USD = 10.0
 
 _SLIPPAGE = 0.01  # dest-min tolerance on path payments
 _XLM_DUST = 0.5  # wind_down considers the position flat below this
@@ -112,7 +111,7 @@ def _spendable_xlm(account_json):
     sell/wind_down chunk never tries to spend down to a balance the network will
     reject once its own transaction fee is deducted."""
     balance = _asset_balance(account_json, "XLM")
-    reserve = (2 + account_json.get("subentry_count", 0)) * _BASE_RESERVE_XLM
+    reserve = (2.5 + account_json.get("subentry_count", 0)) * _BASE_RESERVE_XLM
     return max(0.0, balance - reserve - _FEE_BUFFER_XLM)
 
 
