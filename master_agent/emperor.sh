@@ -121,7 +121,7 @@ while true; do
     # plain `timeout monitor.py` would only kill monitor.py itself and
     # orphan any in-flight revise-strategy subprocess, leaving it running
     # unsupervised alongside the next cycle's fresh monitor.py.
-    setsid python3 /opt/monitor.py > "$MONITOR_LOG" 2>&1 &
+    setsid python3 -u /opt/monitor.py > "$MONITOR_LOG" 2>&1 &
     MONITOR_PID=$!
     MONITOR_START=$(date +%s)
 
