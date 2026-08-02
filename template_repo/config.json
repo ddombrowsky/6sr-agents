@@ -1,6 +1,8 @@
 {
   "name": "template_agent",
+  "schema_version": 2,
   "buy_below": 0.0,
   "sell_above": 0.0,
-  "trade_amount_usd": 10.0
+  "trade_amount_usd": 10.0,
+  "assets": []
 }

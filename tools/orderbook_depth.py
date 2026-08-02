@@ -57,7 +57,15 @@ def get_orderbook_metrics(depth=20):
         mid_price = (best_bid + best_ask) / 2
         spread = best_ask - best_bid
 
-        bid_depth_usd = sum(float(b["price"]) * float(b["amount"]) for b in bids)
+        # Horizon denominates the two sides differently, verified live by fetching this
+        # same book with base and counter swapped and matching the identical offer on
+        # both sides: a bid's `amount` is already in COUNTER units (USDC here), while an
+        # ask's is in BASE units (XLM). This previously multiplied bid amounts by price
+        # as well, which undercounted bid depth by a factor of the price -- measured
+        # $0.34 against $1.96 actual on the XLM/USDC book -- and left `imbalance`
+        # permanently skewed toward "ask-heavy", capable of reporting the wrong sign on
+        # a balanced book. See tools/dex_price.py, which relies on the same rule.
+        bid_depth_usd = sum(float(b["amount"]) for b in bids)
         ask_depth_usd = sum(float(a["price"]) * float(a["amount"]) for a in asks)
         total_depth = bid_depth_usd + ask_depth_usd
         imbalance = (bid_depth_usd - ask_depth_usd) / total_depth if total_depth else 0.0

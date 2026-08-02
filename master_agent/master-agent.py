@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ollama import Client, ResponseError
 
+import score
 import sr_agent_tools
 
 MODEL_NICKNAMES = {
@@ -196,9 +197,13 @@ REVISION_SYSTEM_PROMPT = (
     "read/write live.flag directly from main.py -- that plumbing is intentionally kept "
     "outside the clone you're editing; reimplementing or routing around it risks "
     "double-submitting real trades or bypassing stellar_trader.py's safety caps.\n\n"
-    'You are scored on net worth: `balance_usd + balance_xlm * price * 0.999` (see '
-    '/opt/master_agent/score.py). The 0.1% haircut on the XLM leg is only a tie-break '
-    'nudge toward realizing gains -- it is not worth distorting the strategy for. '
+    # Interpolated, never restated as a literal: this sentence claimed 0.999 for a long
+    # time while score.py actually enforced 0.899, so the model was optimizing a
+    # different objective than the one it was ranked on.
+    f'You are scored on net worth: `balance_usd + balance_xlm * price * '
+    f'{score.UNREALIZED_HAIRCUT}` (see /opt/master_agent/score.py). The '
+    f'{(1 - score.UNREALIZED_HAIRCUT) * 100:.1f}% haircut on the XLM leg is only a '
+    'tie-break nudge toward realizing gains -- it is not worth distorting the strategy for. '
     'Growing net worth is the entire objective; sitting in cash and never trading '
     'scores exactly the starting balance and gets you nowhere.\n\n'
     'You can and should test a revision before committing it. '
@@ -215,11 +220,49 @@ REVISION_SYSTEM_PROMPT = (
     'step in that function and have the trading loop call it. `history` is the list of '
     'recent close prices, oldest first, so indicators work unchanged in both live and '
     'backtest paths.\n\n'
+    'ASSETS. The strategy trades XLM plus UP TO 2 additional Stellar assets, listed in '
+    "config.json's `assets` array (XLM is never listed there -- it is the permanent base "
+    'leg, carried by the top-level buy_below/sell_above/trade_amount_usd). Each entry is '
+    '{"code", "issuer", "buy_below", "sell_above", "trade_amount_usd"}. You may add, '
+    'change or remove those extra assets; you cannot remove XLM.\n'
+    '  * A Stellar asset is the PAIR (code, issuer). The code alone is meaningless: '
+    'anyone can issue an asset with code USDC or AQUA from their own account, and '
+    'impostors are live on the network right now -- there are three different issuers of '
+    '"AQUA", with 191603, 96 and 47 holders. Always write both fields.\n'
+    '  * NEVER write an issuer address from memory. Your recollection of an issuer is '
+    'exactly what an attacker impersonates. Get it from `list_candidate_assets` or '
+    '`verify_asset`, and copy the full 56-character G... address verbatim.\n'
+    '  * Your asset choice is a PROPOSAL, not a decision. monitor.py re-verifies every '
+    'asset before the clone starts and again on later cycles, and silently deletes any '
+    'that fails -- including one that was fine when you picked it and has since lost its '
+    'liquidity. A strategy whose entire thesis rests on one exotic asset will end up an '
+    'XLM-only strategy. Call `verify_asset` before you commit, and prefer assets that '
+    'pass it comfortably.\n'
+    '  * Extra assets trade only on Stellar\'s own DEX: no centralized-exchange price, '
+    'much thinner books, wider spreads, and short/gappy history. Size them well below '
+    'your XLM leg. Scoring marks them at what the live bid side could actually absorb '
+    'and applies an additional illiquidity haircut, so a large position in a thin asset '
+    'is scored at what it could really be sold for, not at its quoted price.\n'
+    '  * Put per-asset logic in an optional `decide_asset(asset, price, history, state, '
+    'config)` returning the same (side, action, requested_usd) 3-tuple or None; it is '
+    'called once per extra asset per tick with that asset\'s own price history. If you '
+    'omit it, each leg just uses its own thresholds from config.json. Keep `decide` for '
+    'the XLM leg -- that is what backtest_strategy replays and what beats_buy_hold is '
+    'measured on. Extra legs are reported separately and over a shorter, less reliable '
+    'window, so do not over-fit to them.\n'
+    '  * Balances now live in `state["positions"]` keyed by asset, but execute_trade '
+    'still maintains them -- you never touch them yourself. Pass the asset as a keyword: '
+    "execute_trade(agent_name, action, side, price, requested_usd, state, "
+    "asset='CODE:ISSUER').\n"
+    '  * Real-money trading is currently XLM-only. A non-XLM leg is always paper, even '
+    'on the live strategy, so do not build a strategy that depends on a real fill in a '
+    'discovered asset.\n\n'
     "Do not default to only nudging buy_below/sell_above. Threshold tweaks are the "
     "weakest lever available to you -- treat them as a last resort, not the first move. "
     "/opt/tools has indicator and signal modules you can import from a strategy's "
-    "main.py, all working (fixed/added by a recent emperor pass, so trust them rather "
-    "than re-deriving your own): ema_sma.py (SMA, `sma(prices, period)`), "
+    "main.py: ema_sma.py (SMA, `sma(prices, period)` -- note it was a truncated stub "
+    "returning None for every sufficient-data case until recently, and its companion "
+    "`exponential_moving_average` did not exist at all; both work now), "
     'moving_averages.py (EMA, `exponential_moving_average(prices, period)`), rsi.py '
     '(`rsi(prices, period)`), ohlc_history.py (`closes(hours=720)` / '
     '`get_candles(hours, interval)` -- ~30 days of REAL historical hourly OHLCV candles '

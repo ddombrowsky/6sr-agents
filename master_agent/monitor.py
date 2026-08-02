@@ -38,6 +38,11 @@ KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycl
 RETIRE_BELOW_RANK = KEEP_TOP_N * 3 # stopped, never-traded strategies below this get untracked
 LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money (pubnet-plan.md)
 
+# Repos whose contents decide how real money moves. Watched every cycle by
+# check_boundary_integrity(); see that function for why.
+INTEGRITY_REPOS = [Path('/opt/tools'), Path('/opt/master_agent')]
+INTEGRITY_BASELINE = Path('/opt/.integrity_baseline.json')
+
 # Guardrails on handing a strategy the real-money live flag. On 2026-08-01 the live flag
 # was given to a clone with zero trades and zero track record, purely because 45 clones
 # that had never traded were tied at the top of a broken ranking. Rank alone is not
@@ -49,7 +54,7 @@ MIN_LIVE_SCORE = 1000.0     # must actually be up on its starting balance
 # How long a revised main.py gets to prove it runs and persists state before the gate
 # gives up on it. Must comfortably exceed one loop iteration (the template fetches a
 # price, then writes state.json, then sleeps 30s) plus a slow price-feed failover.
-SMOKE_TEST_SECONDS = int(os.environ.get('SMOKE_TEST_SECONDS', 75))
+SMOKE_TEST_SECONDS = int(os.environ.get('SMOKE_TEST_SECONDS', 120))
 
 PRICE_FETCH_ATTEMPTS = 3
 PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
@@ -85,8 +90,8 @@ def fetch_price_with_retry():
             time.sleep(PRICE_RETRY_DELAY)
     return None
 
-def compute_strategy_score(strategy_name, state_entry, price):
-    score = score_from_strategy_path(state_entry['path'], price)
+def compute_strategy_score(strategy_name, state_entry, price, marks=None):
+    score = score_from_strategy_path(state_entry['path'], price, marks)
     if score is None:
         print(f'Error reading state for {strategy_name}')
         return -float('inf')
@@ -143,7 +148,228 @@ def trade_stats(name):
         print(f'Could not read trade log for {name}: {e}')
     return count, first, last
 
-def _config_is_sane(cfg, price):
+def _tools():
+    """Lazy handle on the /opt/tools modules, or None if unavailable.
+
+    Imported lazily and defensively so that a problem in the asset stack degrades
+    monitor to XLM-only behavior instead of taking down the whole culling loop.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import asset_discovery
+        import dex_price
+        import portfolio
+        return portfolio, dex_price, asset_discovery
+    except Exception as e:
+        print(f'asset tooling unavailable ({e}); running XLM-only this cycle')
+        return None
+
+
+def fetch_marks_for_cycle(state, price):
+    """One batch of USD marks for every asset any strategy declares or holds.
+
+    Fetched once per cycle, before scoring. Scoring touches every tracked strategy, so
+    doing network I/O per strategy would turn a ~40-strategy ranking pass into hundreds
+    of blocking Horizon calls and earn a rate-limit.
+    """
+    marks = {'XLM': price}
+    tools = _tools()
+    if tools is None:
+        return marks
+    portfolio, dex_price, _ = tools
+
+    specs = set()
+    for name, entry in state.items():
+        path = Path(entry.get('path', ''))
+        try:
+            cfg = json.load(open(path / 'config.json'))
+            specs.update(a['spec'] for a in portfolio.assets_from_config(cfg))
+        except Exception:
+            pass
+        try:
+            st = portfolio.normalize_state(json.load(open(path / 'state.json')))
+            specs.update(s for s, p in st['positions'].items()
+                         if float(p.get('amount') or 0) > 0)
+        except Exception:
+            pass
+    specs.discard('XLM')
+
+    for spec, mark in dex_price.get_marks(sorted(specs)).items():
+        if mark:
+            marks[spec] = mark
+    missing = sorted(specs - set(marks))
+    if missing:
+        print(f'  no mark for {len(missing)} asset(s): {", ".join(missing)}')
+    return marks
+
+
+ASSET_APPROVAL_TTL = 7 * 86400
+VERIFIED_ASSETS_FILE = TRADES_DIR / '.verified_assets.json'
+
+
+def _record_admission(code, issuer, verdict):
+    """Write an admitted asset into the registry stellar_trader enforces against.
+
+    This is the handoff between the second and third verification gates: monitor decides
+    what is admissible, stellar_trader._verified_asset confirms nothing has changed
+    before real money moves. Without this file being written, the enforcement gate finds
+    no record and refuses every non-XLM trade -- safe, but it would mean the live path
+    could never be enabled at all.
+
+    Entries expire after ASSET_APPROVAL_TTL so an asset nobody has re-checked in a week
+    stops being tradeable on its own. A `denied` record is never overwritten here:
+    denials are permanent and are set by stellar_trader when a leg proves unsellable.
+    """
+    try:
+        spec = __import__('assets').canonical(code, issuer)
+    except Exception:
+        return
+    registry = {}
+    if VERIFIED_ASSETS_FILE.exists():
+        try:
+            registry = json.loads(VERIFIED_ASSETS_FILE.read_text())
+        except Exception:
+            registry = {}
+
+    if registry.get(spec, {}).get('denied'):
+        return
+
+    registry[spec] = {
+        'code': code, 'issuer': issuer,
+        'approved_at': time.time(),
+        'approved_by': 'monitor',
+        'expires_at': time.time() + ASSET_APPROVAL_TTL,
+        'evidence': verdict.get('evidence', {}),
+        'denied': False, 'deny_reason': None,
+    }
+    try:
+        tmp = VERIFIED_ASSETS_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(registry, indent=2))
+        tmp.replace(VERIFIED_ASSETS_FILE)
+    except Exception as e:
+        print(f'  could not record admission for {spec}: {e}')
+
+
+def _sanitize_assets(cfg_path, marks=None):
+    """Re-verify every extra asset a config declares and delete the ones that fail.
+
+    Runs on every clone, INCLUDING when the revision made no changes. The `assets` list
+    is committed to git, so it propagates through `git clone` down the entire lineage
+    and `apply_random_tweak` copies it verbatim -- without re-verification here, an
+    asset denied in one generation keeps trading five generations later. Re-checking is
+    also the only thing that catches an asset that was fine when admitted and has since
+    been rugged, delisted, or drained of liquidity.
+
+    Returns the surviving asset list. Rewrites config.json only if something changed.
+    """
+    tools = _tools()
+    if tools is None:
+        return []
+    portfolio, _, asset_discovery = tools
+
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        return []
+
+    # Iterate the RAW list, not portfolio.assets_from_config(). That helper dedupes by
+    # asset code and caps the list, which is right for a *running* strategy but wrong
+    # here: a second entry sharing a code with a good one would be silently skipped and
+    # therefore never verified, and would stay in config.json on disk looking admitted.
+    # Anything written into the file has to be examined here or physically removed.
+    raw = cfg.get('assets')
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    kept, seen_codes = [], set()
+    changed = False
+    for entry in raw:
+        if not isinstance(entry, dict):
+            print('  dropping malformed asset entry (not an object)')
+            changed = True
+            continue
+        code, issuer = entry.get('code'), entry.get('issuer')
+        try:
+            assets_mod = sys.modules.get('assets') or __import__('assets')
+            spec = assets_mod.canonical(code, issuer)
+        except Exception as e:
+            print(f'  dropping asset {code!r}: {e}')
+            changed = True
+            continue
+        # canonical('XLM', None) succeeds -- XLM is a valid asset, just never a valid
+        # *extra* one. It is the permanent base leg carried by the top-level thresholds,
+        # so listing it here would double-count the position.
+        if assets_mod.is_native(spec):
+            print('  dropping XLM from assets: it is the base leg, not an extra asset')
+            changed = True
+            continue
+        if code.upper() in seen_codes:
+            print(f'  dropping duplicate asset code {assets_mod.display(spec)}')
+            changed = True
+            continue
+        if len(kept) >= portfolio.MAX_EXTRA_ASSETS:
+            print(f'  dropping {code}: more than {portfolio.MAX_EXTRA_ASSETS} extra assets')
+            changed = True
+            continue
+
+        verdict = asset_discovery.verify_asset(code, issuer)
+        if not verdict['ok']:
+            reason = verdict['vetoes'][0] if verdict['vetoes'] else \
+                f"only {verdict['score']} evidence points from " \
+                f"{verdict['sources_consulted']} sources"
+            print(f'  dropping unverified asset {assets_mod.display(spec)} -- {reason}')
+            changed = True
+            continue
+
+        seen_codes.add(code.upper())
+        kept.append(entry)
+        _record_admission(code, issuer, verdict)
+
+    if changed:
+        cfg['assets'] = kept
+        try:
+            json.dump(cfg, open(cfg_path, 'w'), indent=2)
+        except Exception as e:
+            print(f'  could not rewrite config after dropping assets: {e}')
+    return portfolio.assets_from_config(cfg)
+
+
+def _assets_are_sane(cfg, marks):
+    """Validate the `assets` block. A missing mark is NOT a failure.
+
+    Failing the whole config over a transient Horizon blip would send the revision to
+    the random-tweak fallback and discard the model's work; _sanitize_assets drops
+    unpriceable legs instead.
+    """
+    tools = _tools()
+    if tools is None:
+        return True
+    portfolio = tools[0]
+
+    raw = cfg.get('assets')
+    if raw in (None, []):
+        return True
+    if not isinstance(raw, list) or len(raw) > portfolio.MAX_EXTRA_ASSETS:
+        return False
+
+    parsed = portfolio.assets_from_config(cfg)
+    if len(parsed) != len(raw):
+        return False       # something was malformed, duplicated, or was XLM
+
+    for asset in parsed:
+        mark = (marks or {}).get(asset['spec'])
+        if not mark:
+            continue       # unpriceable right now; _sanitize_assets handles it
+        buy, sell = asset['buy_below'], asset['sell_above']
+        if buy <= 0 or sell <= 0 or buy >= sell:
+            return False
+        if buy < mark * 0.5 or sell > mark * 1.5:
+            return False
+    return True
+
+
+def _config_is_sane(cfg, price, marks=None):
     # Guards against a revision that "succeeds" (subprocess returncode 0) but
     # leaves the clone dead-on-arrival: unset/inverted thresholds never
     # trade, and thresholds set implausibly far from the real fetched price
@@ -160,9 +386,9 @@ def _config_is_sane(cfg, price):
         return False
     if price and (buy_below < price * 0.5 or sell_above > price * 1.5):
         return False
-    return True
+    return _assets_are_sane(cfg, marks)
 
-def main_py_is_sane(strategy_dir, name, price):
+def main_py_is_sane(strategy_dir, name, price, marks=None):
     """Check that a revised main.py actually parses, runs, and persists state.
 
     _config_is_sane only ever looked at config.json, so a revision that gutted
@@ -204,16 +430,21 @@ def main_py_is_sane(strategy_dir, name, price):
         except Exception:
             pass
         cfg['name'] = scratch_name
-        if not _config_is_sane(cfg, price):
+        if not _config_is_sane(cfg, price, marks):
             # Thresholds are validated separately; don't let a bad config mask a
-            # main.py that would run fine once the fallback fixes them.
+            # main.py that would run fine once the fallback fixes them. The `assets`
+            # list is deliberately preserved here -- stripping it would mean the smoke
+            # test never exercises the multi-asset path it is supposed to be checking.
             cfg['buy_below'] = round(price * 0.98, 6)
             cfg['sell_above'] = round(price * 1.02, 6)
         json.dump(cfg, open(tmp_dir / 'config.json', 'w'), indent=2)
 
+        # PAPER_ONLY makes the no-live-trading guarantee structural rather than relying
+        # on having remembered to drop live.flag from the copy.
+        env = dict(os.environ, PAPER_ONLY='1')
         proc = subprocess.Popen(['python3', '-u', 'main.py'], cwd=str(tmp_dir),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, preexec_fn=os.setsid)
+                                text=True, preexec_fn=os.setsid, env=env)
         try:
             out, _ = proc.communicate(timeout=SMOKE_TEST_SECONDS)
             # Exiting on its own is fatal: strat_manager starts main.py once, so a
@@ -240,16 +471,46 @@ def main_py_is_sane(strategy_dir, name, price):
             return False, (f'main.py ran for {SMOKE_TEST_SECONDS}s without ever writing '
                            f'state.json: {tail}')
         try:
-            st = json.load(open(state_path))
-            usd = float(st['balance_usd'])
-            xlm = float(st['balance_xlm'])
+            raw = json.load(open(state_path))
         except Exception as e:
             return False, f'main.py wrote an unreadable state.json: {e}'
-        if usd < 0 or xlm < 0:
-            return False, f'main.py wrote negative balances (usd={usd}, xlm={xlm})'
-        if usd + xlm * price <= 0:
-            return False, f'main.py wrote a zero/negative net worth (usd={usd}, xlm={xlm})'
-        return True, f'ran {SMOKE_TEST_SECONDS}s, net worth {usd + xlm * price:.2f}'
+
+        tools = _tools()
+        if tools is None:
+            usd = float(raw.get('balance_usd', 0.0))
+            xlm = float(raw.get('balance_xlm', 0.0))
+            if usd < 0 or xlm < 0:
+                return False, f'main.py wrote negative balances (usd={usd}, xlm={xlm})'
+            if usd + xlm * price <= 0:
+                return False, f'main.py wrote a zero/negative net worth (usd={usd}, xlm={xlm})'
+            return True, f'ran {SMOKE_TEST_SECONDS}s, net worth {usd + xlm * price:.2f}'
+
+        portfolio = tools[0]
+        st = portfolio.normalize_state(raw)
+        usd = st['balance_usd']
+        if usd < 0:
+            return False, f'main.py wrote a negative USD balance ({usd})'
+        for spec, position in st['positions'].items():
+            if float(position.get('amount') or 0) < 0:
+                return False, f'main.py wrote a negative {spec} balance'
+
+        # A position in something the config does not declare means the strategy
+        # traded an asset that was never admitted -- exactly what the asset gate
+        # exists to prevent, so it fails the revision rather than being tidied away.
+        declared = portfolio.declared_specs(cfg)
+        undeclared = set(st['positions']) - declared
+        undeclared = {s for s in undeclared
+                      if float(st['positions'][s].get('amount') or 0) > 0}
+        if undeclared:
+            return False, f'main.py holds undeclared asset(s): {", ".join(sorted(undeclared))}'
+
+        marks_for_check = dict(marks or {})
+        marks_for_check.setdefault('XLM', price)
+        net_worth, unpriced = portfolio.net_worth(st, marks_for_check)
+        if net_worth <= 0:
+            return False, f'main.py wrote a zero/negative net worth ({net_worth})'
+        note = f', {len(unpriced)} leg(s) unpriced' if unpriced else ''
+        return True, f'ran {SMOKE_TEST_SECONDS}s, net worth {net_worth:.2f}{note}'
     except Exception as e:
         return False, f'smoke test errored: {e}'
     finally:
@@ -370,13 +631,17 @@ def apply_seed_thresholds(cfg_path, name, price):
             pass
     new_cfg_data = {
         'name': name,
+        'schema_version': 2,
         'buy_below': round(price * 0.98, 6),
         'sell_above': round(price * 1.02, 6),
         'trade_amount_usd': trade_amount_usd,
+        # Seeds are always XLM-only. Picking extra assets is a trait the population
+        # evolves via revisions, not something bootstrapping guesses at.
+        'assets': [],
     }
     json.dump(new_cfg_data, open(cfg_path, 'w'), indent=2)
 
-def bootstrap_initial_strategies(price, count=2):
+def bootstrap_initial_strategies(price, count=2, marks=None):
     # First run: strategy_state.json doesn't exist yet, so there's nothing to
     # stop or clone-from in the normal cycle below. Seed `count` strategies
     # straight from the template so there's something for later cycles to evolve.
@@ -413,8 +678,14 @@ def bootstrap_initial_strategies(price, count=2):
         # Runs whenever the model touched the repo, even if `revised` is already False:
         # both fallbacks only rewrite config.json, so a gutted main.py would otherwise
         # survive a failed config check and get started anyway (seed_0_1785619070).
+        # Verify declared assets before the smoke test, so the smoke run exercises the
+        # same asset list the strategy will actually start with. Runs even when the
+        # revision failed: the fallbacks copy `assets` through untouched.
+        if cfg_path.exists():
+            _sanitize_assets(cfg_path, marks)
+
         if touched:
-            ok, reason = main_py_is_sane(strategy_dir, name, price)
+            ok, reason = main_py_is_sane(strategy_dir, name, price, marks)
             print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
             if not ok:
                 revert_main_py(strategy_dir, before_head, name)
@@ -422,7 +693,7 @@ def bootstrap_initial_strategies(price, count=2):
 
         if revised and cfg_path.exists():
             cfg = json.load(open(cfg_path))
-            if not _config_is_sane(cfg, price):
+            if not _config_is_sane(cfg, price, marks):
                 print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
                 revised = False
 
@@ -442,10 +713,31 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     tweak = random.uniform(0.95, 1.05)
     new_cfg_data = {
         'name': new_name,
+        'schema_version': parent.get('schema_version', 2),
         'buy_below': round(parent['buy_below'] * tweak, 6),
         'sell_above': round(parent['sell_above'] * tweak, 6),
         'trade_amount_usd': parent.get('trade_amount_usd', 10.0)
     }
+
+    # Carry the parent's extra assets across, nudging each leg by its OWN factor so the
+    # fallback explores per-leg thresholds rather than moving every leg in lockstep.
+    # Never invents an asset: only assets the parent already had (and which
+    # _sanitize_assets re-verifies afterwards) can appear here.
+    inherited = []
+    for asset in (parent.get('assets') or []):
+        if not isinstance(asset, dict):
+            continue
+        leg_tweak = random.uniform(0.95, 1.05)
+        leg = dict(asset)
+        for key in ('buy_below', 'sell_above'):
+            try:
+                leg[key] = round(float(asset[key]) * leg_tweak, 9)
+            except (KeyError, TypeError, ValueError):
+                pass
+        inherited.append(leg)
+    if inherited:
+        new_cfg_data['assets'] = inherited
+
     json.dump(new_cfg_data, open(new_cfg_path, 'w'), indent=2)
 
 def _config_signature(state_entry):
@@ -454,7 +746,18 @@ def _config_signature(state_entry):
         cfg = json.load(open(Path(state_entry['path']) / 'config.json'))
     except Exception:
         return None
-    return (cfg.get('buy_below'), cfg.get('sell_above'), cfg.get('trade_amount_usd'))
+    assets = cfg.get('assets') or []
+    if not isinstance(assets, list):
+        assets = []
+    # Assets are part of what defines a strategy. Without them two clones differing
+    # ONLY in which assets they picked look identical here, select_parents discards one
+    # as a duplicate, and a revision slot is wasted -- killing exactly the diversity
+    # multi-asset support exists to create.
+    asset_sig = tuple(sorted(
+        (a.get('code'), a.get('issuer'), a.get('buy_below'), a.get('sell_above'))
+        for a in assets if isinstance(a, dict)))
+    return (cfg.get('buy_below'), cfg.get('sell_above'),
+            cfg.get('trade_amount_usd'), asset_sig)
 
 def select_parents(performances, state, count=2):
     """Pick `count` distinct strategies to clone and revise this cycle.
@@ -506,6 +809,107 @@ def set_live_flag(name, live):
     else:
         flag_path.unlink(missing_ok=True)
 
+def main_py_calls_execute_trade(name):
+    """Whether <name>/main.py routes its trades through trade_logger.execute_trade.
+
+    About ten strategies in the population still mutate balances inline and call
+    record_trade directly -- the style the template moved away from. They log paper
+    trades normally and are indistinguishable on the leaderboard, but execute_trade is
+    the *only* path that checks live.flag and calls stellar_trader.submit_trade, so
+    those strategies are structurally incapable of placing a real order.
+
+    Promoting one is worse than a no-op: set_live_flag writes live.flag, the strategy
+    ignores it, and monitor now believes real money is deployed behind a position that
+    was never opened. The next leader change then calls wind_down() against an account
+    this strategy never touched, and gates the promotion on liquidating a position that
+    doesn't exist.
+
+    Returns (ok, reason). An unreadable or unparseable main.py fails closed.
+    """
+    main_py = STRATEGIES_DIR / name / 'main.py'
+    try:
+        tree = ast.parse(main_py.read_text())
+    except Exception as e:
+        return False, f'could not parse main.py ({e})'
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = func.attr if isinstance(func, ast.Attribute) else getattr(func, 'id', None)
+        if called == 'execute_trade':
+            return True, ''
+    return False, ('main.py never calls execute_trade (inline record_trade style), '
+                   'so it cannot submit a real order')
+
+
+def check_boundary_integrity():
+    """Has the real-money safety boundary been modified out from under us? (ok, reasons)
+
+    stellar_trader.py is the only thing enforcing MAX_TRADE_USD / MAX_DAILY_USD, and its
+    docstring says those caps are deliberately not caller-supplied so a revision cannot
+    override them. That argument holds only as long as the file itself is fixed -- and
+    the revision agent runs `exec` as root with no path restriction and is explicitly
+    told it may edit its own tooling. Nothing structurally prevents it rewriting the caps
+    or the trading code. Until that hole is closed properly (an unprivileged revision
+    user, or a read-only mount), this is the detection layer: notice when the boundary
+    changes and stop trading real money rather than trusting it.
+
+    Two signals, both cheap:
+      * a dirty working tree in /opt/tools or /opt/master_agent -- the realistic shape of
+        a tampering event, since a model writing a file has no reason to commit it
+      * HEAD moved away from the recorded baseline -- catches the case where it does
+
+    The baseline lives in INTEGRITY_BASELINE and is adopted automatically the first time
+    this runs against clean repos. After a legitimate change, commit it and delete that
+    file; the next cycle re-adopts. That deliberate manual step is the point -- an
+    automatic re-baseline would detect nothing.
+    """
+    reasons = []
+    heads = {}
+    for repo in INTEGRITY_REPOS:
+        if not (repo / '.git').exists():
+            continue
+        # Deliberately NOT .strip()ed: porcelain status codes occupy two fixed columns
+        # and an unstaged modification is " M path", so stripping the whole output eats
+        # the leading space of the first line and shifts every column offset by one
+        # (reported "onitor.py" for monitor.py).
+        dirty = subprocess.run(['git', '-C', str(repo), 'status', '--porcelain'],
+                               capture_output=True, text=True).stdout
+        head = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'],
+                              capture_output=True, text=True).stdout.strip()
+        heads[str(repo)] = head
+        changed = [line[3:].strip() for line in dirty.splitlines() if line.strip()]
+        if changed:
+            shown = ', '.join(changed[:5])
+            more = f' +{len(changed) - 5} more' if len(changed) > 5 else ''
+            reasons.append(f'{repo} has uncommitted changes ({shown}{more})')
+
+    baseline = {}
+    if INTEGRITY_BASELINE.exists():
+        try:
+            baseline = json.loads(INTEGRITY_BASELINE.read_text())
+        except Exception:
+            reasons.append('integrity baseline is unreadable')
+
+    if baseline:
+        for repo, head in heads.items():
+            recorded = baseline.get(repo)
+            if recorded and head and recorded != head:
+                reasons.append(
+                    f'{repo} HEAD moved {recorded[:8]} -> {head[:8]} without re-baselining')
+    elif not reasons:
+        # First clean run: adopt what we see. Never adopt a dirty tree as the baseline,
+        # or a tampering event present at startup would be blessed permanently.
+        try:
+            INTEGRITY_BASELINE.write_text(json.dumps(heads, indent=2))
+            print(f'Recorded live-trading integrity baseline: '
+                  f'{ {k: v[:8] for k, v in heads.items()} }')
+        except Exception as e:
+            print(f'Could not write integrity baseline: {e}')
+
+    return (not reasons), reasons
+
+
 def qualifies_for_live(name, score):
     """Whether `name` has earned the right to trade real money. (ok, reason)
 
@@ -515,6 +919,11 @@ def qualifies_for_live(name, score):
     track record. If nothing qualifies, nothing is promoted and no live trading
     happens this cycle -- that is the intended safe default.
     """
+    # Checked first: this is about whether the strategy *can* trade live at all, which
+    # no amount of paper track record makes up for.
+    can_execute, why_not = main_py_calls_execute_trade(name)
+    if not can_execute:
+        return False, why_not
     count, first, last = trade_stats(name)
     if count < MIN_LIVE_TRADES:
         return False, f'only {count} trades logged (need {MIN_LIVE_TRADES})'
@@ -534,7 +943,37 @@ def promote_live_strategy(current_leader, leader_score):
     strategy from KEEP_TOP_N below).
     """
     live = load_live_strategy()
+
+    # Integrity is checked before the "already live" early return, so a boundary change
+    # halts an incumbent too -- not just a would-be promotion.
+    intact, problems = check_boundary_integrity()
+    if not intact:
+        print('LIVE TRADING HALTED -- the real-money safety boundary has changed:')
+        for problem in problems:
+            print(f'  - {problem}')
+        held = live.get('name') if live else None
+        if held:
+            # Clear the flag so no further real orders can be placed, but deliberately
+            # do NOT wind_down: liquidating would route through the very code whose
+            # integrity is in question. Stopping is safe and reversible; trading through
+            # possibly-modified caps is not. Any open position is left for a human.
+            set_live_flag(held, False)
+            print(f'  cleared live.flag on {held}; its position (if any) is left open '
+                  f'for manual review')
+        print('  review the changes, commit them, then delete '
+              f'{INTEGRITY_BASELINE} to re-baseline')
+        return
+
     if live and live.get('name') == current_leader:
+        # Re-assert the flag rather than just returning. A halt above clears live.flag
+        # while leaving live_strategy.json pointing at the same name, so this early
+        # return would otherwise never restore it: the system would stay halted forever
+        # even after the operator fixed the boundary and re-baselined, with no path back
+        # short of a leader change. Recovery should follow integrity automatically.
+        flag = STRATEGIES_DIR / current_leader / 'live.flag'
+        if not flag.exists():
+            print(f'Restoring live.flag for {current_leader} (boundary intact again)')
+            set_live_flag(current_leader, True)
         return
 
     ok, reason = qualifies_for_live(current_leader, leader_score)
@@ -584,8 +1023,11 @@ def run():
         subprocess.run(['/opt/strat_manager.py', 'prune'])
 
         state = load_state()
+        # One batch of asset marks per cycle, before any scoring. Doing this per
+        # strategy would mean hundreds of blocking Horizon calls per ranking pass.
+        marks = fetch_marks_for_cycle(state, price)
         if not state:
-            bootstrap_initial_strategies(price)
+            bootstrap_initial_strategies(price, marks=marks)
             print(f'Sleeping for {CYCLE_SLEEP}s...')
             time.sleep(CYCLE_SLEEP)
             continue
@@ -593,13 +1035,13 @@ def run():
         if len(state) < KEEP_TOP_N:
             shortfall = KEEP_TOP_N - len(state)
             print(f'Only {len(state)} strategies known (< {KEEP_TOP_N}); backfilling {shortfall} from template.')
-            bootstrap_initial_strategies(price, count=shortfall)
+            bootstrap_initial_strategies(price, count=shortfall, marks=marks)
             state = load_state()
 
         performances = []
         trade_counts = {}
         for name, info in state.items():
-            score = compute_strategy_score(name, info, price)
+            score = compute_strategy_score(name, info, price, marks)
             trade_counts[name] = trade_stats(name)[0]
             performances.append((name, score))
         # Tie-break on trade count. Strategies that have never traded all sit at exactly
@@ -687,10 +1129,16 @@ def run():
                 print(f'Revision for {new_name} left the clone identical to {name}; treating as unrevised')
                 revised = False
 
+            # Always re-verify declared assets, revised or not: `assets` is committed
+            # to git and inherited by every future clone of this lineage, and
+            # apply_random_tweak copies it forward verbatim.
+            if new_cfg.exists():
+                _sanitize_assets(new_cfg, marks)
+
             # See bootstrap_initial_strategies: this must run even when `revised` is
             # already False, since the random-tweak fallback only rewrites config.json.
             if touched:
-                ok, reason = main_py_is_sane(new_dir, new_name, price)
+                ok, reason = main_py_is_sane(new_dir, new_name, price, marks)
                 print(f'main.py check for {new_name}: {"passed" if ok else "FAILED"} -- {reason}')
                 if not ok:
                     revert_main_py(new_dir, before_head, new_name)
@@ -698,7 +1146,7 @@ def run():
 
             if revised and new_cfg.exists():
                 cfg = json.load(open(new_cfg))
-                if not _config_is_sane(cfg, price):
+                if not _config_is_sane(cfg, price, marks):
                     print(f'Revised config for {new_name} failed sanity check ({cfg}); treating as unrevised')
                     revised = False
 

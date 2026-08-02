@@ -3,15 +3,26 @@
     "type": "function",
     "function": {
       "name": "backtest_strategy",
-      "description": "Replay a trading strategy over ~30 days of real historical hourly XLM/USD candles and return a JSON summary: return_pct, buy_hold_pct, beats_buy_hold, trades, sells, win_rate, max_drawdown_pct, final_net_worth, and decide_source. Use this to check whether a strategy revision is actually an improvement BEFORE starting it or committing it -- it takes a second or two, versus an hour of live paper trading for one very noisy sample. `beats_buy_hold: false` means the strategy loses to simply holding XLM and should be reworked. If decide_source comes back as \"config-thresholds\" the strategy's main.py does not expose a top-level decide(price, history, state, config) function, so the backtest is only measuring its config.json thresholds, not any custom logic you wrote.",
+      "description": "Replay a strategy over ~30 days of real historical hourly XLM/USD candles and return return_pct, buy_hold_pct, beats_buy_hold, trades, win_rate and max_drawdown_pct. Use it as your fitness check instead of guessing. beats_buy_hold is computed on the XLM leg ONLY. If the strategy declares extra assets, each is replayed separately over its own (shorter, thinner, gappier) Stellar DEX history and reported under `legs` -- check `active_buckets` there before trusting a leg's return, since a leg with few traded buckets rests on very little real price discovery. Do not over-fit to leg numbers.",
       "parameters": {
         "type": "object",
         "properties": {
-          "strategy_path": {"type": "string", "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"},
-          "days": {"type": "integer", "description": "How many days of history to replay (default 30, max useful ~30)"},
-          "ticks_per_candle": {"type": "integer", "description": "Decision points per candle. 1 (default) evaluates once per hour; pass 120 to approximate the live loop's 30-second polling cadence, which matters for strategies that fire repeatedly while a threshold is standing."}
+          "strategy_path": {
+            "type": "string",
+            "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"
+          },
+          "days": {
+            "type": "integer",
+            "description": "How many days of history to replay (default 30, max useful ~30)"
+          },
+          "ticks_per_candle": {
+            "type": "integer",
+            "description": "Decision points per candle. 1 (default) evaluates once per hour; pass 120 to approximate the live loop's 30-second polling cadence, which matters for strategies that fire repeatedly while a threshold is standing."
+          }
         },
-        "required": ["strategy_path"]
+        "required": [
+          "strategy_path"
+        ]
       }
     }
   },
@@ -23,8 +34,14 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "hours": {"type": "integer", "description": "How many hours of history to return (default 720)"},
-          "interval": {"type": "integer", "description": "Candle size in minutes: 1, 5, 15, 60 (default), 240, or 1440"}
+          "hours": {
+            "type": "integer",
+            "description": "How many hours of history to return (default 720)"
+          },
+          "interval": {
+            "type": "integer",
+            "description": "Candle size in minutes: 1, 5, 15, 60 (default), 240, or 1440"
+          }
         }
       }
     }
@@ -37,9 +54,14 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "expression": {"type": "string", "description": "e.g. (3 + 4) * 2"}
+          "expression": {
+            "type": "string",
+            "description": "e.g. (3 + 4) * 2"
+          }
         },
-        "required": ["expression"]
+        "required": [
+          "expression"
+        ]
       }
     }
   },
@@ -48,7 +70,10 @@
     "function": {
       "name": "get_current_time",
       "description": "Get the current local date and time",
-      "parameters": {"type": "object", "properties": {}}
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
     }
   },
   {
@@ -56,7 +81,10 @@
     "function": {
       "name": "get_uptime",
       "description": "Report system uptime, logged-in user count, and the 1/5/15-minute load averages. Use for any question about system load, how busy the machine is, or how long it has been running.",
-      "parameters": {"type": "object", "properties": {}}
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
     }
   },
   {
@@ -67,9 +95,14 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "Absolute or relative path to the file to read"}
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to the file to read"
+          }
         },
-        "required": ["path"]
+        "required": [
+          "path"
+        ]
       }
     }
   },
@@ -81,10 +114,19 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "path": {"type": "string", "description": "Absolute or relative path to the file to write"},
-          "content": {"type": "string", "description": "Text content to write to the file"}
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to the file to write"
+          },
+          "content": {
+            "type": "string",
+            "description": "Text content to write to the file"
+          }
         },
-        "required": ["path", "content"]
+        "required": [
+          "path",
+          "content"
+        ]
       }
     }
   },
@@ -96,9 +138,14 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "url": {"type": "string", "description": "The URL to fetch, e.g. https://example.com"}
+          "url": {
+            "type": "string",
+            "description": "The URL to fetch, e.g. https://example.com"
+          }
         },
-        "required": ["url"]
+        "required": [
+          "url"
+        ]
       }
     }
   },
@@ -110,9 +157,14 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "package": {"type": "string", "description": "The apt package name to install, e.g. jq"}
+          "package": {
+            "type": "string",
+            "description": "The apt package name to install, e.g. jq"
+          }
         },
-        "required": ["package"]
+        "required": [
+          "package"
+        ]
       }
     }
   },
@@ -121,7 +173,10 @@
     "function": {
       "name": "update_package_list",
       "description": "Refresh the apt package index (apt-get update). Run this before installing a package if it might not be found.",
-      "parameters": {"type": "object", "properties": {}}
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
     }
   },
   {
@@ -132,9 +187,107 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "command": {"type": "string", "description": "The shell command to run, e.g. \"ls -la /opt\""}
+          "command": {
+            "type": "string",
+            "description": "The shell command to run, e.g. \"ls -la /opt\""
+          }
         },
-        "required": ["command"]
+        "required": [
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_candidate_assets",
+      "description": "List Stellar assets that a strategy could add as one of its up to 2 extra trading legs, ranked by liquidity and reputation. Returns code, issuer, rating, trustline count and 7d volume for each. Use this to FIND candidate assets rather than recalling asset issuers from memory -- an asset code alone is not unique and impostors exist on-chain. Presence in this list is a proposal, not approval: every asset is still re-verified by monitor.py before the strategy starts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "How many candidates to return (default 15)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "verify_asset",
+      "description": "Check whether a specific (code, issuer) Stellar asset would be admitted for trading, and see the underlying evidence: reputation rating, trustline count, 7d volume, issuer flags, order-book spread and depth, and any disqualifying concerns. Call this BEFORE writing an asset into config.json -- monitor.py runs the same check and silently deletes any asset that fails.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, e.g. AQUA."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's full 56-character G... address. Never abbreviate it and never write one from memory."
+          }
+        },
+        "required": [
+          "code",
+          "issuer"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_asset_price",
+      "description": "Current USD mark for one Stellar asset plus live order-book liquidity (spread, bid depth, ask depth). Use this to set that asset's buy_below/sell_above thresholds against its real current price, and to judge how large a position it could actually support.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, e.g. AQUA."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's full 56-character G... address."
+          }
+        },
+        "required": [
+          "code",
+          "issuer"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_asset_price_history",
+      "description": "Hourly OHLC candles for one Stellar asset, oldest first, for computing indicators on an extra asset leg. Note this history comes from Stellar's on-chain DEX and is thinner and gappier than the XLM/USD history from get_price_history -- hours with no trades are absent entirely.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, e.g. AQUA."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's full 56-character G... address."
+          },
+          "hours": {
+            "type": "integer",
+            "description": "How many hours of history (default 168)."
+          }
+        },
+        "required": [
+          "code",
+          "issuer"
+        ]
       }
     }
   }
