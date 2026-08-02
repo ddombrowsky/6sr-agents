@@ -83,6 +83,13 @@ _BASE_RESERVE_XLM = 0.5  # current Stellar protocol base reserve per subentry
 # margin against fee bumps across a chunked sequence.
 _FEE_BUFFER_XLM = 0.01
 _MAX_WIND_DOWN_CHUNKS_PER_CALL = 20  # safety bound; remainder retried next monitor.py cycle
+# Spendable XLM that wind_down() will not sell. Not a safety cap like the ones at the top
+# of this file -- it exists because wind_down's "sell everything" premise drains the
+# account to its protocol floor, leaving _spendable_xlm() at 0.0 and the sell leg dead
+# until a human funds it again (observed 2026-08-01 16:09 and 2026-08-02 17:31, both
+# times immediately after a leader change). Sized so the account can still open every
+# trustline it is allowed to and keep the operating buffer on top.
+WIND_DOWN_RESERVE_XLM = MIN_XLM_OPERATING_BUFFER + MAX_OPEN_NONBASE_ASSETS * _BASE_RESERVE_XLM
 
 
 def _paper_only():
@@ -267,6 +274,17 @@ def _spendable_xlm(account_json):
     balance = _asset_balance(account_json, "XLM")
     reserve = (2.5 + account_json.get("subentry_count", 0)) * _BASE_RESERVE_XLM
     return max(0.0, balance - reserve - _FEE_BUFFER_XLM)
+
+
+def _sellable_xlm(account_json):
+    """Spendable XLM that wind_down() may liquidate — spendable minus the operating floor.
+
+    Deliberately NOT used by submit_trade: a strategy selling its own position is meant
+    to be able to exit it completely, and flooring that would silently change trading
+    behaviour. This narrower notion applies only to the demotion path, where nothing is
+    live and the leftover XLM is infrastructure rather than a position anyone chose.
+    """
+    return max(0.0, _spendable_xlm(account_json) - WIND_DOWN_RESERVE_XLM)
 
 
 def _current_live_name():
@@ -742,13 +760,22 @@ def _total_nonbase_exposure(account_json):
 
 
 def wind_down() -> dict:
-    """Liquidate claudio's entire real XLM position back to USDC.
+    """Liquidate claudio's real XLM position back to USDC, down to the operating floor.
 
     Called by monitor.py's promote_live_strategy when swapping the live strategy — not
     importable from template_repo/, same restriction as submit_trade. Exactly one
     strategy trades live at a time, so claudio's on-chain XLM balance at demotion time
-    is entirely attributable to the outgoing live strategy; there's no per-strategy
-    position to track, just flatten whatever's on the account.
+    is attributable to the outgoing live strategy; there's no per-strategy position to
+    track, just flatten what's on the account.
+
+    Except that "what's on the account" is not all position. WIND_DOWN_RESERVE_XLM of
+    spendable XLM is held back, because native XLM is also what pays fees and funds
+    trustline reserves. Selling down to the protocol floor — which this function did
+    until 2026-08-02 — leaves _spendable_xlm() at exactly 0.0, and from there every
+    subsequent sell and every wind_down returns "insufficient balance": the next live
+    strategy can open a position it cannot close, and the failure is invisible until a
+    human reads the account. The floor is small in USD terms (~$0.35 at $0.175) and is
+    the cheapest way to keep the sell leg alive across a leader change.
 
     Sells in MAX_TRADE_USD-sized chunks to avoid slippage from dumping a large position
     in one market sell, looping until the remaining balance is below the dust threshold
@@ -769,9 +796,12 @@ def wind_down() -> dict:
     the asset permanently, suspends non-XLM buys, and halts everything past
     MAX_STUCK_USD, which is what makes that trade-off safe.
 
-    Returns {'liquidated', 'remaining_xlm', 'chunks', 'reason', 'legs', 'stuck'}. The
-    first four keys keep their exact meaning -- monitor.promote_live_strategy gates on
-    'liquidated' and reports 'remaining_xlm'.
+    Returns {'liquidated', 'remaining_xlm', 'chunks', 'reason', 'legs', 'stuck'}.
+    monitor.promote_live_strategy gates on 'liquidated' and reports 'remaining_xlm';
+    both now measure the *sellable* balance, i.e. net of WIND_DOWN_RESERVE_XLM. That is
+    the load-bearing half of the floor: measuring 'liquidated' against raw spendable
+    would leave it permanently False once the floor is reached, and a leader change
+    would then never complete -- trading one stuck state for a worse one.
     """
     if _paper_only():
         return {"liquidated": False, "remaining_xlm": 0.0, "chunks": 0,
@@ -823,7 +853,7 @@ def wind_down() -> dict:
     # XLM last.
     while chunks < _MAX_WIND_DOWN_CHUNKS_PER_CALL:
         account = _account(_source_address())
-        remaining = _spendable_xlm(account)
+        remaining = _sellable_xlm(account)
         if remaining <= _XLM_DUST:
             break
 
@@ -847,7 +877,7 @@ def wind_down() -> dict:
         _log_pubnet_trade("wind_down_sell", chunk_usd, send_amount, tx_hash)
         chunks += 1
 
-    remaining_xlm = _spendable_xlm(_account(_source_address()))
+    remaining_xlm = _sellable_xlm(_account(_source_address()))
     stuck = [l['spec'] for l in legs if l['stuck']]
     if remaining_xlm > _XLM_DUST:
         return {"liquidated": False, "remaining_xlm": remaining_xlm, "chunks": chunks,
@@ -864,7 +894,8 @@ if __name__ == "__main__":
     xlm = _asset_balance(account, "XLM")
     usdc = _asset_balance(account, "USDC")
     print(f"claudio ({address})")
-    print(f"  XLM:  {xlm:.7f} (spendable above reserve: {_spendable_xlm(account):.7f})")
+    print(f"  XLM:  {xlm:.7f} (spendable above reserve: {_spendable_xlm(account):.7f}, "
+          f"wind_down-sellable: {_sellable_xlm(account):.7f})")
     print(f"  USDC: {'no trustline' if usdc is None else f'{usdc:.7f}'}")
     print(f"  daily spend used: ${_daily_spent():.2f} / ${MAX_DAILY_USD:.2f}")
     print("(read-only status check — submit_trade()/wind_down() are not called here)")
