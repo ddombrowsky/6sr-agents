@@ -61,6 +61,23 @@ def load_marks(state, price):
     return marks, portfolio
 
 
+def extra_legs(st):
+    """[(CODE, amount)] for every non-XLM position held, sorted by code.
+
+    Codes rather than full specs: portfolio.assets_from_config already dedupes a
+    strategy's assets by code, so within one row a bare code is unambiguous.
+    """
+    legs = []
+    for spec, position in st['positions'].items():
+        if spec == 'XLM':
+            continue
+        amount = float(position.get('amount') or 0)
+        if amount <= 0:
+            continue
+        legs.append((position.get('code') or spec.split(':')[0], amount))
+    return sorted(legs)
+
+
 def main():
     price = get_price()
     if price is None:
@@ -77,7 +94,7 @@ def main():
     total_unpriced = 0
     for name, info in state.items():
         usd, xlm = load_balances(info['path'])
-        legs, unpriced = 0, []
+        legs, unpriced = [], []
         score = None
         if usd is not None and price is not None:
             if portfolio is None:
@@ -86,30 +103,29 @@ def main():
                 try:
                     st = portfolio.normalize_state(
                         json.load(open(Path(info['path']) / 'state.json')))
-                    legs = sum(1 for s, p in st['positions'].items()
-                               if s != 'XLM' and float(p.get('amount') or 0) > 0)
+                    legs = extra_legs(st)
                     score, unpriced = compute_score_multi(st, marks)
                 except Exception:
                     score = compute_score(usd, xlm, price)
         total_unpriced += len(unpriced)
-        rows.append((name, info.get('status'), info.get('pid'), usd, xlm, score, legs))
+        rows.append((name, info.get('status'), info.get('pid'), score, usd, xlm, legs))
 
     # Strategies with unknown score sort last; known ones descending by score.
-    rows.sort(key=lambda r: (r[5] is None, -(r[5] or 0)))
+    rows.sort(key=lambda r: (r[3] is None, -(r[3] or 0)))
 
     name_w = max(len(r[0]) for r in rows) + 2
-    header = (f"{'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'USD':>12}"
-              f"{'XLM':>14}{'LEGS':>6}{'SCORE':>14}")
+    header = (f"{'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>14}"
+              f"{'USD':>12}{'XLM':>14}  {'ASSETS'}")
     print(header)
     print('-' * len(header))
-    for name, status, pid, usd, xlm, score, legs in rows:
+    for name, status, pid, score, usd, xlm, legs in rows:
+        score_s = f'{score:.2f}' if score is not None else 'N/A'
         usd_s = f'{usd:.2f}' if usd is not None else 'N/A'
         xlm_s = f'{xlm:.4f}' if xlm is not None else 'N/A'
-        score_s = f'{score:.2f}' if score is not None else 'N/A'
         pid_s = str(pid) if pid else '-'
-        legs_s = str(legs) if legs else '-'
-        print(f'{name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{usd_s:>12}'
-              f'{xlm_s:>14}{legs_s:>6}{score_s:>14}')
+        legs_s = ', '.join(f'{code}:{amount:.4f}' for code, amount in legs) or '-'
+        print(f'{name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>14}'
+              f'{usd_s:>12}{xlm_s:>14}  {legs_s}')
 
     if price is not None:
         print(f'\nCurrent XLM/USD price: {price}')
