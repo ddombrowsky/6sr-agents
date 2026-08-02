@@ -56,6 +56,13 @@ MIN_LIVE_SCORE = 1000.0     # must actually be up on its starting balance
 # price, then writes state.json, then sleeps 30s) plus a slow price-feed failover.
 SMOKE_TEST_SECONDS = int(os.environ.get('SMOKE_TEST_SECONDS', 120))
 
+# Odds that a freshly bootstrapped strategy which ended up with no assets is handed the
+# next assets from the Reflector oracle's tracked list. A coin flip rather than always:
+# the point is to introduce non-XLM legs into a population that otherwise cannot invent
+# one, while keeping XLM-only seeds in the mix as the control group to rank them against.
+REFLECTOR_INJECT_CHANCE = 0.5
+REFLECTOR_INJECT_COUNT = 2
+
 PRICE_FETCH_ATTEMPTS = 3
 PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
 PRICE_FAILURE_SLEEP = 300   # seconds to wait before retrying a cycle that got no price
@@ -336,6 +343,126 @@ def _sanitize_assets(cfg_path, marks=None):
         except Exception as e:
             print(f'  could not rewrite config after dropping assets: {e}')
     return portfolio.assets_from_config(cfg)
+
+
+# Cursor over the Reflector oracle's tracked-asset list, used to hand freshly
+# bootstrapped strategies something to trade besides XLM. In memory only: losing it on
+# restart just means starting the walk over, and persisting it would be one more file to
+# keep consistent for no benefit.
+#
+# This exists because nothing else in monitor can introduce an asset. _sanitize_assets
+# only removes, apply_seed_thresholds only clears, and apply_random_tweak only copies the
+# parent's -- so with the revision model unresponsive, every clone falls through to the
+# tweak fallback and the population can never discover a non-XLM leg on its own.
+_reflector_pool = {'assets': [], 'index': 0}
+
+
+def _next_reflector_assets(count=2):
+    """The next `count` oracle-tracked assets, cycling and refreshing when exhausted.
+
+    Returns [] if the oracle is unreachable, so injection simply doesn't happen that
+    round -- the same fail-safe degradation to XLM-only the rest of the asset stack uses.
+
+    A short tail (one left when two are wanted) yields just that one rather than
+    refreshing mid-call to top up a single slot: a refresh costs 1-2 minutes of CLI
+    invocations, and the caller is happy with fewer candidates.
+    """
+    pool = _reflector_pool
+    if pool['index'] >= len(pool['assets']):
+        try:
+            if '/opt/tools' not in sys.path:
+                sys.path.append('/opt/tools')
+            import reflector_oracle
+            pool['assets'] = reflector_oracle.get_tracked_assets()
+        except Exception as e:
+            print(f'  could not refresh the Reflector asset pool: {e}')
+            pool['assets'] = []
+        pool['index'] = 0
+        if not pool['assets']:
+            return []
+        print(f"  refreshed Reflector asset pool: {len(pool['assets'])} tracked assets")
+
+    picks = pool['assets'][pool['index']:pool['index'] + count]
+    pool['index'] += len(picks)
+    return picks
+
+
+def _inject_reflector_assets(cfg_path, marks=None, count=2):
+    """Give a still-XLM-only bootstrapped strategy a coin flip at two oracle assets.
+
+    Returns True if config.json was written. The picks are *proposals*, exactly like an
+    LLM-chosen asset: the caller runs _sanitize_assets straight afterwards, so every
+    normal verification rule (clawback, auth_required, trustlines, age, spread, bid
+    depth, pinned issuers) still decides what actually survives. "Next two" therefore
+    routinely yields one or zero.
+
+    Any pick with no mark is skipped -- a leg with no price cannot be given sane
+    thresholds, would never trade, and would fail _assets_are_sane if a mark appeared
+    later. Marks that are fetched get folded into `marks` so the cycle's sanity checks
+    validate the new legs rather than skipping them as unpriced.
+    """
+    tools = _tools()
+    if tools is None:
+        return False
+    portfolio, dex_price, _ = tools
+
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        return False
+    if portfolio.assets_from_config(cfg):
+        return False  # already has assets; nothing to seed
+
+    if random.random() >= REFLECTOR_INJECT_CHANCE:
+        return False
+
+    candidates = _next_reflector_assets(count)
+    if not candidates:
+        return False
+
+    base_size = float(cfg.get('trade_amount_usd') or 10.0)
+    injected = []
+    for candidate in candidates:
+        mark = dex_price.get_mark(candidate['spec'])
+        if not mark or mark <= 0:
+            print(f"  skipping {candidate['spec']}: no mark")
+            continue
+        # Same +/-2% band apply_seed_thresholds gives the XLM leg, so an injected leg
+        # starts out exactly as (in)active as the seed it rides along with. Rounded to
+        # 9dp to match apply_random_tweak's per-leg precision -- which is why the result
+        # has to be re-checked: several tracked assets mark below 1e-3, and one below
+        # ~5e-10 would round its band flat to 0.0 (or to buy == sell), failing
+        # _assets_are_sane and dragging the whole config into the fallback.
+        buy_below = round(mark * 0.98, 9)
+        sell_above = round(mark * 1.02, 9)
+        if buy_below <= 0 or buy_below >= sell_above:
+            print(f"  skipping {candidate['spec']}: mark {mark!r} is too small to give "
+                  f"a representable threshold band")
+            continue
+        injected.append({
+            'code': candidate['code'],
+            'issuer': candidate['issuer'],
+            'buy_below': buy_below,
+            'sell_above': sell_above,
+            # Deliberately smaller than the XLM leg: these books are thin, which is
+            # what the revision prompt tells the model about extra assets too.
+            'trade_amount_usd': round(base_size / 4, 2),
+        })
+        if marks is not None:
+            marks[candidate['spec']] = mark
+
+    if not injected:
+        return False
+
+    cfg['assets'] = injected
+    try:
+        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+    except Exception as e:
+        print(f'  could not write injected assets: {e}')
+        return False
+    print(f"  seeded {len(injected)} Reflector-tracked asset(s): "
+          f"{', '.join(a['code'] for a in injected)}")
+    return True
 
 
 def _assets_are_sane(cfg, marks):
@@ -627,9 +754,12 @@ def apply_seed_thresholds(cfg_path, name, price):
     # apply_random_tweak (0.0 * anything is still 0.0). Seed a real range
     # around the current price instead.
     trade_amount_usd = 10.0
+    existing_assets = []
     if cfg_path.exists():
         try:
-            trade_amount_usd = json.load(open(cfg_path)).get('trade_amount_usd', 10.0)
+            existing = json.load(open(cfg_path))
+            trade_amount_usd = existing.get('trade_amount_usd', 10.0)
+            existing_assets = existing.get('assets') or []
         except Exception:
             pass
     new_cfg_data = {
@@ -638,9 +768,13 @@ def apply_seed_thresholds(cfg_path, name, price):
         'buy_below': round(price * 0.98, 6),
         'sell_above': round(price * 1.02, 6),
         'trade_amount_usd': trade_amount_usd,
-        # Seeds are always XLM-only. Picking extra assets is a trait the population
-        # evolves via revisions, not something bootstrapping guesses at.
-        'assets': [],
+        # This rebuilds config.json from scratch, so `assets` has to be carried across
+        # explicitly. It used to hard-write [], which was fine while seeds were always
+        # XLM-only -- but this runs in the `not revised` branch, exactly the case
+        # _inject_reflector_assets targets, so clearing it here would wipe every
+        # injected leg moments after it was written. Only the XLM thresholds are seeded;
+        # the extra legs already carry their own, derived from their marks.
+        'assets': existing_assets if isinstance(existing_assets, list) else [],
     }
     json.dump(new_cfg_data, open(cfg_path, 'w'), indent=2)
 
@@ -678,6 +812,13 @@ def bootstrap_initial_strategies(price, count=2, marks=None):
             print(f'Revision for {name} left the clone untouched; treating as unrevised')
             revised = False
 
+        # Bootstrap is the one place a non-XLM leg can enter the population mechanically
+        # rather than by the revision model choosing to write one. Before sanitizing, so
+        # the picks go through the exact same verification gate an LLM-chosen asset does.
+        injected = False
+        if cfg_path.exists():
+            injected = _inject_reflector_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
+
         # Runs whenever the model touched the repo, even if `revised` is already False:
         # both fallbacks only rewrite config.json, so a gutted main.py would otherwise
         # survive a failed config check and get started anyway (seed_0_1785619070).
@@ -687,7 +828,10 @@ def bootstrap_initial_strategies(price, count=2, marks=None):
         if cfg_path.exists():
             _sanitize_assets(cfg_path, marks)
 
-        if touched:
+        # `or injected`: a failed revision that changed nothing leaves `touched` False,
+        # which is the common case here -- but injection still changes runtime behavior
+        # (an extra get_mark per leg per tick), so it has to face the same gate.
+        if touched or injected:
             ok, reason = main_py_is_sane(strategy_dir, name, price, marks)
             print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
             if not ok:
