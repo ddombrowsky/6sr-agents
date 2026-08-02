@@ -54,8 +54,9 @@ def load_marks(state, price):
                          if s != 'XLM' and float(p.get('amount') or 0) > 0)
         except Exception:
             pass
-    for spec, mark in dex_price.get_marks(sorted(specs)).items():
-        if mark:
+    for spec in sorted(specs):
+        mark = dex_price.get_mark_with_depth(spec)
+        if mark and mark.get('price'):
             marks[spec] = mark
     return marks, portfolio
 

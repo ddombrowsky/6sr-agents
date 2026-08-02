@@ -396,6 +396,36 @@ def get_mark(spec, quote=None):
     return None
 
 
+def realize_against_bids(amount, bids):
+    """USD obtainable for `amount` units by walking a bid ladder. Pure, no network.
+
+    Split out so scoring can depth-cap every strategy's position from ONE order book
+    fetched per asset per cycle, instead of hitting Horizon per strategy. Quantity beyond
+    the available bids contributes nothing -- there is nobody to sell it to.
+    """
+    remaining, proceeds = float(amount), 0.0
+    for bid in bids or []:
+        if remaining <= 0:
+            break
+        take = min(remaining, float(bid['base_amount']))
+        proceeds += take * float(bid['price'])
+        remaining -= take
+    return proceeds
+
+
+def get_mark_with_depth(spec, quote=None):
+    """{'price': float, 'bids': [...]} for `spec`, or None.
+
+    The bid ladder is USD-normalized by get_orderbook, so callers can walk it directly.
+    Fetched once per asset per scoring cycle and reused across every strategy holding it.
+    """
+    price = get_mark(spec, quote=quote)
+    if price is None:
+        return None
+    book = None if assets.is_native(spec) else get_orderbook(spec, quote=quote)
+    return {'price': price, 'bids': (book or {}).get('bids', [])}
+
+
 def mark_value(spec, amount, quote=None):
     """USD the position `amount` of `spec` could actually be sold into right now.
 
@@ -427,14 +457,8 @@ def mark_value(spec, amount, quote=None):
         price = get_mark(spec, quote=quote)
         return None if price is None else amount * price
 
-    remaining, proceeds = amount, 0.0
-    for bid in book['bids']:
-        if remaining <= 0:
-            break
-        take = min(remaining, bid['base_amount'])
-        proceeds += take * bid['price']
-        remaining -= take
-    return proceeds   # unfilled remainder contributes nothing, by design
+    # unfilled remainder contributes nothing, by design
+    return realize_against_bids(amount, book['bids'])
 
 
 def get_marks(specs, quote=None):

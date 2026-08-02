@@ -46,15 +46,25 @@ except Exception:      # pragma: no cover - keeps the XLM-only path working stan
 # the two cannot drift apart again.
 UNREALIZED_HAIRCUT = 0.999
 
-# Applied to non-XLM legs on top of their mark. This is a DIFFERENT KIND OF NUMBER from
-# UNREALIZED_HAIRCUT and the two must never be "harmonized". UNREALIZED_HAIRCUT is a
-# hurdle rate on an asset the strategy is expected to hold, so it stays near 1.0.
-# ILLIQUID_HAIRCUT is a slippage estimate on a thin order book, and it is *supposed* to
-# bias against exotic legs: a discovered asset with a few thousand dollars of depth
-# genuinely cannot be exited at its quoted price the way XLM can. dex_price.mark_value
-# already caps a position at real bid depth; this is the residual haircut on what's
-# left, covering the gap between "there are bids" and "those bids survive contact".
-ILLIQUID_HAIRCUT = 0.90
+# Residual nudge on a non-XLM leg AFTER its value has already been depth-capped against
+# the real bid ladder. It covers only the gap between "these bids exist right now" and
+# "these bids survive contact" -- so, like UNREALIZED_HAIRCUT, it must stay near 1.0.
+#
+# This was 0.90, and that was the same mistake as the original 0.899 UNREALIZED_HAIRCUT
+# in miniature: a flat 10% charge is a hurdle rate, not a slippage estimate, and it made
+# a multi-asset strategy uncompetitive by construction. Measured against the live book on
+# 2026-08-02, seed_multiasset_1785700731 held 308,151 AQUA marked at $105.01 whose real
+# depth-capped exit value was $104.35 -- 0.6% of genuine slippage, against which the flat
+# haircut charged $10.50, overstating it roughly sixteenfold. The strategy scored 988.88,
+# ranked last of twelve, and would have been culled on the next cycle: the loop deleting
+# precisely the behaviour it was extended to explore.
+#
+# Real illiquidity is now measured rather than guessed. compute_score_multi walks the
+# asset's actual bid ladder (fetched once per asset per cycle by
+# monitor.fetch_marks_for_cycle) and values the position at what it could really be sold
+# into, with quantity beyond available depth counting as zero. A genuinely thin asset is
+# still penalised -- severely, if its book is shallow -- but by evidence, not by fiat.
+ILLIQUID_HAIRCUT = 0.99
 
 # How long a last-known-good mark may be reused before the leg is valued at zero.
 # Deliberately finite: an asset that suddenly cannot be priced is what a rug looks like,
@@ -95,11 +105,18 @@ def compute_score_multi(state, marks):
         if amount <= 0:
             continue
         mark = marks.get(spec)
-        if mark is None or mark <= 0:
+        if mark is None:
+            unpriced.append(spec)
+            continue
+        # realizable_value depth-caps against the bid ladder when one was supplied, and
+        # falls back to amount x unit price when it wasn't -- so a caller that passes
+        # plain floats still gets sensible (if less precise) numbers.
+        value = _portfolio.realizable_value(amount, mark)
+        if value is None:
             unpriced.append(spec)
             continue
         haircut = UNREALIZED_HAIRCUT if spec == _assets.NATIVE else ILLIQUID_HAIRCUT
-        total += amount * mark * haircut
+        total += value * haircut
 
     return total, unpriced
 

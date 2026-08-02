@@ -166,6 +166,34 @@ def add_amount(state, spec, delta):
     return position['amount']
 
 
+def mark_price(mark):
+    """Scalar USD unit price from a mark entry, or None.
+
+    A mark may be a bare float, or a {'price', 'bids'} dict carrying the asset's bid
+    ladder so scoring can depth-cap a position without re-fetching per strategy. Both
+    forms are accepted everywhere a mark is read, so callers that only need a price never
+    have to care which they were handed.
+    """
+    if isinstance(mark, dict):
+        mark = mark.get('price')
+    return _as_float(mark, default=0.0) if mark is not None else None
+
+
+def realizable_value(amount, mark):
+    """USD the position is really worth: depth-capped when a bid ladder is available,
+    otherwise amount x unit price. Returns None if the asset cannot be priced at all."""
+    price = mark_price(mark)
+    if price is None or price <= 0:
+        return None
+    if isinstance(mark, dict) and mark.get('bids'):
+        try:
+            import dex_price
+            return dex_price.realize_against_bids(amount, mark['bids'])
+        except Exception:
+            pass
+    return amount * price
+
+
 def net_worth(state, marks):
     """Mark-to-market net worth. Returns (net_worth, unpriced_specs).
 
@@ -188,11 +216,11 @@ def net_worth(state, marks):
         if amount <= 0:
             continue
         mark = marks.get(spec) if isinstance(marks, dict) else None
-        mark = _as_float(mark, default=0.0) if mark is not None else None
-        if mark is None or mark <= 0:
+        value = realizable_value(amount, mark) if mark is not None else None
+        if value is None:
             unpriced.append(spec)
             continue
-        total += amount * mark
+        total += value
     return total, unpriced
 
 

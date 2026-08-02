@@ -195,8 +195,11 @@ def fetch_marks_for_cycle(state, price):
             pass
     specs.discard('XLM')
 
-    for spec, mark in dex_price.get_marks(sorted(specs)).items():
-        if mark:
+    # One order book per asset per cycle, carrying the bid ladder so scoring can
+    # depth-cap each strategy's position without any further network calls.
+    for spec in sorted(specs):
+        mark = dex_price.get_mark_with_depth(spec)
+        if mark and mark.get('price'):
             marks[spec] = mark
     missing = sorted(specs - set(marks))
     if missing:
@@ -358,7 +361,7 @@ def _assets_are_sane(cfg, marks):
         return False       # something was malformed, duplicated, or was XLM
 
     for asset in parsed:
-        mark = (marks or {}).get(asset['spec'])
+        mark = portfolio.mark_price((marks or {}).get(asset['spec']))
         if not mark:
             continue       # unpriceable right now; _sanitize_assets handles it
         buy, sell = asset['buy_below'], asset['sell_above']
