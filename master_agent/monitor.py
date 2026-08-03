@@ -228,6 +228,85 @@ def trade_stats(name):
         print(f'Could not read trade log for {name}: {e}')
     return count, first, last
 
+def turnover_stats(name):
+    """(trades, turnover_usd, friction_usd) from this strategy's trade log.
+
+    Turnover is the sum of every fill's notional -- the quantity a spread is charged on,
+    and the one number that says whether a strategy has an edge or just a habit. On
+    2026-08-03 the leader had turned over $5,757 to gain $23.33: a 40.5 bp edge, against
+    a book that costs ~8.7 bp round trip and extra-asset books that cost 150-190. That
+    ratio existed in the trade logs all along and nothing ever computed it, so "962
+    trades" read as evidence of a working strategy rather than as a cost to be covered.
+
+    `friction_usd` is summed from the per-line friction_bp that trade_logger started
+    writing on 2026-08-03. Lines from before that are counted into turnover but
+    contribute no cost, which is correct -- they genuinely were not charged any.
+    """
+    log_path = trade_log_path(name)
+    if not log_path.exists():
+        return 0, 0.0, 0.0
+    trades = 0
+    turnover = friction_usd = 0.0
+    try:
+        with log_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                trades += 1
+                notional = abs(float(row.get('amount_usd') or 0.0))
+                turnover += notional
+                bp = row.get('friction_bp')
+                if bp:
+                    friction_usd += notional * float(bp) / 10000.0
+    except Exception as e:
+        print(f'Could not read trade log for {name}: {e}')
+    return trades, turnover, friction_usd
+
+
+def print_turnover_report(performances, limit=KEEP_TOP_N):
+    """One block per cycle: what the leaders traded, and what trading it cost them.
+
+    Sits next to the score table deliberately. Score says who is winning; this says
+    whether they are winning by having an edge or by being lucky with a lot of coin
+    flips, which is the distinction the cull could not previously make.
+    """
+    rows = []
+    for name, score in performances[:limit]:
+        trades, turnover, friction_usd = turnover_stats(name)
+        if not trades:
+            continue
+        gain = score - MIN_LIVE_SCORE      # vs the 1000.00 starting balance
+        # Edge per dollar traded. Below the round-trip cost of the book it trades on,
+        # a strategy is paying to play.
+        edge_bp = (gain / turnover * 10000) if turnover > 0 else None
+        rows.append((name, trades, turnover, gain, edge_bp, friction_usd))
+    if not rows:
+        return
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import friction
+        cost_bp = friction.round_trip_bp('XLM')
+    except Exception:
+        cost_bp = None
+    header = f'Turnover vs edge (XLM round trip costs {cost_bp} bp):' if cost_bp \
+        else 'Turnover vs edge:'
+    print(header)
+    for name, trades, turnover, gain, edge_bp, friction_usd in rows:
+        edge = f'{edge_bp:.1f} bp/$' if edge_bp is not None else 'n/a'
+        # The verdict, spelled out: an edge thinner than the toll is not an edge.
+        verdict = ''
+        if edge_bp is not None and cost_bp:
+            verdict = '  <-- edge below trading cost' if edge_bp < cost_bp else ''
+        print(f'  {name}: {trades} trades, ${turnover:,.0f} turnover, '
+              f'{gain:+.2f} gain, {edge}, ${friction_usd:.2f} paid{verdict}')
+
+
 def _tools():
     """Lazy handle on the /opt/tools modules, or None if unavailable.
 
@@ -479,6 +558,100 @@ def _sanitize_assets(cfg_path, marks=None):
 # tweak fallback and the population can never discover a non-XLM leg on its own.
 _reflector_pool = {'assets': [], 'index': 0}
 
+# Codes that are never worth injecting as a *tradeable extra leg*, whatever their
+# liquidity. USDC and the other dollar anchors are the quote asset: "buying" one with USD
+# at ~$1.00 opens a position that cannot appreciate, consumes one of the two
+# MAX_EXTRA_ASSETS slots, and pays the spread twice for the privilege. They rank near the
+# top of discover_candidates precisely because they are the most liquid things on the
+# network, so without this the liquidity-first pool below would hand out USDC first,
+# every time.
+_UNTRADEABLE_CODES = {'USDC', 'USDT', 'USD', 'DAI', 'BUSD', 'TUSD', 'USDX', 'YUSDC'}
+
+# An injected leg's threshold band must be at least this many times its round-trip
+# trading cost, or the band is mostly toll. See _inject_discovered_assets.
+BAND_COST_MULTIPLE = 4.0
+
+
+def _leg_round_trip(spec):
+    """Round-trip cost for `spec` as a fraction, or 0.0 if friction can't be consulted.
+
+    Fails open, unlike friction.py's own default: this only widens a threshold band, and
+    a tools outage should leave the band at the historical +/-2% rather than silently
+    widening every injected leg to the non-base floor.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import friction
+        return friction.half_spread(spec) * 2
+    except Exception:
+        return 0.0
+
+# Same cursor shape as _reflector_pool, over asset_discovery.discover_candidates() --
+# stellar.expert's liquidity/rating-ranked universe. This is the primary source now; see
+# _next_candidate_assets.
+_discovered_pool = {'assets': [], 'index': 0}
+
+
+def _next_discovered_assets(count=2):
+    """The next `count` liquidity-ranked candidates, cycling and refreshing when spent.
+
+    Why this exists alongside the Reflector pool: on 2026-08-03 the Reflector channel had
+    a 0% admission rate. Every single asset it proposed was rejected by _sanitize_assets
+    moments later -- apUSDT (113 trustlines, needs 200), asUSDC (80.7% spread), KES (200%
+    spread), VEUR (no mark at all). That is not bad luck. reflector_oracle tracks a price
+    feed, and most of what it feeds prices for is fiat forex anchors that barely trade on
+    the Stellar DEX, so the one mechanism that can introduce a non-XLM leg into the
+    population was structurally incapable of introducing one.
+
+    asset_discovery.discover_candidates() was already here, already ranked by
+    stellar.expert's composite rating and trustline count, and returned exactly the
+    assets that DO pass -- AQUA, XRP, BTCLN, ZARZ. It was reachable only from the
+    revision LLM's tool surface, which was itself dead (see _check_revision_interpreter),
+    so nothing mechanical had ever used it.
+
+    Same contract as _next_reflector_assets: [] on failure, shuffled on refresh so a
+    restart doesn't re-propose the alphabetical/ranked head forever, and every pick is a
+    PROPOSAL that _sanitize_assets re-verifies independently.
+    """
+    pool = _discovered_pool
+    if pool['index'] >= len(pool['assets']):
+        try:
+            if '/opt/tools' not in sys.path:
+                sys.path.append('/opt/tools')
+            import asset_discovery
+            found = asset_discovery.discover_candidates(limit=50) or []
+        except Exception as e:
+            print(f'  could not refresh the discovered asset pool: {e}')
+            found = []
+        pool['assets'] = [a for a in found
+                          if (a.get('code') or '').upper() not in _UNTRADEABLE_CODES]
+        random.shuffle(pool['assets'])
+        pool['index'] = 0
+        if not pool['assets']:
+            return []
+        print(f"  refreshed discovered asset pool: {len(pool['assets'])} ranked assets "
+              f"(shuffled; first few: {', '.join(a['code'] for a in pool['assets'][:4])})")
+
+    picks = pool['assets'][pool['index']:pool['index'] + count]
+    pool['index'] += len(picks)
+    return picks
+
+
+def _next_candidate_assets(count=2):
+    """Assets to propose to a fresh strategy: liquidity-ranked first, oracle as backup.
+
+    Kept as two separate pools rather than one merged list so the fallback is legible in
+    the logs: if discover_candidates is down (stellar.expert unreachable), the cycle
+    still proposes *something* rather than proposing nothing, and the log line says which
+    source it came from.
+    """
+    picks = _next_discovered_assets(count)
+    if picks:
+        return picks
+    print('  discovered pool empty; falling back to the Reflector oracle list')
+    return _next_reflector_assets(count)
+
 
 def _next_reflector_assets(count=2):
     """The next `count` oracle-tracked assets, cycling and refreshing when exhausted.
@@ -520,8 +693,8 @@ def _next_reflector_assets(count=2):
     return picks
 
 
-def _inject_reflector_assets(cfg_path, marks=None, count=2):
-    """Give a still-XLM-only bootstrapped strategy a coin flip at two oracle assets.
+def _inject_discovered_assets(cfg_path, marks=None, count=2):
+    """Give a still-XLM-only bootstrapped strategy a coin flip at two discovered assets.
 
     Returns True if config.json was written. The picks are *proposals*, exactly like an
     LLM-chosen asset: the caller runs _sanitize_assets straight afterwards, so every
@@ -549,7 +722,7 @@ def _inject_reflector_assets(cfg_path, marks=None, count=2):
     if random.random() >= REFLECTOR_INJECT_CHANCE:
         return False
 
-    candidates = _next_reflector_assets(count)
+    candidates = _next_candidate_assets(count)
     if not candidates:
         return False
 
@@ -560,14 +733,21 @@ def _inject_reflector_assets(cfg_path, marks=None, count=2):
         if not mark or mark <= 0:
             print(f"  skipping {candidate['spec']}: no mark")
             continue
-        # Same +/-2% band apply_seed_thresholds gives the XLM leg, so an injected leg
-        # starts out exactly as (in)active as the seed it rides along with. Rounded to
-        # 9dp to match apply_random_tweak's per-leg precision -- which is why the result
-        # has to be re-checked: several tracked assets mark below 1e-3, and one below
-        # ~5e-10 would round its band flat to 0.0 (or to buy == sell), failing
+        # The band starts at the +/-2% apply_seed_thresholds gives the XLM leg, but is
+        # widened if this asset's own book is wide enough to eat it. A round trip inside
+        # the band earns (band - round_trip_cost); on the XLM book (8.7 bp) a 4% band
+        # keeps essentially all of it, but AQUA's book measured 151 bp round trip and
+        # ARS's 186 bp, so a 4% band on those hands back a third to a half of every
+        # winning trade before anything else happens. BAND_COST_MULTIPLE keeps the round
+        # trip at most 1/N of the band, which on a thin asset simply means it trades
+        # less often and only on moves actually worth crossing for.
+        # Rounded to 9dp to match apply_random_tweak's per-leg precision -- which is why
+        # the result has to be re-checked: several tracked assets mark below 1e-3, and
+        # one below ~5e-10 would round its band flat to 0.0 (or to buy == sell), failing
         # _assets_are_sane and dragging the whole config into the fallback.
-        buy_below = round(mark * 0.98, 9)
-        sell_above = round(mark * 1.02, 9)
+        half_band = max(0.02, _leg_round_trip(candidate['spec']) * BAND_COST_MULTIPLE / 2)
+        buy_below = round(mark * (1 - half_band), 9)
+        sell_above = round(mark * (1 + half_band), 9)
         if buy_below <= 0 or buy_below >= sell_above:
             print(f"  skipping {candidate['spec']}: mark {mark!r} is too small to give "
                   f"a representable threshold band")
@@ -593,9 +773,14 @@ def _inject_reflector_assets(cfg_path, marks=None, count=2):
     except Exception as e:
         print(f'  could not write injected assets: {e}')
         return False
-    print(f"  seeded {len(injected)} Reflector-tracked asset(s): "
+    print(f"  seeded {len(injected)} discovered asset(s): "
           f"{', '.join(a['code'] for a in injected)}")
     return True
+
+
+# The old name, kept because it is referenced in CLAUDE.md, default-assets.md and several
+# emperor_logs, and a future pass reading those should not find a NameError.
+_inject_reflector_assets = _inject_discovered_assets
 
 
 def _assets_are_sane(cfg, marks):
@@ -944,7 +1129,7 @@ def apply_seed_thresholds(cfg_path, name, price):
         # This rebuilds config.json from scratch, so `assets` has to be carried across
         # explicitly. It used to hard-write [], which was fine while seeds were always
         # XLM-only -- but this runs in the `not revised` branch, exactly the case
-        # _inject_reflector_assets targets, so clearing it here would wipe every
+        # _inject_discovered_assets targets, so clearing it here would wipe every
         # injected leg moments after it was written. Only the XLM thresholds are seeded;
         # the extra legs already carry their own, derived from their marks.
         'assets': existing_assets if isinstance(existing_assets, list) else [],
@@ -961,6 +1146,47 @@ def _revision_budget():
     """
     return REVISIONS_PER_CYCLE if random.random() < REVISION_CHANCE else 0
 
+_REVISION_INTERPRETER_CHECKED = []
+
+
+def _check_revision_interpreter():
+    """Warn loudly, once per process, if sys.executable cannot import ollama.
+
+    On 2026-08-03 every revision in every observed cycle had been failing with
+    `ModuleNotFoundError: No module named 'ollama'`, and the only trace was one line of
+    captured stderr buried in the monitor log. The cause was this function's subprocess
+    spawning a bare `python3`: only /opt/agents/venv/bin/python has the ollama package,
+    and /usr/bin/python3 -- what PATH resolves to under `docker exec`, cron, or
+    emperor.sh's setsid, i.e. every non-interactive launch -- does not. So the entire
+    LLM layer was dead, monitor fell through to apply_random_tweak on every clone, and
+    the system's "evolution" was random threshold jitter with no model in the loop. From
+    the outside it looked like a run of unremarkable cycles.
+
+    The spawn below now uses sys.executable, which by construction is whatever monitor
+    itself is running under. This check exists for the remaining case: monitor started
+    under an interpreter that has no ollama either. That is still a total failure of
+    revision, but it will now say so at the top of the cycle instead of being inferred
+    from a fallback message that looks identical to a healthy quota-exhausted cycle.
+    """
+    if _REVISION_INTERPRETER_CHECKED:
+        return _REVISION_INTERPRETER_CHECKED[0]
+    ok = False
+    try:
+        probe = subprocess.run([sys.executable, '-c', 'import ollama'],
+                               capture_output=True, text=True, timeout=60)
+        ok = probe.returncode == 0
+        if not ok:
+            why = ((probe.stderr or '').strip().splitlines() or ['?'])[-1]
+            print(f'WARNING: {sys.executable} cannot import ollama ({why}) -- '
+                  f'EVERY revision this cycle will fail and fall back to a random tweak. '
+                  f'Start monitor.py under an interpreter that has it '
+                  f'(e.g. /opt/agents/venv/bin/python).')
+    except Exception as e:
+        print(f'WARNING: could not probe the revision interpreter ({e})')
+    _REVISION_INTERPRETER_CHECKED.append(ok)
+    return ok
+
+
 def _run_revision(name, parent_name, score, leaderboard, price):
     """Hand one strategy to `master-agent.py revise-strategy`. True only on a clean exit.
 
@@ -971,9 +1197,13 @@ def _run_revision(name, parent_name, score, leaderboard, price):
     """
     if not MASTER_AGENT_SCRIPT.exists():
         return False
+    _check_revision_interpreter()
     try:
         result = subprocess.run(
-            ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
+            # sys.executable, NOT 'python3' -- see _check_revision_interpreter. The
+            # revision subprocess must run under the same interpreter monitor does, or it
+            # silently loses access to every dependency monitor was started with.
+            [sys.executable, str(MASTER_AGENT_SCRIPT), 'revise-strategy',
              name, parent_name, str(score), leaderboard, str(price)],
             capture_output=True, text=True, timeout=REVISION_TIMEOUT,
         )
@@ -1021,7 +1251,7 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     # go through the exact same verification gate an LLM-chosen asset does.
     injected = False
     if inject and cfg_path.exists():
-        injected = _inject_reflector_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
+        injected = _inject_discovered_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
 
     # Always re-verify declared assets, revised or not: `assets` is committed to git and
     # inherited by every future clone of this lineage, apply_random_tweak copies it forward
@@ -1472,6 +1702,30 @@ def run():
         print('Strategy performances (score):')
         for name, score in performances:
             print(f'  {name}: {score:.2f} ({trade_counts.get(name, 0)} trades)')
+
+        # Fully swallowed, like the live/paper report below: a reporting bug must never
+        # cost a monitoring cycle.
+        try:
+            print_turnover_report(performances)
+        except Exception as e:
+            print(f'turnover report unavailable ({e})')
+
+        # One row an hour into /opt/trades/.market_history.jsonl: the DEX book, its
+        # width and depth, the CEX/DEX basis and news sentiment. Nothing recorded any of
+        # this before, so no strategy could condition on it and no post-mortem could
+        # reconstruct the conditions a result happened under.
+        try:
+            if '/opt/tools' not in sys.path:
+                sys.path.append('/opt/tools')
+            import market_recorder
+            row = market_recorder.record_snapshot()
+            if row:
+                print(f"Market: XLM ${row.get('cex_mid')}, DEX spread "
+                      f"{row.get('spread_bp')} bp, basis {row.get('basis_bp')} bp, "
+                      f"tradeable {row.get('tradeable_bp')} bp, "
+                      f"sentiment {row.get('sentiment')}")
+        except Exception as e:
+            print(f'market snapshot unavailable ({e})')
 
         current_leader, leader_score = performances[0]
         promote_live_strategy(current_leader, leader_score)

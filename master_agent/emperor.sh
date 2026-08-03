@@ -28,6 +28,35 @@
 
 set -e
 
+# Which python runs monitor.py and agent-bootstrap.py. This used to be a bare `python3`,
+# and that single word disabled the entire LLM layer of this system for an unknown number
+# of cycles: only /opt/agents/venv/bin/python has the `ollama` package, while a
+# non-interactive shell (which is what setsid, cron and `docker exec` give you) resolves
+# `python3` to /usr/bin/python3, which does not. Every revise-strategy subprocess died
+# instantly with ModuleNotFoundError, monitor.py dutifully fell back to a random threshold
+# tweak, and the logs looked like ordinary cycles. monitor.py now spawns revisions with
+# sys.executable, so whatever is chosen here propagates all the way down.
+#
+# Prefer an interpreter that can actually import ollama; fall back to python3 so a
+# container without the venv still runs (paper trading and culling work fine without a
+# model, they just do not evolve).
+PYTHON="${EMPEROR_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in /opt/agents/venv/bin/python python3; do
+        if command -v "$candidate" >/dev/null 2>&1 && \
+           "$candidate" -c 'import ollama' >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    PYTHON=python3
+    echo "[emperor] WARNING: no interpreter found that can import ollama; falling back to" \
+         "$PYTHON. Revisions and the emperor self-revision step will BOTH fail this run." >&2
+fi
+echo "[emperor] using interpreter: $PYTHON"
+
 ONCE=0
 for arg in "$@"; do
     case "$arg" in
@@ -91,7 +120,7 @@ verify_and_commit_repo() {
 
     for f in $changed_py_files; do
         path="$repo/$f"
-        if [ -f "$path" ] && ! python3 -c "import ast, sys
+        if [ -f "$path" ] && ! "$PYTHON" -c "import ast, sys
 ast.parse(open(sys.argv[1]).read())" "$path" 2>>"$AGENT_LOG"; then
             echo "[emperor] WARNING: $label/$f failed to parse after this cycle's revision; reverting it" >&2
             if git -C "$repo" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
@@ -132,7 +161,7 @@ while true; do
     # (2.5h), so a plain `timeout monitor.py` would only kill monitor.py itself
     # and orphan any in-flight revise-strategy subprocess, leaving it running
     # unsupervised alongside the next cycle's fresh monitor.py.
-    setsid python3 -u /opt/monitor.py > "$MONITOR_LOG" 2>&1 &
+    setsid "$PYTHON" -u /opt/monitor.py > "$MONITOR_LOG" 2>&1 &
     MONITOR_PID=$!
     MONITOR_START=$(date +%s)
 
@@ -220,7 +249,7 @@ HEADER
     {
         cat "$PROMPT_FILE"
         printf '\nexit\n'
-    } | python3 /opt/agents/agent-bootstrap.py > "$AGENT_LOG" 2>&1 || \
+    } | "$PYTHON" /opt/agents/agent-bootstrap.py > "$AGENT_LOG" 2>&1 || \
         echo "[emperor] agent-bootstrap.py step failed this cycle; see $AGENT_LOG" >&2
 
     echo "[emperor] verifying and committing master_agent/tools changes"

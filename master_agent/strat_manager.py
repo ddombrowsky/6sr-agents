@@ -4,6 +4,7 @@ import json
 import subprocess
 import signal
 import sys
+import time
 from pathlib import Path
 
 STATE_FILE = Path('/opt/strategy_state.json')
@@ -174,6 +175,14 @@ def start_strategy(name, command=None):
     save_state(state)
     print(f"Started strategy '{name}' with PID {proc.pid}, logging to {log_path}")
 
+# How long a culled strategy gets to exit after SIGTERM before it is killed outright.
+# main.py's loop sleeps 30s between ticks and does not install a signal handler, so the
+# TERM lands almost immediately in practice; this only has to cover a tick that is mid
+# network call to Horizon or a price feed.
+STOP_GRACE_SECONDS = 15
+STOP_POLL_SECONDS = 0.5
+
+
 def stop_strategy(name):
     state = load_state()
     if name not in state:
@@ -187,6 +196,27 @@ def stop_strategy(name):
         # send SIGTERM to the process group
         os.killpg(os.getpgid(pid), signal.SIGTERM)
         print(f"Sent termination to strategy '{name}' (PID {pid})")
+        # ...and then confirm it actually died. This used to mark the entry 'stopped'
+        # the instant the signal was sent, without ever looking: a strategy that ignored
+        # or outlived the TERM kept running, kept trading, and kept writing state.json,
+        # while monitor.py believed it was culled -- so it was scored as a stopped
+        # strategy, exempt from the restart loop, and only reconcile()'s dead-pid check a
+        # full cycle later would notice anything was wrong (and it checks for the
+        # opposite failure, so in this direction it noticed nothing at all). If it is
+        # still alive after the grace period, escalate to SIGKILL, which nothing can
+        # ignore. The cull has to be real: it is the only thing bounding how many
+        # strategies run at once, and a live strategy that is believed dead is one
+        # nothing will ever wind down.
+        deadline = time.time() + STOP_GRACE_SECONDS
+        while time.time() < deadline and _is_alive(pid):
+            time.sleep(STOP_POLL_SECONDS)
+        if _is_alive(pid):
+            print(f"Strategy '{name}' (PID {pid}) ignored SIGTERM for "
+                  f"{STOP_GRACE_SECONDS}s; sending SIGKILL")
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError) as e:
+                print(f"Could not SIGKILL {pid}: {e}")
     except ProcessLookupError:
         print(f"Process {pid} not found; cleaning up state.")
     state[name]['pid'] = None

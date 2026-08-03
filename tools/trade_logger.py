@@ -11,6 +11,7 @@ from pathlib import Path
 from stellar_trader import submit_trade
 
 import assets as _assets
+import friction as _friction
 import portfolio as _portfolio
 
 BASE_DIR = Path('/opt/trades')
@@ -82,7 +83,7 @@ def _live_fields(side, requested_usd, result):
 
 def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd, balance_xlm,
                  *, asset='XLM', asset_issuer=None, amount_asset=None, balance_asset=None,
-                 live=None):
+                 live=None, fill_price=None, friction_bp=None):
     """Append one JSON line to /opt/trades/<agent_name>.log.
 
     The seven positional parameters and their meanings are unchanged -- strategies
@@ -104,6 +105,14 @@ def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd,
     useful one than `schema` (which stays 2, since none of the fields above changed
     meaning, type or presence): it distinguishes "never attempted" from "attempted and
     refused", which is exactly the distinction live-vs-paper reporting turns on.
+
+    `fill_price`/`friction_bp` are the same kind of additive, presence-is-the-marker
+    field (2026-08-03). `price` keeps its v1 meaning exactly -- the reference price the
+    decide step saw -- so monitor.trade_stats, live_report and every strategy reading
+    these logs are unaffected. `fill_price` is what the trade actually transacted at
+    after crossing the book; the difference between them is the cost that used to be
+    silently zero. Absent on a line written before friction existed, which is precisely
+    how to tell the two eras apart when comparing P&L across the cutover.
     """
     spec = _assets.canonical(asset, asset_issuer) if asset_issuer else _spec_of(asset)
     code, issuer = _assets.parse(spec)
@@ -125,6 +134,9 @@ def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd,
     }
     if live is not None:
         entry["live"] = live
+    if fill_price is not None:
+        entry["fill_price"] = fill_price
+        entry["friction_bp"] = friction_bp
     log_path = BASE_DIR / f"{agent_name}.log"
     with open(log_path, 'a') as f:
         f.write(json.dumps(entry) + "\n")
@@ -144,7 +156,10 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
         used for control flow, just passed through to record_trade.
     side: normalized 'buy' | 'sell' -- the only thing used to decide which balance to
         mutate and what to pass to stellar_trader.submit_trade.
-    price: current price, used to size the trade.
+    price: the current *reference* price (the CEX aggregate for XLM, the mark for
+        anything else). The trade does not fill here: friction.fill_price adjusts it by
+        the live half-spread first, since a buy lifts the ask and a sell hits the bid.
+        `price` is still what gets logged in the `price` field, unchanged.
     requested_usd: how much USD notional the caller wants to trade -- a request, not a
         guarantee. Clamped here to what's actually affordable/sellable, so a decide step
         can never overdraft USD or oversell the asset no matter what it asks for.
@@ -198,27 +213,40 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
     code = _assets.parse(spec)[0]
     is_native = _assets.is_native(spec)
 
+    # Every fill crosses the book. Until 2026-08-03 this function bought and sold at the
+    # same `price`, which made trading free and made the whole population evolve toward
+    # churning: the leader was turning over $5,757 for a $23.33 gain -- a 40.5 bp edge
+    # against a real 12.6 bp XLM book it never paid, and against 148 bp books on the
+    # extra assets it kept being handed. stellar_trader submits path-payment-strict-send
+    # swaps, which TAKE liquidity, so a buy lifts the ask and a sell hits the bid.
+    # friction.fill_price never raises and never returns zero cost; see its docstring for
+    # why the failure mode is to charge the floor rather than to exempt.
+    half = _friction.half_spread(spec)
+    fill = _friction.fill_price(spec, side, price, h=half)
+    friction_bp = round(half * 10000, 3)
+
     if side == 'buy':
         actual_usd = min(requested_usd, state['balance_usd'])
         if actual_usd <= 0:
             return state
-        amount_asset = actual_usd / price
+        amount_asset = actual_usd / fill
         state['balance_usd'] -= actual_usd
         _portfolio.add_amount(state, spec, amount_asset)
         trade_usd = actual_usd
     else:
         held = _portfolio.get_amount(state, spec)
-        actual_asset = min(requested_usd / price, held)
+        actual_asset = min(requested_usd / fill, held)
         if actual_asset <= 0:
             return state
-        trade_usd = actual_asset * price
+        trade_usd = actual_asset * fill
         _portfolio.add_amount(state, spec, -actual_asset)
         state['balance_usd'] += trade_usd
         amount_asset = actual_asset
 
     balance_asset = _portfolio.get_amount(state, spec)
     print(f"[{agent_name}] {'Bought' if side == 'buy' else 'Sold'} "
-          f"{amount_asset:.4f} {code} at ${price:.6f}")
+          f"{amount_asset:.4f} {code} at ${fill:.6f} "
+          f"(ref ${price:.6f}, {friction_bp:.1f}bp)")
 
     if is_live is None:
         is_live = LIVE_FLAG.exists()
@@ -261,7 +289,7 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
                 amount_asset if is_native else 0.0,
                 state['balance_usd'], state['balance_xlm'],
                 asset=spec, amount_asset=amount_asset, balance_asset=balance_asset,
-                live=live_record)
+                live=live_record, fill_price=fill, friction_bp=friction_bp)
         except Exception as e:
             # A logging failure must not be able to take down a strategy that has already
             # traded; the balances in `state` are the authoritative record either way.

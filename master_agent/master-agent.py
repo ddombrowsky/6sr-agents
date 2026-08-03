@@ -10,6 +10,24 @@ from ollama import Client, ResponseError
 import score
 import sr_agent_tools
 
+def _friction_facts():
+    """(xlm_round_trip_bp, nonbase_floor_bp) for the revision prompt, or a safe default.
+
+    Interpolated rather than written as literals, for exactly the reason
+    score.UNREALIZED_HAIRCUT is: the prompt claimed 0.999 for weeks while score.py
+    enforced 0.899, so the model was optimizing an objective it was not ranked on. A
+    cost the prompt states and the code does not charge is the same bug.
+    """
+    try:
+        sys.path.append('/opt/tools')
+        import friction
+        return friction.round_trip_bp('XLM'), round(friction.NONBASE_FLOOR * 2 * 10000, 1)
+    except Exception:
+        return 12.0, 100.0
+
+
+_XLM_RT_BP, _NONBASE_RT_BP = _friction_facts()
+
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
     'qwen': 'qwen3.5',
@@ -28,9 +46,20 @@ TRADES_DIR = Path('/opt/trades')
 REVISION_HISTORY_FILENAME = '.strategy-revision-history.json'
 REVISION_HISTORY_MAX_MESSAGES = 5
 
+_API_KEY = os.environ.get('OLLAMA_API_KEY')
+if not _API_KEY:
+    # Previously this line was `'Bearer ' + os.environ.get('OLLAMA_API_KEY')`, which
+    # raised `TypeError: can only concatenate str (not "NoneType") to str` at import --
+    # before argument parsing, before any error handling, and with a traceback that named
+    # the concatenation rather than the missing key. monitor.py logs that stderr and
+    # falls back to a random tweak, so a forgotten `. ./env.sh` looked exactly like a
+    # model failure. Say what is actually wrong.
+    sys.exit('[error: OLLAMA_API_KEY is not set -- source /opt/env.sh before running '
+             'monitor.py or master-agent.py; every revision will fail without it]')
+
 client = Client(
     host="http://172.17.0.1:11434",
-    headers={'Authorization': 'Bearer ' + os.environ.get('OLLAMA_API_KEY')}
+    headers={'Authorization': 'Bearer ' + _API_KEY}
 )
 
 TOOLS = sr_agent_tools.TOOLS
@@ -206,6 +235,29 @@ REVISION_SYSTEM_PROMPT = (
     'tie-break nudge toward realizing gains -- it is not worth distorting the strategy for. '
     'Growing net worth is the entire objective; sitting in cash and never trading '
     'scores exactly the starting balance and gets you nowhere.\n\n'
+    # Added 2026-08-03. Before this date nothing in the system charged a spread, so the
+    # population had evolved toward pure churn: the leader was turning over $5,757 to
+    # gain $23.33, and every clone of it inherited the habit. The model was never told
+    # trading cost anything, because it did not.
+    'TRADING COSTS MONEY. Every fill crosses the order book: a buy lifts the ask, a '
+    f'sell hits the bid. Right now a full buy-then-sell round trip in XLM costs about '
+    f'{_XLM_RT_BP} basis points, and in a discovered non-XLM asset it is far worse -- '
+    f'assume at least {_NONBASE_RT_BP} bp and check, because measured books on AQUA and '
+    'ARS were 151 and 186 bp. This is charged for real: trade_logger.execute_trade fills '
+    'you at the adjusted price and backtest_strategy replays it the same way, so it is '
+    'already inside every number you are judged on. The consequences you must design '
+    'around:\n'
+    '  * A threshold band narrower than the round-trip cost CANNOT be profitable, no '
+    'matter how often it is right. Check that `sell_above - buy_below` comfortably '
+    'exceeds it.\n'
+    '  * Turnover is a cost, not an achievement. Doubling your trade count doubles what '
+    'you pay; it does not double your edge. `backtest_strategy` returns '
+    '`total_friction_usd` next to `return_pct` -- if it is a large fraction of your '
+    'gain, you have built a fee generator, and the fix is to trade less and better, not '
+    'more.\n'
+    '  * Being selective is now a real strategy. A filter that skips marginal trades '
+    'keeps the cost you would have paid on them, which is why an indicator or a regime '
+    'gate can beat a bare threshold bot even when it is wrong as often.\n\n'
     'You can and should test a revision before committing it. '
     '`backtest_strategy(strategy_path)` replays the strategy over 30 days of real '
     'hourly candles and returns return_pct, buy_hold_pct, beats_buy_hold, trades, '
@@ -291,7 +343,27 @@ REVISION_SYSTEM_PROMPT = (
     "reflector_oracle.py (an alternate on-chain price source -- now wired as a fallback "
     "inside price_feed.py itself, so you don't need to call it directly unless you "
     'specifically want to cross-check the DEX-oracle price against the CEX-aggregate '
-    "one), and orderbook_depth.py (`get_orderbook_metrics()` -- live XLM/USDC order "
+    'one), '
+    # New 2026-08-03. Both are the emperor pass's answer to "where would a new edge come
+    # from" -- one measures a dislocation nothing was looking at, the other keeps the
+    # history that would let a later revision find more of them.
+    'basis.py (`get_basis()` / `dex_is_cheap()` / `dex_is_rich()` -- THE DEX/CEX BASIS. '
+    'Every strategy here decides on price_feed\'s centralized-exchange aggregate but '
+    'executes against the Stellar DEX order book, and those are two different venues at '
+    'two different prices. get_basis() returns `basis_bp` (how far the DEX is from the '
+    'CEX right now) and `tradeable_bp` (that gap MINUS the cost of crossing to capture '
+    'it). Only tradeable_bp is actionable, and it is negative most of the time -- which '
+    'is itself the useful signal, because it tells you when NOT to trade. A strategy '
+    'that already wants to buy can wait for the DEX to be the cheap venue instead of '
+    'lifting a rich book, and that is an improvement which requires predicting nothing), '
+    'market_recorder.py (`read_history(hours)` / `series(field, hours)` -- an hourly '
+    'record of the DEX book width, depth, the basis and news sentiment, going back as '
+    'far as it has been running. This is the only persistent history of anything other '
+    "than price; `series('basis_bp', 72)` feeds straight into an EMA or RSI if you "
+    'want to trade the basis rather than just gate on it), '
+    'friction.py (`round_trip_bp(spec)` -- what a round trip in an asset costs, if you '
+    'want to size a threshold band against it programmatically rather than hardcoding a '
+    "number), and orderbook_depth.py (`get_orderbook_metrics()` -- live XLM/USDC order "
     'book from the Stellar DEX: best bid/ask, spread, and USD depth/imbalance on each '
     'side, a liquidity signal distinct from price or sentiment; a wide spread means '
     'higher slippage risk right now, a lopsided imbalance means resting supply/demand '

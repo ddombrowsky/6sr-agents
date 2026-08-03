@@ -2,6 +2,65 @@
   {
     "type": "function",
     "function": {
+      "name": "get_dex_cex_basis",
+      "description": "Current dislocation between where an asset is quoted on centralized exchanges and where it actually trades on the Stellar DEX order book. Every strategy here decides on price_feed's CEX aggregate but executes against the DEX, so this is the gap between the price you reason about and the price you get. Returns cex_mid, dex_bid/ask/mid, spread_bp, basis_bp (how far the DEX is from the CEX; positive means the DEX is rich, i.e. a good place to sell and a bad place to buy) and tradeable_bp (that gap MINUS the cost of crossing to capture it). Act on tradeable_bp, never on basis_bp alone -- capturing a 3 bp dislocation by crossing a 12 bp book loses money. tradeable_bp is negative most of the time, which is itself the signal: it says when not to trade.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, or 'XLM' (the default) for the base leg"
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's 56-character G... address. Omit for XLM."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_friction",
+      "description": "What trading an asset actually costs: the half-spread charged on one fill and the total for a full buy-then-sell round trip, in basis points. This cost is real and is already charged inside both trade_logger.execute_trade and backtest_strategy, so it is inside every number you are judged on. Use it to check that a threshold band is wider than the cost of the round trip that would capture it -- a band narrower than round_trip_bp cannot be profitable no matter how often it is right. Non-XLM assets are dramatically more expensive than XLM (measured: XLM ~9 bp, AQUA ~151 bp, ARS ~186 bp), so always check before sizing a leg's thresholds.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, or 'XLM' (the default) for the base leg"
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's 56-character G... address. Omit for XLM."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_market_history",
+      "description": "Recorded hourly market conditions going back as far as monitor.py has been running: DEX book width (spread_bp), bid/ask depth, the DEX/CEX basis, and news sentiment. This is the only persistent history of anything other than price -- ohlc_history covers price alone, and it is a CEX price. Use it to check whether an edge you are about to build survives when the book is wide, or whether the basis mean-reverts on a timescale you could trade. Returns a min/mean/max summary plus the most recent raw rows.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "hours": {
+            "type": "integer",
+            "description": "How far back to read, in hours (default 168 = one week)"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "backtest_strategy",
       "description": "Replay a strategy over ~30 days of real historical hourly XLM/USD candles and return return_pct, buy_hold_pct, beats_buy_hold, trades, win_rate and max_drawdown_pct. Use it as your fitness check instead of guessing. beats_buy_hold is computed on the XLM leg ONLY. If the strategy declares extra assets, each is replayed separately over its own (shorter, thinner, gappier) Stellar DEX history and reported under `legs` -- check `active_buckets` there before trusting a leg's return, since a leg with few traded buckets rests on very little real price discovery. Do not over-fit to leg numbers. Always check `decide_source` first: 'main.py:decide' means your code was replayed; 'config-thresholds' means the backtester could not import decide() from main.py and replayed config.json's plain buy_below/sell_above rule instead -- in that case a top-level `WARNING` key is present and every other number describes the config, not the code, so fix main.py's structure and re-run before trusting beats_buy_hold.",
       "parameters": {

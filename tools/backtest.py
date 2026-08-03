@@ -24,6 +24,16 @@ available USD, a sell at held XLM, and a zero-size trade is a no-op) so backtest
 are comparable to the live paper numbers in each strategy's state.json. Nothing here
 touches trade logs, live.flag, or stellar_trader -- it is pure simulation.
 
+That mirroring now includes COST (2026-08-03). Both this and execute_trade fill through
+friction.fill_price, so a buy lifts the ask and a sell hits the bid. Before that, a
+strategy could "beat buy-and-hold" purely by trading more, and the loop dutifully
+selected for exactly that: the leader was turning $5,757 of volume into a $23.33 gain, a
+40.5 bp edge against a 12.6 bp book nobody charged it for. Buy-and-hold is charged ONE
+entry half-spread, because it too has to be bought once -- charging the strategy and not
+the benchmark would replace one biased comparison with its mirror image. The result now
+carries `friction_bp` and `total_friction_usd` so a revision can see what its own
+turnover cost it.
+
 Extra (non-XLM) assets: pass legs=True, or call backtest_asset() directly, to replay each
 declared extra asset over its own Stellar DEX candle history. Those results are reported
 separately under `legs` and are NEVER folded into `beats_buy_hold`, which stays a pure
@@ -46,6 +56,30 @@ from ohlc_history import get_candles
 
 START_USD = 1000.0  # same starting balances as template_repo/main.py
 START_XLM = 0.0
+
+
+def _friction_half(spec):
+    """Half-spread for `spec`, or 0.0 if friction.py cannot be consulted.
+
+    Note this is the ONE place in the friction work that fails *open* rather than
+    charging a floor, and the asymmetry with trade_logger is deliberate. There, refusing
+    to charge would let real evolution proceed on a false premise. Here, a missing
+    tools module would silently make every backtest in the population report a number
+    computed under different assumptions than the last one -- and a backtest that
+    quietly changes its own units is worse than one that is visibly uncharged, because
+    `friction_bp: 0.0` in the result says exactly what happened.
+    """
+    try:
+        import friction
+        return friction.half_spread(spec)
+    except Exception:
+        return 0.0
+
+
+def _fill(side, price, half):
+    """price adjusted for crossing the book. Pure, inlined rather than calling
+    friction.fill_price, because this runs tens of thousands of times per replay."""
+    return price * (1.0 + half) if side == 'buy' else price * (1.0 - half)
 
 
 def _decide_from_config(config):
@@ -270,6 +304,14 @@ def backtest_asset(strategy_dir, code, issuer, days=7, ticks_per_candle=1):
     history = []
     trades = sells = 0
 
+    # This matters far more here than on the XLM leg. Measured 2026-08-03, XLM's book was
+    # 8.7 bp wide while AQUA's was 151 bp and ARS's 195 bp -- 17-22x. A leg strategy
+    # replayed without cost looks like a diversification win and is in fact a way to pay
+    # a 1.5% toll several times an hour, which is how "extra assets" would have entered
+    # the population looking profitable.
+    half = _friction_half(spec)
+    friction_usd = 0.0
+
     for candle in candles:
         price = candle['close']
         history.append(price)
@@ -290,19 +332,22 @@ def backtest_asset(strategy_dir, code, issuer, days=7, ticks_per_candle=1):
                 break
 
             held = _leg_amount(state, spec)
+            fill = _fill(side, price, half)
             if side == 'buy':
                 actual_usd = min(requested_usd, state['balance_usd'])
                 if actual_usd <= 0:
                     break
                 state['balance_usd'] -= actual_usd
-                _add_leg(state, spec, actual_usd / price)
+                _add_leg(state, spec, actual_usd / fill)
+                friction_usd += actual_usd * half
                 trades += 1
             elif side == 'sell':
-                actual = min(requested_usd / price, held)
+                actual = min(requested_usd / fill, held)
                 if actual <= 0:
                     break
                 _add_leg(state, spec, -actual)
-                state['balance_usd'] += actual * price
+                state['balance_usd'] += actual * fill
+                friction_usd += actual * fill * half
                 trades += 1
                 sells += 1
             else:
@@ -310,7 +355,7 @@ def backtest_asset(strategy_dir, code, issuer, days=7, ticks_per_candle=1):
 
     final_price = candles[-1]['close']
     final_net_worth = state['balance_usd'] + _leg_amount(state, spec) * final_price
-    buy_hold = START_USD * final_price / candles[0]['close']
+    buy_hold = START_USD * final_price / _fill('buy', candles[0]['close'], half)
     traded_buckets = sum(1 for c in candles if c.get('trade_count', 0) > 0)
 
     return {
@@ -328,6 +373,8 @@ def backtest_asset(strategy_dir, code, issuer, days=7, ticks_per_candle=1):
         'final_net_worth': round(final_net_worth, 2),
         'return_pct': round((final_net_worth / START_USD - 1) * 100, 3),
         'buy_hold_pct': round((buy_hold / START_USD - 1) * 100, 3),
+        'friction_bp': round(half * 10000, 2),
+        'total_friction_usd': round(friction_usd, 4),
         # Reported for information only. beats_buy_hold on the XLM leg is the gate.
         'beats_buy_hold_leg_only': final_net_worth > buy_hold,
     }
@@ -396,6 +443,14 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
     peak = START_USD
     max_drawdown = 0.0
 
+    # Fetched ONCE for the whole replay, not per tick: a 30-day run at 120 ticks/candle
+    # is ~86,000 decisions, and friction.half_spread would otherwise hit its cache that
+    # many times for a number that moves on the scale of hours. Passing it as `h` also
+    # keeps the whole backtest deterministic against a single book reading, so two runs
+    # of the same strategy are comparable to each other.
+    half = _friction_half('XLM')
+    friction_usd = 0.0
+
     for candle in candles:
         price = candle['close']
         history.append(price)
@@ -420,28 +475,36 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
             if requested_usd != requested_usd:
                 break
 
+            # The fill, not the quote -- same rule as trade_logger.execute_trade.
+            fill = _fill(side, price, half)
+
             if side == 'buy':
                 actual_usd = min(requested_usd, state['balance_usd'])
                 if actual_usd <= 0:
                     break
                 state['balance_usd'] -= actual_usd
-                _add_xlm(state, actual_usd / price)
+                _add_xlm(state, actual_usd / fill)
                 cost_basis += actual_usd
+                friction_usd += actual_usd * half
                 trades += 1
             elif side == 'sell':
-                actual_xlm = min(requested_usd / price, state['balance_xlm'])
+                actual_xlm = min(requested_usd / fill, state['balance_xlm'])
                 if actual_xlm <= 0:
                     break
                 held = state['balance_xlm']
                 # A sell "wins" if it exits above the average price paid for the XLM
                 # being sold -- the only definition available without pairing up
                 # individual lots, and the one that matches how these bots trade.
+                # Measured on the FILL: a sell that clears the quote but not the spread
+                # is a loss, and calling it a win is how a win_rate of 60% coexisted
+                # with a strategy that bled.
                 avg_cost = cost_basis / held if held else 0.0
-                if price > avg_cost:
+                if fill > avg_cost:
                     wins += 1
                 cost_basis -= avg_cost * actual_xlm
                 _add_xlm(state, -actual_xlm)
-                state['balance_usd'] += actual_xlm * price
+                state['balance_usd'] += actual_xlm * fill
+                friction_usd += actual_xlm * fill * half
                 trades += 1
                 sells += 1
             else:
@@ -454,7 +517,11 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
 
     final_price = candles[-1]['close']
     final_net_worth = state['balance_usd'] + state['balance_xlm'] * final_price
-    buy_hold = START_USD * final_price / candles[0]['close']
+    # Buy-and-hold pays to get in, once. It is a real alternative a real operator could
+    # take, not a costless abstraction, and exempting it while charging the strategy
+    # would just invert the old bias instead of removing it. One entry, no exit: the
+    # comparison is against a position still held at final_price, exactly as before.
+    buy_hold = START_USD * final_price / _fill('buy', candles[0]['close'], half)
 
     result = {
         'strategy': os.path.basename(strategy_dir.rstrip('/')),
@@ -475,6 +542,11 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
         # revision prompt's "treat beats_buy_hold: false as a failed revision" means.
         'beats_buy_hold': final_net_worth > buy_hold,
         'max_drawdown_pct': round(max_drawdown * 100, 3),
+        # What trading cost, so a revision can weigh turnover against edge instead of
+        # treating volume as free. If total_friction_usd rivals the gain, the strategy
+        # is not a strategy, it is a fee generator.
+        'friction_bp': round(half * 10000, 2),
+        'total_friction_usd': round(friction_usd, 4),
     }
 
     if legs:

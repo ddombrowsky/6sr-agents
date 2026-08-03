@@ -200,7 +200,59 @@ def get_asset_price_history(code: str, issuer: str, hours: int = 168) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def get_dex_cex_basis(code: str = 'XLM', issuer: str = '') -> str:
+    """Current DEX-vs-CEX dislocation, and whether it is worth crossing for."""
+    try:
+        import basis
+        spec = 'XLM'
+        if code and code.upper() != 'XLM':
+            import assets as _assets
+            spec = _assets.canonical(code, issuer or None)
+        result = basis.get_basis(spec)
+        if result is None:
+            return json.dumps({'error': 'basis unavailable: one venue did not answer, '
+                                        'or the book is wider than the sanity limit'})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
+def get_friction(code: str = 'XLM', issuer: str = '') -> str:
+    """What one fill and one round trip in an asset actually cost, in basis points."""
+    try:
+        import friction
+        spec = 'XLM'
+        if code and code.upper() != 'XLM':
+            import assets as _assets
+            spec = _assets.canonical(code, issuer or None)
+        return json.dumps(friction.describe(spec), indent=2)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
+def get_market_history(hours: int = 168) -> str:
+    """Recorded hourly market conditions: book width, depth, basis, sentiment.
+
+    Returns a summary plus the raw rows. The summary alone is usually what a revision
+    needs, and the rows can be long, so they are capped -- a model that wants the full
+    series should call series() from inside main.py rather than reading it here.
+    """
+    try:
+        import market_recorder
+        rows = market_recorder.read_history(hours=int(hours))
+        return json.dumps({
+            'summary': market_recorder.summary(hours=int(hours)),
+            'rows': rows[-200:],
+            'total_rows': len(rows),
+        }, indent=2)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 TOOLS = {
+    'get_dex_cex_basis': get_dex_cex_basis,
+    'get_friction': get_friction,
+    'get_market_history': get_market_history,
     'list_candidate_assets': list_candidate_assets,
     'verify_asset': verify_asset,
     'get_asset_price': get_asset_price,
