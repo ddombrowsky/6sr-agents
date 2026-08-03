@@ -62,6 +62,23 @@ MIN_LIVE_SCORE = 1000.0     # must actually be up on its starting balance
 # price, then writes state.json, then sleeps 30s) plus a slow price-feed failover.
 SMOKE_TEST_SECONDS = int(os.environ.get('SMOKE_TEST_SECONDS', 120))
 
+# Whether a revised main.py has to stay *importable by the backtester*, i.e. whether
+# backtest.py can load a top-level decide() out of it. If it can't, backtest_strategy
+# silently replays config.json's plain buy_below/sell_above rule and reports
+# decide_source: 'config-thresholds' -- so beats_buy_hold, return_pct and win_rate are
+# confident-looking numbers about something other than the code being ranked, and the
+# revision prompt tells the model to trust them. On 2026-08-03, 122 of 130 strategies and
+# 6 of the 11 running ones (including the live one) were blind in exactly this way.
+#   'non-regression' (default) reject only if the candidate is blind AND the main.py it
+#                    would be reverted to was not: a lineage may never go sighted->blind.
+#   'strict'         reject any blind main.py. Note revert_main_py restores the parent's
+#                    file, which in most lineages is itself blind, so strict mostly
+#                    discards near-misses (a real decide() plus one stray top-level
+#                    statement) in exchange for an equally blind parent. Worth revisiting
+#                    once most of the population is sighted.
+#   'off'            report the finding, gate nothing.
+MAIN_PY_IMPORTABILITY = os.environ.get('MAIN_PY_IMPORTABILITY', 'non-regression')
+
 # Odds that a freshly bootstrapped strategy which ended up with no assets is handed the
 # next assets from the Reflector oracle's tracked list. A coin flip rather than always:
 # the point is to introduce non-XLM legs into a population that otherwise cannot invent
@@ -226,6 +243,56 @@ def _tools():
         return portfolio, dex_price, asset_discovery
     except Exception as e:
         print(f'asset tooling unavailable ({e}); running XLM-only this cycle')
+        return None
+
+
+def _stellar_caps():
+    """stellar_trader's current per-trade/daily caps, or None. Never raises.
+
+    Lazy and defensive for the same reasons _tools() is. Only ever used to *record* what
+    the caps were when a strategy was promoted -- a strategy earns the live flag on a
+    paper track record sized by its own config.json, then trades real money clamped by
+    these, and the two numbers are not the same. Failing to read them must degrade that
+    record, never block a promotion.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import stellar_trader
+        return {'max_trade_usd': float(stellar_trader.MAX_TRADE_USD),
+                'max_daily_usd': float(stellar_trader.MAX_DAILY_USD)}
+    except Exception as e:
+        print(f'could not read stellar_trader caps ({e}); recording sizing without them')
+        return None
+
+
+def _importability_check(source_or_path):
+    """(ok, reason) from backtest.importability_report, or None if it can't be consulted.
+
+    None means "cannot tell", and every caller FAILS OPEN on it. That is deliberately the
+    opposite of main_py_calls_execute_trade, which fails closed: that one guards real
+    money, this one guards a *fitness signal*. Failing closed whenever /opt/tools were
+    missing or mid-rewrite would revert every revised main.py in the population, freeze
+    main.py evolution entirely and route every clone to apply_random_tweak -- a much
+    larger and much quieter failure than the blindness it is trying to prevent, and one
+    that would read in the logs as a run of bad revisions.
+
+    Also tolerates a /opt/tools that predates importability_report: emperor.sh rewrites
+    the two repos independently, so version skew between them is a real state, not a
+    hypothetical.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import backtest
+        report = getattr(backtest, 'importability_report', None)
+        if report is not None:
+            return report(source_or_path)
+        ok = backtest._is_importable(source_or_path)
+        return ok, ('decide() is importable' if ok
+                    else 'backtest cannot import a top-level decide() from main.py')
+    except Exception as e:
+        print(f'importability check unavailable ({e}); not gating on it')
         return None
 
 
@@ -584,7 +651,7 @@ def _config_is_sane(cfg, price, marks=None):
         return False
     return _assets_are_sane(cfg, marks)
 
-def main_py_is_sane(strategy_dir, name, price, marks=None):
+def main_py_is_sane(strategy_dir, name, price, marks=None, *, baseline_source=None):
     """Check that a revised main.py actually parses, runs, and persists state.
 
     _config_is_sane only ever looked at config.json, so a revision that gutted
@@ -595,6 +662,10 @@ def main_py_is_sane(strategy_dir, name, price, marks=None):
     scored -inf (0 trades) forever after, and the config-only gate never noticed.
 
     Returns (ok, reason).
+
+    `baseline_source` is the main.py this candidate would be reverted to (see
+    _main_py_at). It is only consulted by the importability gate below, which refuses a
+    revision that would take a lineage from backtest-visible to backtest-blind.
 
     The smoke run happens in a throwaway copy, never the real directory:
     trade_logger.execute_trade submits a REAL order when a live.flag exists in cwd,
@@ -611,6 +682,31 @@ def main_py_is_sane(strategy_dir, name, price, marks=None):
         ast.parse(source)
     except SyntaxError as e:
         return False, f'main.py has a syntax error: {e.msg} (line {e.lineno})'
+
+    # Before the smoke run, deliberately: this is a pure AST walk costing microseconds,
+    # the smoke run costs SMOKE_TEST_SECONDS (120s) per candidate, and "it also runs"
+    # adds nothing once the verdict is decided. The reason string names the offending
+    # line, because "not importable" on its own is unactionable to the next revision.
+    if MAIN_PY_IMPORTABILITY != 'off':
+        verdict = _importability_check(source)
+        if verdict is not None and not verdict[0]:
+            why = verdict[1]
+            baseline_ok = None
+            if baseline_source is not None:
+                baseline_verdict = _importability_check(baseline_source)
+                baseline_ok = baseline_verdict[0] if baseline_verdict else None
+            if MAIN_PY_IMPORTABILITY == 'strict' or baseline_ok:
+                return False, (
+                    f'backtest cannot import decide() from main.py ({why}), so '
+                    f'beats_buy_hold would describe config.json thresholds rather than '
+                    f'this code' + (' -- and the main.py it replaces was importable'
+                                    if baseline_ok else ''))
+            # Both blind: rejecting would revert to an equally blind parent, throwing
+            # away whatever else the revision did to main.py for no gain in visibility.
+            # Recorded so the emperor pass can see it; not gated. See
+            # MAIN_PY_IMPORTABILITY.
+            print(f'NOTE: {name} is backtest-blind ({why}); the main.py it replaces was '
+                  f'too, so this is not treated as a regression')
 
     scratch_name = f'smoketest_{uuid.uuid4().hex[:12]}'
     tmp_root = tempfile.mkdtemp(prefix='smoketest_')
@@ -739,6 +835,17 @@ def _git(path, *args):
 def _git_head(path):
     r = _git(path, 'rev-parse', 'HEAD')
     return r.stdout.strip() if r.returncode == 0 else None
+
+def _main_py_at(strategy_dir, before_head):
+    """main.py's contents at `before_head` -- exactly what revert_main_py would restore.
+
+    Read out of git rather than off disk, so it is unaffected by the model rewriting the
+    working tree between the check and the revert. None if it can't be read.
+    """
+    if not before_head:
+        return None
+    r = _git(strategy_dir, 'show', f'{before_head}:main.py')
+    return r.stdout if r.returncode == 0 else None
 
 def _git_is_dirty(path):
     r = _git(path, 'status', '--porcelain')
@@ -930,7 +1037,8 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     # the common case on a template spawn -- but injection still changes runtime behavior
     # (an extra get_mark per leg per tick), so it has to face the same gate.
     if touched or injected:
-        ok, reason = main_py_is_sane(strategy_dir, name, price, marks)
+        ok, reason = main_py_is_sane(strategy_dir, name, price, marks,
+                                     baseline_source=_main_py_at(strategy_dir, before_head))
         print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
         if not ok:
             revert_main_py(strategy_dir, before_head, name)
@@ -1070,8 +1178,38 @@ def load_live_strategy():
             return None
     return None
 
-def save_live_strategy(name):
-    LIVE_STRATEGY_FILE.write_text(json.dumps({'name': name, 'since': time.time()}, indent=2))
+def _promotion_sizing(name):
+    """The paper trade size this strategy was promoted on, vs the real per-trade cap.
+
+    Recorded at promotion because the two are not the same number and nothing used to
+    say so: a strategy earns the live flag on a paper track record of trade_amount_usd
+    fills, then trades real money clamped by stellar_trader's caps, so the live P&L is
+    not a scaled copy of the paper P&L that justified the promotion. This is only the
+    *configured expectation* -- the realized ratio is per-trade and lower whenever the
+    daily budget or claudio's balance binds, which is why trade_logger records it per
+    trade and live_report reads it back. None on any failure; this must never block a
+    promotion.
+    """
+    try:
+        cfg = json.load(open(STRATEGIES_DIR / name / 'config.json'))
+        # Top-level only: extra legs never trade live (trade_logger refuses them).
+        sizing = {'trade_amount_usd': float(cfg.get('trade_amount_usd') or 0.0)}
+        caps = _stellar_caps()
+        if caps:
+            sizing.update(caps)
+            if sizing['trade_amount_usd'] > 0 and caps['max_trade_usd'] > 0:
+                sizing['implied_ratio'] = round(
+                    min(1.0, caps['max_trade_usd'] / sizing['trade_amount_usd']), 6)
+        return sizing
+    except Exception as e:
+        print(f'could not record promotion sizing for {name} ({e})')
+        return None
+
+def save_live_strategy(name, sizing=None):
+    entry = {'name': name, 'since': time.time()}
+    if sizing:
+        entry['sizing'] = sizing
+    LIVE_STRATEGY_FILE.write_text(json.dumps(entry, indent=2))
 
 def set_live_flag(name, live):
     # Plain marker file main.py polls for, not a config.json key, so it survives a
@@ -1274,7 +1412,11 @@ def promote_live_strategy(current_leader, leader_score):
 
     print(f'Promoting {current_leader} to live')
     set_live_flag(current_leader, True)
-    save_live_strategy(current_leader)
+    # Deliberately not refreshed on the "already live" re-assert path above: `since` must
+    # not move, and this is a snapshot of the sizing *at promotion* by definition. A caps
+    # change afterwards is exactly the drift worth seeing, so live_report flags it rather
+    # than it being silently overwritten here.
+    save_live_strategy(current_leader, sizing=_promotion_sizing(current_leader))
 
 def run():
     while True:
@@ -1335,6 +1477,20 @@ def run():
         promote_live_strategy(current_leader, leader_score)
         live_state = load_live_strategy()
         live_name = live_state['name'] if live_state else None
+
+        # One line per cycle on how the live strategy's real fills compare to the paper
+        # book it is ranked on. emperor_logs are the primary input to the next emperor
+        # pass, and without this the divergence exists only in the strategy's own stdout
+        # -- which is where 343 consecutive refused orders sat unnoticed on 2026-08-03.
+        # Fully swallowed: a reporting bug must never cost a monitoring cycle.
+        if live_name:
+            try:
+                import live_report
+                line = live_report.summary_line(live_name)
+                if line:
+                    print(line)
+            except Exception as e:
+                print(f'live/paper report unavailable ({e})')
 
         # Stop everything ranked below KEEP_TOP_N (no-op if already
         # stopped). Re-derived from full-population rank every cycle, so a

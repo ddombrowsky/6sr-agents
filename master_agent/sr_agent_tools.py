@@ -117,8 +117,25 @@ def backtest_strategy(strategy_path: str, days: int = 30, ticks_per_candle: int 
         from backtest import backtest
         # legs=True costs nothing for an XLM-only strategy (no declared assets means no
         # extra work) and is what makes a multi-asset revision reviewable at all.
-        return json.dumps(backtest(strategy_path, days=int(days),
-                                   ticks_per_candle=int(ticks_per_candle), legs=True))
+        result = backtest(strategy_path, days=int(days),
+                          ticks_per_candle=int(ticks_per_candle), legs=True)
+        # decide_source has always been in the payload, and was never noticed: models read
+        # the field they came for (beats_buy_hold), which the prompt tells them is
+        # authoritative -- and which, on a config-thresholds replay, is a confident number
+        # about config.json rather than about the code being revised. On 2026-08-03 that
+        # described 122 of 130 strategies. Loud, top-level, and impossible to skim past.
+        if isinstance(result, dict) and result.get('decide_source') != 'main.py:decide':
+            result['WARNING'] = (
+                f"decide_source is {result.get('decide_source')!r}: the backtester could "
+                f"NOT import decide() from main.py, so every number here (return_pct, "
+                f"beats_buy_hold, win_rate, max_drawdown_pct) describes config.json's "
+                f"buy_below/sell_above thresholds, NOT this strategy's code. Fix the "
+                f"structure first: main.py's top level may contain only imports, "
+                f"assignments, defs, the docstring and an `if __name__ == '__main__'` "
+                f"guard, with the logic in a top-level "
+                f"decide(price, history, state, config). Then re-run this tool and check "
+                f"that decide_source is 'main.py:decide' before trusting any result.")
+        return json.dumps(result)
     except Exception as e:
         return f'error: {type(e).__name__}: {e}'
 

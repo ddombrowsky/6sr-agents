@@ -135,6 +135,39 @@ def main():
         print(f'WARNING: {total_unpriced} held asset leg(s) had no usable mark and were '
               f'valued at zero.')
 
+    blind = backtest_blind(state)
+    if blind:
+        # An aggregate, not a per-row column: the table would carry a mostly-uninformative
+        # flag, while "how much of the population is invisible to its own fitness check"
+        # is the number worth knowing. These strategies rank normally -- backtest_strategy
+        # just reports config.json's thresholds when asked about them.
+        print(f'NOTE: {len(blind)} of {len(state)} strategies are backtest-blind (no '
+              f'importable decide(); backtest replays config thresholds instead): '
+              f'{", ".join(sorted(blind))}')
+
+
+def backtest_blind(state):
+    """Strategies whose main.py the backtester cannot load a decide() from.
+
+    Fails open (returns nothing) if /opt/tools is unavailable: this is a footnote on a
+    read-only table, and a missing module must not turn into a claim about the population.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        from backtest import _is_importable
+    except Exception:
+        return []
+    blind = []
+    for name, info in state.items():
+        main_py = Path(info.get('path', '')) / 'main.py'
+        try:
+            if main_py.exists() and not _is_importable(str(main_py)):
+                blind.append(name)
+        except Exception:
+            continue
+    return blind
+
 
 if __name__ == '__main__':
     main()

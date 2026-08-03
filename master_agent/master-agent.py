@@ -210,14 +210,24 @@ REVISION_SYSTEM_PROMPT = (
     '`backtest_strategy(strategy_path)` replays the strategy over 30 days of real '
     'hourly candles and returns return_pct, buy_hold_pct, beats_buy_hold, trades, '
     'win_rate and max_drawdown_pct in a second or two -- use it as your fitness check '
-    'instead of guessing, and iterate until the numbers improve. Treat '
-    '`beats_buy_hold: false` as a failed revision and try something else: a strategy '
-    'that loses to simply holding XLM is not worth starting. The backtester picks up '
-    "your logic automatically if main.py exposes a top-level "
+    'instead of guessing, and iterate until the numbers improve.\n'
+    '  * CHECK `decide_source` FIRST, before you read any other field. The backtester '
+    'only replays your logic if main.py exposes a top-level '
     '`decide(price, history, state, config)` returning `(side, action, requested_usd)` '
-    "or None; if it doesn't, it falls back to the plain buy_below/sell_above rule and "
-    'will not see your changes at all. So structure main.py that way: put the decide '
-    'step in that function and have the trading loop call it. `history` is the list of '
+    "or None, AND main.py's top level contains nothing but imports, assignments, defs, "
+    "the docstring and an `if __name__ == '__main__'` guard (a bare "
+    "`sys.path.append(...)` call, a top-level `print`, an `if`/`with` or the trading "
+    'loop itself all disqualify it -- write `sys.path = sys.path + [\'/opt/tools\']` as '
+    'an assignment instead). If it cannot, `decide_source` comes back as '
+    "'config-thresholds', a WARNING key is present, and every number in the result "
+    "describes config.json's buy_below/sell_above rule rather than your code. Fix the "
+    'structure and re-run until `decide_source` is \'main.py:decide\'; a revision that '
+    'never reaches its own fitness check has not been tested at all, and monitor.py '
+    'will reject a main.py that goes from importable to not.\n'
+    '  * Once `decide_source` is \'main.py:decide\', treat `beats_buy_hold: false` as a '
+    'failed revision and try something else: a strategy that loses to simply holding '
+    'XLM is not worth starting.\n'
+    '`history` is the list of '
     'recent close prices, oldest first, so indicators work unchanged in both live and '
     'backtest paths.\n\n'
     'ASSETS. The strategy trades XLM plus UP TO 2 additional Stellar assets, listed in '
@@ -249,7 +259,9 @@ REVISION_SYSTEM_PROMPT = (
     'omit it, each leg just uses its own thresholds from config.json. Keep `decide` for '
     'the XLM leg -- that is what backtest_strategy replays and what beats_buy_hold is '
     'measured on. Extra legs are reported separately and over a shorter, less reliable '
-    'window, so do not over-fit to them.\n'
+    'window, so do not over-fit to them. `decide_asset` is picked up under exactly the '
+    'same importability rules as `decide`, so a main.py that fails them makes both legs '
+    'invisible to the backtest.\n'
     '  * Balances now live in `state["positions"]` keyed by asset, but execute_trade '
     'still maintains them -- you never touch them yourself. Pass the asset as a keyword: '
     "execute_trade(agent_name, action, side, price, requested_usd, state, "

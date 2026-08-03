@@ -64,18 +64,47 @@ def _decide_from_config(config):
     return decide
 
 
-def _is_importable(main_py):
-    """True if main.py can be imported without running a trading loop.
+_TOP_LEVEL_RULE = ('the module top level may only contain imports, assignments, defs, '
+                   "the docstring and an `if __name__` guard")
 
-    Importing a module runs every top-level statement, and template_repo/main.py's
-    top level fetches prices in `while True`, so importing the wrong file would hang
-    the backtest forever. Only allow modules whose top level is declarations plus an
-    `if __name__ == '__main__'` guard, and which actually define `decide`.
+
+def _source_of(main_py):
+    """main.py's text, whether given as a path, a Path, or the source itself."""
+    if hasattr(main_py, 'read_text'):
+        return main_py.read_text()
+    if isinstance(main_py, str) and not os.path.exists(main_py):
+        return main_py  # already source, not a path
+    return open(main_py).read()
+
+
+def _describe(node):
+    """One short line naming a top-level statement, for the rejection reason."""
+    try:
+        text = ast.unparse(node).splitlines()[0]
+    except Exception:  # ast.unparse is 3.9+; never let the reason string be the failure
+        text = ''
+    if len(text) > 60:
+        text = text[:57] + '...'
+    return f'{type(node).__name__} at line {getattr(node, "lineno", "?")}' + (f': {text}' if text else '')
+
+
+def importability_report(main_py):
+    """(ok, reason) for whether the backtester can import decide() from this main.py.
+
+    The rules are _is_importable's, unchanged -- this only adds the reason, because the
+    caller that rejects a revision over this has to be able to say which line did it.
+    "It is not importable" is unactionable; "top-level Expr at line 9:
+    sys.path.append('/opt/tools')" is the whole fix.
+
+    Accepts a path, a Path, or the source text itself, so a caller holding a candidate
+    from `git show` doesn't have to write it to disk first.
     """
     try:
-        tree = ast.parse(main_py.read_text() if hasattr(main_py, 'read_text') else open(main_py).read())
-    except Exception:
-        return False
+        tree = ast.parse(_source_of(main_py))
+    except SyntaxError as e:
+        return False, f'main.py has a syntax error: {e.msg} (line {e.lineno})'
+    except Exception as e:
+        return False, f'main.py could not be read: {e}'
 
     has_decide = False
     for node in tree.body:
@@ -93,8 +122,21 @@ def _is_importable(main_py):
             if (isinstance(test, ast.Compare)
                     and isinstance(test.left, ast.Name) and test.left.id == '__name__'):
                 continue  # __main__ guard, not executed on import
-        return False
-    return has_decide
+        return False, f'top-level {_describe(node)} -- {_TOP_LEVEL_RULE}'
+    if not has_decide:
+        return False, 'no top-level decide() function'
+    return True, 'decide() is importable'
+
+
+def _is_importable(main_py):
+    """True if main.py can be imported without running a trading loop.
+
+    Importing a module runs every top-level statement, and template_repo/main.py's
+    top level fetches prices in `while True`, so importing the wrong file would hang
+    the backtest forever. Only allow modules whose top level is declarations plus an
+    `if __name__ == '__main__'` guard, and which actually define `decide`.
+    """
+    return importability_report(main_py)[0]
 
 
 def _load_decide(strategy_dir, config):
