@@ -3,7 +3,10 @@
 # Emperor script (higher than master)
 #
 # Runs forever by default, repeating this cycle:
-# 1. Run monitor.py for a bounded window (default 2.5h), capturing its log.
+# 1. Run monitor.py for a bounded window (default 2.5h), capturing its log,
+#    then ask it to stop by touching /opt/.monitor.py.exit (it exits at its
+#    next cycle-boundary sleep); TERM its process group only if that is still
+#    not enough after another full window.
 # 2. Feed that log plus the current SYSTEM_STATE.md to the
 #    agents/agent-bootstrap.py agent, and have it revise:
 #      * master_agent/master-agent.py
@@ -42,6 +45,9 @@ cd /opt
 RUN_HOURS=${EMPEROR_RUN_HOURS:-2.5h}
 LOG_DIR=/opt/emperor_logs
 LOG_RETENTION_CYCLES=${EMPEROR_LOG_RETENTION:-48}
+# Cooperative stop request read by monitor.py at every cycle-boundary sleep
+# (see EXIT_FILE / sleep_or_exit there). Must match that path.
+MONITOR_EXIT_FILE=/opt/.monitor.py.exit
 mkdir -p "$LOG_DIR"
 
 # Converts a timeout(1)/sleep(1)-style duration ("2.5h", "90m", "45s", or a
@@ -112,21 +118,38 @@ while true; do
     RUN_SECONDS=$(duration_to_seconds "$RUN_HOURS")
     echo "[emperor] running monitor.py for $RUN_HOURS (${RUN_SECONDS}s), logging to $MONITOR_LOG"
 
-    # monitor.py is launched in its own session (setsid) so that on window
-    # expiry we can kill its whole process group, not just monitor.py
-    # itself. monitor.py's revise-strategy calls are synchronous,
-    # non-detached subprocess.run()s that can take up to REVISION_TIMEOUT
-    # (6000s) each, times two clones per cycle -- a single monitor.py cycle
-    # can legitimately take longer than this window's default (2.5h), so a
-    # plain `timeout monitor.py` would only kill monitor.py itself and
-    # orphan any in-flight revise-strategy subprocess, leaving it running
+    # Clear any stale stop request (e.g. from a previous cycle whose monitor.py
+    # was killed before it could consume the file) or this cycle's monitor.py
+    # would exit on its very first sleep.
+    rm -f "$MONITOR_EXIT_FILE"
+
+    # monitor.py is launched in its own session (setsid) so that if the
+    # cooperative stop below is ignored we can kill its whole process group,
+    # not just monitor.py itself. monitor.py's revise-strategy calls are
+    # synchronous, non-detached subprocess.run()s that can take up to
+    # REVISION_TIMEOUT (6000s) each, times two clones per cycle -- a single
+    # monitor.py cycle can legitimately take longer than this window's default
+    # (2.5h), so a plain `timeout monitor.py` would only kill monitor.py itself
+    # and orphan any in-flight revise-strategy subprocess, leaving it running
     # unsupervised alongside the next cycle's fresh monitor.py.
     setsid python3 -u /opt/monitor.py > "$MONITOR_LOG" 2>&1 &
     MONITOR_PID=$!
     MONITOR_START=$(date +%s)
 
+    # Window expiry is a *request* first: touching $MONITOR_EXIT_FILE makes
+    # monitor.py exit at its next cycle-boundary sleep, so it stops between
+    # cycles with no revision subprocess, config rewrite or git commit in
+    # flight. It only reads the file at those sleeps, so an already-sleeping
+    # monitor takes up to CYCLE_SLEEP (1h) to notice, and one still mid-cycle
+    # takes however long that cycle has left -- hence a whole extra
+    # $RUN_SECONDS of grace before falling back to the old behaviour of
+    # killing the process group.
     (
         sleep "$RUN_SECONDS"
+        echo "[emperor] window expired; requesting cooperative exit via $MONITOR_EXIT_FILE"
+        : > "$MONITOR_EXIT_FILE"
+        sleep "$RUN_SECONDS"
+        echo "[emperor] WARNING: monitor.py still running ${RUN_SECONDS}s after $MONITOR_EXIT_FILE was placed; killing its process group" >&2
         kill -TERM -"$MONITOR_PID" 2>/dev/null
     ) &
     WATCHER_PID=$!
@@ -134,6 +157,9 @@ while true; do
     wait "$MONITOR_PID" 2>/dev/null || true
     kill "$WATCHER_PID" 2>/dev/null || true
     wait "$WATCHER_PID" 2>/dev/null || true
+    # monitor.py removes the file itself when it honours it; this covers the
+    # TERM path and any exit that happened for an unrelated reason.
+    rm -f "$MONITOR_EXIT_FILE"
 
     MONITOR_ELAPSED=$(( $(date +%s) - MONITOR_START ))
     # A cycle that ends in a small fraction of the requested window is

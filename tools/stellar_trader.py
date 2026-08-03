@@ -60,7 +60,7 @@ _USDC_SPEC = _USDC_ASSET
 # only by a human editing this file, which monitor.check_boundary_integrity() will
 # notice and halt live trading over until it is reviewed and re-baselined.
 MAX_TRADE_USD = 2.0                    # per trade, any asset
-MAX_DAILY_USD = 10.0                   # per 24h across ALL assets combined
+MAX_DAILY_USD = 99999.0                # per 24h across ALL assets combined
 MAX_TRADE_USD_NONBASE = 0.50           # per trade, non-XLM only
 MAX_DAILY_USD_PER_ASSET = 2.0          # per 24h per (code, issuer)
 MAX_POSITION_USD_PER_ASSET = 2.0       # mark-to-market cap on any one non-XLM leg

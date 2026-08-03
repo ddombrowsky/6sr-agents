@@ -7,6 +7,9 @@ tweaked/revised thresholds, and makes sure the new clones plus the rest of the
 top N are running. If the population is below KEEP_TOP_N (e.g. after strategies
 were removed via `strat_manager.py rm`), it backfills the shortfall with fresh
 clones from template_repo before scoring.
+
+To stop it, touch /opt/.monitor.py.exit: it exits at its next between-cycle sleep
+rather than being signalled mid-revision (see EXIT_FILE / sleep_or_exit below).
 """
 import ast
 import json
@@ -67,6 +70,35 @@ PRICE_FETCH_ATTEMPTS = 3
 PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
 PRICE_FAILURE_SLEEP = 300   # seconds to wait before retrying a cycle that got no price
 CYCLE_SLEEP = 3600
+
+# Cooperative shutdown request. Touch this file and monitor.py exits the next time it
+# reaches a cycle-boundary sleep instead of sleeping. This is how emperor.sh ends a
+# monitor window now: a SIGTERM to the process group can land anywhere, including in the
+# middle of an in-flight revise-strategy subprocess, a _sanitize_assets rewrite of a
+# clone's config.json, or a commit_revision git commit -- leaving a half-revised clone
+# that the next cycle then has to prune. Checked only at the sleeps, so by construction
+# nothing is in flight when it fires. emperor.sh still falls back to TERM if this is
+# ignored (the wait there has to exceed CYCLE_SLEEP, since a monitor that is already
+# asleep will not notice the file until the sleep ends).
+EXIT_FILE = Path('/opt/.monitor.py.exit')
+
+def sleep_or_exit(seconds, what='cycle'):
+    """Sleep `seconds`, or exit 0 now if a shutdown has been requested.
+
+    Removes EXIT_FILE on the way out so the next monitor.py run isn't stopped
+    immediately by a stale request (emperor.sh also clears it, for the case where
+    monitor.py died before it could).
+    """
+    if EXIT_FILE.exists():
+        print(f'{EXIT_FILE} exists; exiting instead of sleeping {seconds}s before next {what}')
+        try:
+            EXIT_FILE.unlink()
+        except OSError as e:
+            print(f'Warning: could not remove {EXIT_FILE}: {e}')
+        sys.stdout.flush()
+        raise SystemExit(0)
+    print(f'Sleeping for {seconds}s...')
+    time.sleep(seconds)
 
 def load_state():
     if STATE_FILE.exists():
@@ -1156,7 +1188,7 @@ def run():
         if price is None:
             print(f'Could not fetch price after {PRICE_FETCH_ATTEMPTS} attempts; '
                   f'retrying this cycle in {PRICE_FAILURE_SLEEP}s')
-            time.sleep(PRICE_FAILURE_SLEEP)
+            sleep_or_exit(PRICE_FAILURE_SLEEP, 'price retry')
             continue
 
         # Correct any strategy left with a stale 'running' status from a
@@ -1175,8 +1207,7 @@ def run():
         marks = fetch_marks_for_cycle(state, price)
         if not state:
             bootstrap_initial_strategies(price, marks=marks)
-            print(f'Sleeping for {CYCLE_SLEEP}s...')
-            time.sleep(CYCLE_SLEEP)
+            sleep_or_exit(CYCLE_SLEEP)
             continue
 
         if len(state) < KEEP_TOP_N:
@@ -1317,9 +1348,8 @@ def run():
                 print(f'Restarting top-{KEEP_TOP_N} strategy that was stopped: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'start', name])
 
-        # Wait an hour before next cycle
-        print(f'Sleeping for {CYCLE_SLEEP}s...')
-        time.sleep(CYCLE_SLEEP)
+        # Wait an hour before next cycle (or exit here if asked to stop)
+        sleep_or_exit(CYCLE_SLEEP)
 
 if __name__ == '__main__':
     run()
