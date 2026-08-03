@@ -17,8 +17,8 @@ MODEL_NICKNAMES = {
 }
 # Pick the model with the MASTER_AGENT_MODEL env var (a nickname above) rather than
 # editing this literal: successive emperor passes kept flipping it between 'gpt' and
-# 'qwen' and overwriting each other's choice. 'qwen' is the current deliberate default.
-MODEL = MODEL_NICKNAMES.get(os.environ.get('MASTER_AGENT_MODEL', 'qwen'), MODEL_NICKNAMES['qwen'])
+# 'qwen' and overwriting each other's choice. 'gpt' is the current deliberate default.
+MODEL = MODEL_NICKNAMES.get(os.environ.get('MASTER_AGENT_MODEL', 'gpt'), MODEL_NICKNAMES['gpt'])
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
