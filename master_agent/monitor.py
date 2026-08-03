@@ -2,11 +2,14 @@
 """Monitor script for XLM paper trading strategies.
 Runs an infinite loop checking strategy performance every hour.
 Every cycle it ranks *all* known strategies (running or stopped) by score,
-stops anything ranked below KEEP_TOP_N, clones the top two with slightly
-tweaked/revised thresholds, and makes sure the new clones plus the rest of the
-top N are running. If the population is below KEEP_TOP_N (e.g. after strategies
-were removed via `strat_manager.py rm`), it backfills the shortfall with fresh
-clones from template_repo before scoring.
+stops anything ranked below KEEP_TOP_N, and adds three newcomers: CLONES_PER_CYCLE
+clones of the best distinct performers plus TEMPLATE_SPAWNS_PER_CYCLE pulled fresh
+from template_repo, all with slightly tweaked/revised thresholds. It then makes sure
+those plus the rest of the top N are running -- so the rank-based cull stops three per
+cycle simply because three are added. At most REVISIONS_PER_CYCLE of the newcomers is
+handed to the LLM (and only on REVISION_CHANCE of cycles); see _revision_budget.
+If the population is below KEEP_TOP_N (e.g. after strategies were removed via
+`strat_manager.py rm`), it backfills the shortfall from template_repo before scoring.
 
 To stop it, touch /opt/.monitor.py.exit: it exits at its next between-cycle sleep
 rather than being signalled mid-revision (see EXIT_FILE / sleep_or_exit below).
@@ -65,6 +68,27 @@ SMOKE_TEST_SECONDS = int(os.environ.get('SMOKE_TEST_SECONDS', 120))
 # one, while keeping XLM-only seeds in the mix as the control group to rank them against.
 REFLECTOR_INJECT_CHANCE = 0.5
 REFLECTOR_INJECT_COUNT = 2
+
+# What one cycle adds to the population: two clones of the best distinct performers, plus
+# one strategy pulled fresh from template_repo. The template spawn exists because every
+# other newcomer descends from an existing strategy -- without it the population can only
+# ever narrow around whatever the current leaders already do, and bootstrap_initial_strategies
+# (the only other template path) fires just on first boot or a below-KEEP_TOP_N backfill.
+# The cull is rank-based (see the performances[KEEP_TOP_N:] loop in run()), so adding three
+# per cycle is what makes it stop three per cycle; there is no separate "how many to stop".
+CLONES_PER_CYCLE = 2
+TEMPLATE_SPAWNS_PER_CYCLE = 1
+
+# Cap on revise-strategy subprocess calls per cycle, and the odds a cycle spends its one
+# call at all. Two revisions used to run back to back every cycle: at the default
+# REVISION_TIMEOUT (60000s, ~16.7h) that is legally an order of magnitude longer than
+# CYCLE_SLEEP and can outlast a whole emperor.sh window, and the cost was paid whether or
+# not the model was even responsive. One call, taken 75% of the time, is the budget; which
+# of the cycle's newcomers gets it is drawn at random. The ~25% of cycles that revise
+# nothing are not a failure mode -- every newcomer still gets apply_random_tweak or
+# apply_seed_thresholds, which is the same exploration the fallback path has always done.
+REVISIONS_PER_CYCLE = 1
+REVISION_CHANCE = 0.75
 
 PRICE_FETCH_ATTEMPTS = 3
 PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
@@ -810,80 +834,141 @@ def apply_seed_thresholds(cfg_path, name, price):
     }
     json.dump(new_cfg_data, open(cfg_path, 'w'), indent=2)
 
-def bootstrap_initial_strategies(price, count=2, marks=None):
-    # First run: strategy_state.json doesn't exist yet, so there's nothing to
-    # stop or clone-from in the normal cycle below. Seed `count` strategies
-    # straight from the template so there's something for later cycles to evolve.
-    print(f'No strategies registered yet; bootstrapping {count} initial strategies from the template.')
-    for i in range(count):
-        name = f'seed_{i}_{int(time.time())}'
-        print(f'Bootstrapping strategy {name}')
-        subprocess.run(['/opt/strat_manager.py', 'clone', name, TEMPLATE_REPO])
-        strategy_dir = STRATEGIES_DIR / name
-        cfg_path = strategy_dir / 'config.json'
-        before_head = _git_head(strategy_dir)
+def _revision_budget():
+    """How many revise-strategy calls this cycle may make: REVISIONS_PER_CYCLE or 0.
 
+    Rolled once per cycle, deliberately -- not once per candidate. The budget is shared by
+    every path that can create a strategy (the clone loop and bootstrap_initial_strategies
+    alike), so "at most one revision per cycle" holds even on a backfill cycle that seeds
+    eight strategies at once. That used to be eight back-to-back REVISION_TIMEOUT waits.
+    """
+    return REVISIONS_PER_CYCLE if random.random() < REVISION_CHANCE else 0
+
+def _run_revision(name, parent_name, score, leaderboard, price):
+    """Hand one strategy to `master-agent.py revise-strategy`. True only on a clean exit.
+
+    The single call site for the revision subprocess. master-agent.py already turns a
+    model error into a non-zero exit (a reply starting with '[error:'), so a False here
+    means the caller must fall back to a mechanical tweak rather than start a clone that
+    is byte-identical to its parent.
+    """
+    if not MASTER_AGENT_SCRIPT.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
+             name, parent_name, str(score), leaderboard, str(price)],
+            capture_output=True, text=True, timeout=REVISION_TIMEOUT,
+        )
+        if result.returncode == 0:
+            print(f'Master agent revised {name}:\n{result.stdout.strip()}')
+            return True
+        print(f'Master agent revision failed for {name}: {result.stderr.strip()}')
+    except Exception as e:
+        print(f'Master agent revision errored for {name}: {e}')
+    return False
+
+def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, leaderboard,
+                       price, marks, revise, inject, seed_fallback):
+    """Create one strategy: clone -> optional revision -> gates -> fallback -> commit.
+
+    The one path every new strategy takes, whether it is a clone of a winner or a fresh
+    pull from template_repo. Only three things differ between those two cases, and they
+    are the keyword arguments: `inject` (offer it Reflector assets), `seed_fallback`
+    (rebuild config.json from the current price instead of nudging a parent's), and
+    `revise` (spend the cycle's one revision slot on this one).
+
+    Deliberately does not start the strategy -- callers do, because the clone loop starts
+    its whole batch only after every clone has been gated and committed.
+    """
+    # Names the parent explicitly: emperor_logs are the primary input to the next emperor
+    # pass, and a clone's lineage is otherwise unrecoverable from the log alone.
+    lineage = 'template' if parent_name == name else f'parent {parent_name}'
+    print(f'Provisioning {name} from {lineage} ({source_repo}), '
+          f'{"revising" if revise else "no revision"}')
+    subprocess.run(['/opt/strat_manager.py', 'clone', name, source_repo])
+    strategy_dir = STRATEGIES_DIR / name
+    cfg_path = strategy_dir / 'config.json'
+    before_head = _git_head(strategy_dir)
+
+    revised = _run_revision(name, parent_name, score, leaderboard, price) if revise else False
+
+    touched = revision_changed_anything(strategy_dir, before_head)
+    if revised and not touched:
+        print(f'Revision for {name} left the clone identical to {parent_name}; treating as unrevised')
         revised = False
-        if MASTER_AGENT_SCRIPT.exists():
-            try:
-                result = subprocess.run(
-                    ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
-                     name, name, '1000.0', '{}', str(price)],
-                    capture_output=True, text=True, timeout=REVISION_TIMEOUT,
-                )
-                if result.returncode == 0:
-                    print(f'Master agent revised {name}:\n{result.stdout.strip()}')
-                    revised = True
-                else:
-                    print(f'Master agent revision failed for {name}: {result.stderr.strip()}')
-            except Exception as e:
-                print(f'Master agent revision errored for {name}: {e}')
 
-        touched = revision_changed_anything(strategy_dir, before_head)
-        if revised and not touched:
-            print(f'Revision for {name} left the clone untouched; treating as unrevised')
+    # The one place a non-XLM leg can enter the population mechanically rather than by the
+    # revision model choosing to write one -- _sanitize_assets only ever removes, and
+    # apply_random_tweak only copies the parent's forward. Before sanitizing, so the picks
+    # go through the exact same verification gate an LLM-chosen asset does.
+    injected = False
+    if inject and cfg_path.exists():
+        injected = _inject_reflector_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
+
+    # Always re-verify declared assets, revised or not: `assets` is committed to git and
+    # inherited by every future clone of this lineage, apply_random_tweak copies it forward
+    # verbatim, and an asset that was fine when admitted can be rugged later. Before the
+    # smoke test, so the smoke run exercises the asset list the strategy will start with.
+    if cfg_path.exists():
+        _sanitize_assets(cfg_path, marks)
+
+    # Runs whenever the model touched the repo, even if `revised` is already False: both
+    # fallbacks only rewrite config.json, so a gutted main.py would otherwise survive a
+    # failed config check and get started anyway (seed_0_1785619070).
+    # `or injected`: a failed revision that changed nothing leaves `touched` False, which is
+    # the common case on a template spawn -- but injection still changes runtime behavior
+    # (an extra get_mark per leg per tick), so it has to face the same gate.
+    if touched or injected:
+        ok, reason = main_py_is_sane(strategy_dir, name, price, marks)
+        print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
+        if not ok:
+            revert_main_py(strategy_dir, before_head, name)
             revised = False
 
-        # Bootstrap is the one place a non-XLM leg can enter the population mechanically
-        # rather than by the revision model choosing to write one. Before sanitizing, so
-        # the picks go through the exact same verification gate an LLM-chosen asset does.
-        injected = False
-        if cfg_path.exists():
-            injected = _inject_reflector_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
+    if revised and cfg_path.exists():
+        cfg = json.load(open(cfg_path))
+        if not _config_is_sane(cfg, price, marks):
+            print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
+            revised = False
 
-        # Runs whenever the model touched the repo, even if `revised` is already False:
-        # both fallbacks only rewrite config.json, so a gutted main.py would otherwise
-        # survive a failed config check and get started anyway (seed_0_1785619070).
-        # Verify declared assets before the smoke test, so the smoke run exercises the
-        # same asset list the strategy will actually start with. Runs even when the
-        # revision failed: the fallbacks copy `assets` through untouched.
-        if cfg_path.exists():
-            _sanitize_assets(cfg_path, marks)
-
-        # `or injected`: a failed revision that changed nothing leaves `touched` False,
-        # which is the common case here -- but injection still changes runtime behavior
-        # (an extra get_mark per leg per tick), so it has to face the same gate.
-        if touched or injected:
-            ok, reason = main_py_is_sane(strategy_dir, name, price, marks)
-            print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
-            if not ok:
-                revert_main_py(strategy_dir, before_head, name)
-                revised = False
-
-        if revised and cfg_path.exists():
-            cfg = json.load(open(cfg_path))
-            if not _config_is_sane(cfg, price, marks):
-                print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
-                revised = False
-
-        if not revised and cfg_path.exists():
+    fallback = None
+    if not revised and cfg_path.exists():
+        if seed_fallback:
+            # The template ships buy_below == sell_above == 0.0, which never trades and
+            # can't be nudged by apply_random_tweak (0.0 * anything is still 0.0).
+            fallback = 'seeded thresholds'
             print(f'Falling back to seeded thresholds for {name}')
             apply_seed_thresholds(cfg_path, name, price)
+        elif parent_cfg and Path(parent_cfg).exists():
+            fallback = 'random tweak'
+            print(f'Falling back to random tweak for {name}')
+            apply_random_tweak(parent_cfg, cfg_path, name)
 
-        commit_revision(strategy_dir, name,
-                        f'auto: seed {name} ({"llm" if revised else "seeded thresholds"})')
+    origin = f'seed {name}' if seed_fallback else f'revise {name} from {parent_name}'
+    commit_revision(strategy_dir, name,
+                    f'auto: {origin} ({"llm" if revised else (fallback or "unchanged")})')
 
+def bootstrap_initial_strategies(price, count=2, marks=None, budget=0):
+    # Either the first run (strategy_state.json doesn't exist yet, so there's nothing to
+    # stop or clone-from in the normal cycle) or a backfill after the population dropped
+    # below KEEP_TOP_N. Seed `count` strategies straight from the template so there's
+    # something for later cycles to evolve.
+    # Returns the revision budget left over, so a backfill that spent the cycle's one slot
+    # can't have the clone loop spend it again in the same cycle.
+    print(f'Bootstrapping {count} strategies from the template.')
+    # At most one of them gets the cycle's revision slot, if the cycle has one to spend.
+    revise_index = random.randrange(count) if (budget and count) else None
+    for i in range(count):
+        name = f'seed_{uuid.uuid4().hex[:12]}'
+        provision_strategy(
+            name, TEMPLATE_REPO,
+            parent_name=name, parent_cfg=None, score=1000.0, leaderboard='{}',
+            price=price, marks=marks,
+            revise=(i == revise_index), inject=True, seed_fallback=True,
+        )
         subprocess.run(['/opt/strat_manager.py', 'start', name])
+    return budget - 1 if revise_index is not None else budget
 
 def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     # Fallback used when the master agent is unavailable or fails: copy the parent's
@@ -1184,6 +1269,10 @@ def promote_live_strategy(current_leader, leader_score):
 def run():
     while True:
         print('--- Monitoring cycle', datetime.datetime.now(), '---')
+        # Rolled once here, then drawn down by whichever path creates strategies this
+        # cycle -- backfill or the clone loop, never both.
+        budget = _revision_budget()
+        print(f'Revision budget this cycle: {budget}')
         price = fetch_price_with_retry()
         if price is None:
             print(f'Could not fetch price after {PRICE_FETCH_ATTEMPTS} attempts; '
@@ -1206,14 +1295,14 @@ def run():
         # strategy would mean hundreds of blocking Horizon calls per ranking pass.
         marks = fetch_marks_for_cycle(state, price)
         if not state:
-            bootstrap_initial_strategies(price, marks=marks)
+            bootstrap_initial_strategies(price, marks=marks, budget=budget)
             sleep_or_exit(CYCLE_SLEEP)
             continue
 
         if len(state) < KEEP_TOP_N:
             shortfall = KEEP_TOP_N - len(state)
             print(f'Only {len(state)} strategies known (< {KEEP_TOP_N}); backfilling {shortfall} from template.')
-            bootstrap_initial_strategies(price, count=shortfall, marks=marks)
+            budget = bootstrap_initial_strategies(price, count=shortfall, marks=marks, budget=budget)
             state = load_state()
 
         performances = []
@@ -1252,10 +1341,10 @@ def run():
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'stop', name])
 
-        # Two clones are created every cycle and nothing ever removed them, so the
-        # tracked population grew ~2/hour forever (74 tracked / 88 directories by
-        # 2026-08-01) and every cycle re-scored dozens of identical never-traded
-        # clones. Untrack the deep tail: stopped, never traded, nothing to learn from.
+        # Newcomers are created every cycle (three of them now) and nothing ever removed
+        # them, so the tracked population grew ~2/hour forever (74 tracked / 88 directories
+        # by 2026-08-01) and every cycle re-scored dozens of identical never-traded clones.
+        # Untrack the deep tail: stopped, never traded, nothing to learn from.
         # Files stay on disk; the live strategy and anything with a trade history are
         # never touched.
         retire_state = load_state()
@@ -1268,78 +1357,45 @@ def run():
             print(f'Retiring never-traded strategy ranked below {RETIRE_BELOW_RANK}: {name}')
             subprocess.run(['/opt/strat_manager.py', 'rm', name])
 
-        # Clone the top two and hand each clone to the master agent to revise
-        top_two = select_parents(performances, state)
+        # This cycle's newcomers: CLONES_PER_CYCLE clones of the best distinct performers,
+        # plus TEMPLATE_SPAWNS_PER_CYCLE pulled fresh from the template. Built as specs up
+        # front rather than provisioned as we go, because the revision target is drawn from
+        # the whole batch and has to be known before the first one is created.
         leaderboard = json.dumps({n: score for n, score in performances})
-        new_clone_names = []
-        for name, score in top_two:
-            # Only the name is intentionally not derived from the parent (so it
-            # doesn't keep growing across generations of clones-of-clones); the
-            # git clone itself still pulls the winning strategy's own repo.
-            new_name = f"clone_{uuid.uuid4().hex[:12]}"
+        specs = []
+        for name, score in select_parents(performances, state, CLONES_PER_CYCLE):
             parent_repo = state[name]['path']
-            print(f'Cloning best strategy {name} as {new_name}')
-            subprocess.run(['/opt/strat_manager.py', 'clone', new_name, parent_repo])
-            new_clone_names.append(new_name)
-            parent_cfg = Path(parent_repo) / 'config.json'
-            new_dir = Path(STRATEGIES_DIR) / new_name
-            new_cfg = new_dir / 'config.json'
-            before_head = _git_head(new_dir)
+            specs.append(dict(
+                # Only the name is intentionally not derived from the parent (so it
+                # doesn't keep growing across generations of clones-of-clones); the
+                # git clone itself still pulls the winning strategy's own repo.
+                name=f'clone_{uuid.uuid4().hex[:12]}', source_repo=parent_repo,
+                parent_name=name, parent_cfg=Path(parent_repo) / 'config.json',
+                score=score, inject=False, seed_fallback=False,
+            ))
+        for _ in range(TEMPLATE_SPAWNS_PER_CYCLE):
+            fresh = f'seed_{uuid.uuid4().hex[:12]}'
+            specs.append(dict(
+                name=fresh, source_repo=TEMPLATE_REPO,
+                parent_name=fresh, parent_cfg=None,
+                score=1000.0, inject=True, seed_fallback=True,
+            ))
 
-            revised = False
-            if MASTER_AGENT_SCRIPT.exists():
-                try:
-                    result = subprocess.run(
-                        ['python3', str(MASTER_AGENT_SCRIPT), 'revise-strategy',
-                         new_name, name, str(score), leaderboard, str(price)],
-                        capture_output=True, text=True, timeout=REVISION_TIMEOUT,
-                    )
-                    if result.returncode == 0:
-                        print(f'Master agent revised {new_name}:\n{result.stdout.strip()}')
-                        revised = True
-                    else:
-                        print(f'Master agent revision failed for {new_name}: {result.stderr.strip()}')
-                except Exception as e:
-                    print(f'Master agent revision errored for {new_name}: {e}')
+        # One revision at most, and which newcomer gets it is a fair draw: a fresh template
+        # strategy is as worth revising as a clone of the current leader. Everything not
+        # drawn falls back to apply_random_tweak / apply_seed_thresholds, same as it always
+        # has when the model was unavailable.
+        target = random.choice(specs)['name'] if (budget and specs) else None
+        print(f'Revising {target or "nothing"} this cycle '
+              f'({len(specs)} new strategies: {", ".join(s["name"] for s in specs)})')
+        for spec in specs:
+            provision_strategy(**spec, leaderboard=leaderboard, price=price, marks=marks,
+                               revise=(spec['name'] == target))
 
-            touched = revision_changed_anything(new_dir, before_head)
-            if revised and not touched:
-                print(f'Revision for {new_name} left the clone identical to {name}; treating as unrevised')
-                revised = False
-
-            # Always re-verify declared assets, revised or not: `assets` is committed
-            # to git and inherited by every future clone of this lineage, and
-            # apply_random_tweak copies it forward verbatim.
-            if new_cfg.exists():
-                _sanitize_assets(new_cfg, marks)
-
-            # See bootstrap_initial_strategies: this must run even when `revised` is
-            # already False, since the random-tweak fallback only rewrites config.json.
-            if touched:
-                ok, reason = main_py_is_sane(new_dir, new_name, price, marks)
-                print(f'main.py check for {new_name}: {"passed" if ok else "FAILED"} -- {reason}')
-                if not ok:
-                    revert_main_py(new_dir, before_head, new_name)
-                    revised = False
-
-            if revised and new_cfg.exists():
-                cfg = json.load(open(new_cfg))
-                if not _config_is_sane(cfg, price, marks):
-                    print(f'Revised config for {new_name} failed sanity check ({cfg}); treating as unrevised')
-                    revised = False
-
-            if not revised and parent_cfg.exists() and new_cfg.exists():
-                print(f'Falling back to random tweak for {new_name}')
-                apply_random_tweak(parent_cfg, new_cfg, new_name)
-
-            commit_revision(new_dir, new_name,
-                            f'auto: revise {new_name} from {name} '
-                            f'({"llm" if revised else "random tweak"})')
-
-        # Start the new clones, plus any top-N strategy that's currently stopped
+        # Start the newcomers, plus any top-N strategy that's currently stopped
         # (reload state first since strat_manager.py clone/stop wrote to disk)
-        for new_name in new_clone_names:
-            subprocess.run(['/opt/strat_manager.py', 'start', new_name])
+        for spec in specs:
+            subprocess.run(['/opt/strat_manager.py', 'start', spec['name']])
 
         fresh_state = load_state()
         for name, _ in performances[:KEEP_TOP_N]:
