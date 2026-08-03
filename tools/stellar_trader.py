@@ -59,12 +59,12 @@ _USDC_SPEC = _USDC_ASSET
 # regardless of what the caller asks for. Nothing here can be widened by a revision --
 # only by a human editing this file, which monitor.check_boundary_integrity() will
 # notice and halt live trading over until it is reviewed and re-baselined.
-MAX_TRADE_USD = 2.0                    # per trade, any asset
+MAX_TRADE_USD = 4.0                    # per trade, any asset
 MAX_DAILY_USD = 99999.0                # per 24h across ALL assets combined
 MAX_TRADE_USD_NONBASE = 0.50           # per trade, non-XLM only
-MAX_DAILY_USD_PER_ASSET = 2.0          # per 24h per (code, issuer)
-MAX_POSITION_USD_PER_ASSET = 2.0       # mark-to-market cap on any one non-XLM leg
-MAX_TOTAL_NONBASE_EXPOSURE_USD = 4.0   # across every non-XLM leg at once
+MAX_DAILY_USD_PER_ASSET = 4.0          # per 24h per (code, issuer)
+MAX_POSITION_USD_PER_ASSET = 4.0       # mark-to-market cap on any one non-XLM leg
+MAX_TOTAL_NONBASE_EXPOSURE_USD = 8.0   # across every non-XLM leg at once
 MAX_OPEN_NONBASE_ASSETS = 2            # matches the strategy-side limit
 MAX_SYSTEM_TRUSTLINES = 3              # USDC + 2 discovered. BLND predates this system.
 MIN_XLM_OPERATING_BUFFER = 1.0         # spendable XLM that must survive a new trustline
