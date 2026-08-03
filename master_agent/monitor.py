@@ -326,20 +326,31 @@ def _tools():
 
 
 def _stellar_caps():
-    """stellar_trader's current per-trade/daily caps, or None. Never raises.
+    """stellar_trader's current caps, or None. Never raises.
 
     Lazy and defensive for the same reasons _tools() is. Only ever used to *record* what
     the caps were when a strategy was promoted -- a strategy earns the live flag on a
     paper track record sized by its own config.json, then trades real money clamped by
     these, and the two numbers are not the same. Failing to read them must degrade that
     record, never block a promotion.
+
+    The non-base caps are included because they now bind: a non-XLM leg trades real money
+    and is clamped to MAX_TRADE_USD_NONBASE, an eighth of the XLM per-trade cap. Recording
+    only the XLM caps made every extra leg's sizing look 8x larger than it can be, and
+    left live_report unable to see drift in the caps that actually govern it.
     """
     try:
         if '/opt/tools' not in sys.path:
             sys.path.append('/opt/tools')
         import stellar_trader
         return {'max_trade_usd': float(stellar_trader.MAX_TRADE_USD),
-                'max_daily_usd': float(stellar_trader.MAX_DAILY_USD)}
+                'max_daily_usd': float(stellar_trader.MAX_DAILY_USD),
+                'max_trade_usd_nonbase': float(stellar_trader.MAX_TRADE_USD_NONBASE),
+                'max_daily_usd_per_asset': float(stellar_trader.MAX_DAILY_USD_PER_ASSET),
+                'max_position_usd_per_asset': float(stellar_trader.MAX_POSITION_USD_PER_ASSET),
+                'max_total_nonbase_exposure_usd': float(
+                    stellar_trader.MAX_TOTAL_NONBASE_EXPOSURE_USD),
+                'max_stuck_usd': float(stellar_trader.MAX_STUCK_USD)}
     except Exception as e:
         print(f'could not read stellar_trader caps ({e}); recording sizing without them')
         return None
@@ -1422,7 +1433,6 @@ def _promotion_sizing(name):
     """
     try:
         cfg = json.load(open(STRATEGIES_DIR / name / 'config.json'))
-        # Top-level only: extra legs never trade live (trade_logger refuses them).
         sizing = {'trade_amount_usd': float(cfg.get('trade_amount_usd') or 0.0)}
         caps = _stellar_caps()
         if caps:
@@ -1430,16 +1440,102 @@ def _promotion_sizing(name):
             if sizing['trade_amount_usd'] > 0 and caps['max_trade_usd'] > 0:
                 sizing['implied_ratio'] = round(
                     min(1.0, caps['max_trade_usd'] / sizing['trade_amount_usd']), 6)
+        # Per-leg, because extra legs DO trade live now and are clamped by a different,
+        # much smaller cap. Recording one ratio against MAX_TRADE_USD described the XLM
+        # leg and misdescribed every other by 8x.
+        legs = {}
+        for a in (cfg.get('assets') or []):
+            try:
+                spec = f"{a['code']}:{a['issuer']}"
+                want = float(a.get('trade_amount_usd') or 0.0)
+            except Exception:
+                continue
+            leg = {'trade_amount_usd': want}
+            cap = (caps or {}).get('max_trade_usd_nonbase')
+            if want > 0 and cap:
+                leg['implied_ratio'] = round(min(1.0, cap / want), 6)
+            legs[spec] = leg
+        if legs:
+            sizing['legs'] = legs
         return sizing
     except Exception as e:
         print(f'could not record promotion sizing for {name} ({e})')
         return None
 
-def save_live_strategy(name, sizing=None):
+def save_live_strategy(name, sizing=None, trustlines=None):
     entry = {'name': name, 'since': time.time()}
     if sizing:
         entry['sizing'] = sizing
+    if trustlines:
+        # Which of this strategy's declared legs can actually reach real money. A leg
+        # without a trustline is paper-only for as long as it stays that way, and that is
+        # otherwise visible nowhere -- the strategy runs, logs trades and looks normal.
+        entry['trustlines'] = trustlines
     LIVE_STRATEGY_FILE.write_text(json.dumps(entry, indent=2))
+
+
+def open_trustlines_for(name):
+    """Open a trustline per declared extra asset. Returns {spec: {ok, created, reason}}.
+
+    Called once at promotion, between the outgoing strategy's wind_down and the incoming
+    one's live.flag: after, so the reserve refunds from any closed leg have landed and the
+    XLM floor is measured against reality; before, so a strategy is never live and trading
+    into an asset whose trustline is still being opened.
+
+    A failure is NOT fatal and must never block a promotion. ensure_trustline refuses for
+    environmental reasons far more often than for unsafe ones -- Horizon unreachable,
+    insufficient XLM reserve, MAX_SYSTEM_TRUSTLINES reached -- and blocking would convert
+    a per-asset problem into a whole-system stall, since the cull exempts only the live
+    strategy and an unpromotable leader leaves the inferior incumbent live indefinitely.
+    The strategy goes live XLM-only instead, submit_trade refuses that leg per-trade with
+    a reason that reaches the trade log, and the verdict is recorded in live_strategy.json.
+    """
+    results = {}
+    try:
+        cfg = json.load(open(STRATEGIES_DIR / name / 'config.json'))
+    except Exception as e:
+        print(f'could not read {name} config for trustlines ({e}); live XLM-only')
+        return results
+
+    tools = _tools()
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import stellar_trader
+    except Exception as e:
+        print(f'stellar_trader unavailable ({e}); {name} goes live XLM-only')
+        return results
+
+    # assets_from_config, not the raw list: it dedupes by spec AND code and caps at
+    # MAX_EXTRA_ASSETS, so this opens trustlines for exactly what the strategy can trade.
+    if tools:
+        portfolio = tools[0]
+        try:
+            declared = portfolio.assets_from_config(cfg)
+        except Exception as e:
+            print(f'could not read {name} assets ({e}); live XLM-only')
+            return results
+    else:
+        declared = cfg.get('assets') or []
+
+    for a in declared:
+        code, issuer = a.get('code'), a.get('issuer')
+        if not code or not issuer:
+            continue
+        spec = a.get('spec') or f'{code}:{issuer}'
+        try:
+            r = stellar_trader.ensure_trustline(code, issuer)
+        except Exception as e:
+            r = {'ok': False, 'created': False, 'reason': str(e)}
+        results[spec] = r
+        if r.get('created'):
+            print(f'  trustline opened for {spec}')
+        elif r.get('ok'):
+            print(f'  trustline for {spec} already present')
+        else:
+            print(f'  NO trustline for {spec}: {r.get("reason")} '
+                  f'-- that leg stays paper-only')
+    return results
 
 def set_live_flag(name, live):
     # Plain marker file main.py polls for, not a config.json key, so it survives a
@@ -1638,15 +1734,27 @@ def promote_live_strategy(current_leader, leader_score):
                   f"{old_name} stays live, retrying next cycle")
             return
         print(f"wind_down flattened {old_name} ({result['chunks']} chunk(s))")
+        if result.get('stuck'):
+            # Computed by wind_down and, until now, thrown away here. A stuck leg denies
+            # that asset permanently, suspends every non-XLM buy system-wide, and counts
+            # toward the MAX_STUCK_USD halt -- so it silently degrades the strategy being
+            # promoted right now, and the only trace was a dotfile nobody reads.
+            print(f"  WARNING: {len(result['stuck'])} leg(s) left stuck and unsellable: "
+                  f"{', '.join(result['stuck'])}")
+            print(f"  non-XLM buys are suspended system-wide until "
+                  f"/opt/trades/.stuck_positions.json is cleared by a human")
         set_live_flag(old_name, False)
 
+    # Between wind_down and live.flag, deliberately. See open_trustlines_for.
     print(f'Promoting {current_leader} to live')
+    trustlines = open_trustlines_for(current_leader)
     set_live_flag(current_leader, True)
     # Deliberately not refreshed on the "already live" re-assert path above: `since` must
     # not move, and this is a snapshot of the sizing *at promotion* by definition. A caps
     # change afterwards is exactly the drift worth seeing, so live_report flags it rather
     # than it being silently overwritten here.
-    save_live_strategy(current_leader, sizing=_promotion_sizing(current_leader))
+    save_live_strategy(current_leader, sizing=_promotion_sizing(current_leader),
+                       trustlines=trustlines)
 
 def run():
     while True:

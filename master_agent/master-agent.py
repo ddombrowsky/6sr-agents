@@ -28,6 +28,25 @@ def _friction_facts():
 
 _XLM_RT_BP, _NONBASE_RT_BP = _friction_facts()
 
+
+def _live_caps():
+    """(max_trade_usd, max_trade_usd_nonbase) from stellar_trader, for the prompt.
+
+    Interpolated for the same reason the friction facts are: these two numbers decide how
+    much of a strategy's configured trade size can actually reach the network, they are
+    edited by hand in stellar_trader.py, and a prompt that restates them goes stale
+    silently. The fallbacks are only so a revision still runs if /opt/tools is unreadable.
+    """
+    try:
+        sys.path.append('/opt/tools')
+        import stellar_trader
+        return stellar_trader.MAX_TRADE_USD, stellar_trader.MAX_TRADE_USD_NONBASE
+    except Exception:
+        return 4.0, 0.50
+
+
+_MAX_TRADE_USD, _MAX_TRADE_USD_NONBASE = _live_caps()
+
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
     'qwen': 'qwen3.5',
@@ -318,9 +337,14 @@ REVISION_SYSTEM_PROMPT = (
     'still maintains them -- you never touch them yourself. Pass the asset as a keyword: '
     "execute_trade(agent_name, action, side, price, requested_usd, state, "
     "asset='CODE:ISSUER').\n"
-    '  * Real-money trading is currently XLM-only. A non-XLM leg is always paper, even '
-    'on the live strategy, so do not build a strategy that depends on a real fill in a '
-    'discovered asset.\n\n'
+    '  * Extra legs CAN now trade real money, but only on the live strategy, only once '
+    'monitor has opened a trustline for that asset at promotion, and only while the asset '
+    'stays admitted. Any of those missing and the leg is paper-only, which is the normal '
+    f'case: only one strategy is live at a time. Real non-XLM orders are clamped to '
+    f'${_MAX_TRADE_USD_NONBASE:.2f} per trade against ${_MAX_TRADE_USD:.2f} for XLM, so '
+    'an extra leg\'s real size is a small fraction of what config.json asks for however '
+    'you size it. Design for the paper book, and never build a strategy whose thesis '
+    'depends on any single real fill landing.\n\n'
     "Do not default to only nudging buy_below/sell_above. Threshold tweaks are the "
     "weakest lever available to you -- treat them as a last resort, not the first move. "
     "/opt/tools has indicator and signal modules you can import from a strategy's "

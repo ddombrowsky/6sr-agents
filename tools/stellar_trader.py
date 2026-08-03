@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Real-money XLM/USDC trading on Stellar pubnet using the `claudio` identity.
+"""Real-money trading on Stellar pubnet using the `claudio` identity.
 
-This module is the actual safety boundary that plan describes: MAX_TRADE_USD
-and MAX_DAILY_USD live only here, are never expressed as caller-supplied parameters, and
-are enforced regardless of what a (possibly LLM-revised) strategy asks for.
+XLM plus any asset monitor has admitted; USDC is the settlement asset every trade is
+denominated against, not something a strategy selects. Non-XLM real trading was enabled
+on 2026-08-03 — before that, trade_logger refused every non-XLM submission and this
+module's asset support was reachable only from a REPL.
+
+This module is the actual safety boundary that plan describes: every cap below lives only
+here, is never expressed as a caller-supplied parameter, and is enforced regardless of
+what a (possibly LLM-revised) strategy asks for.
 
 Shells out to the `stellar` CLI for signing/submission, same shell-out pattern as
 reflector_oracle.py, and to Horizon's REST API for balance queries — classic XLM/USDC
@@ -15,16 +20,19 @@ Confirmed live against `claudio`
 assumed:
 - already holds a USDC trustline - issuer GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN,
   the well-known Circle-issued USDC on pubnet.
-- currently funded with ~27.9 XLM and ~14.0 USDC (also holds some BLND, irrelevant here).
+- as of 2026-08-03, ~12.26 XLM and ~61.4 USDC, with 2 subentries (also holds some BLND,
+  which predates this system and is irrelevant here). Funded from ~2.26 XLM that day to
+  buy reserve headroom for discovered-asset trustlines. Run this file directly for the
+  current numbers rather than trusting this line; it has been stale before.
 
 Trading itself uses a self-payment `path-payment-strict-send` (source == destination ==
 claudio's own address) - the standard way to take a market-order-like swap off the
 Stellar DEX orderbook from the CLI, as opposed to manage-buy-offer/manage-sell-offer,
 which post a *resting* limit order that may not fill immediately or in full.
 
-CAUTION: submit_trade()/wind_down() sign and submit real pubnet transactions.
-Exercise them manually from a REPL with MAX_TRADE_USD
-this low before wiring them into monitor.py/main.py - running this file directly
+CAUTION: submit_trade()/wind_down()/ensure_trustline()/remove_trustline() sign and submit
+real pubnet transactions. They are wired into trade_logger and monitor.py; exercise any
+CHANGE to them manually from a REPL first, at these cap sizes. Running this file directly
 (`python3 stellar_trader.py`) only prints a read-only status report, it does not trade.
 """
 import json
@@ -81,13 +89,15 @@ _BASE_RESERVE_XLM = 0.5  # current Stellar protocol base reserve per subentry
 # margin against fee bumps across a chunked sequence.
 _FEE_BUFFER_XLM = 0.01
 _MAX_WIND_DOWN_CHUNKS_PER_CALL = 20  # safety bound; remainder retried next monitor.py cycle
-# Spendable XLM that wind_down() will not sell. Not a safety cap like the ones at the top
-# of this file -- it exists because wind_down's "sell everything" premise drains the
-# account to its protocol floor, leaving _spendable_xlm() at 0.0 and the sell leg dead
-# until a human funds it again (observed 2026-08-01 16:09 and 2026-08-02 17:31, both
-# times immediately after a leader change). Sized so the account can still open every
-# trustline it is allowed to and keep the operating buffer on top.
-WIND_DOWN_RESERVE_XLM = MIN_XLM_OPERATING_BUFFER + MAX_OPEN_NONBASE_ASSETS * _BASE_RESERVE_XLM
+# Spendable XLM that the trading path will not sell. Not a safety cap like the ones at the
+# top of this file -- it is infrastructure. Every non-XLM leg needs a trustline, every
+# trustline costs 0.5 XLM of base reserve, and every transaction costs a fee, all paid out
+# of the same native balance a sell would otherwise spend to the floor. Sized so the
+# account can open every trustline it is allowed to and keep the operating buffer on top.
+#
+# Renamed from WIND_DOWN_RESERVE_XLM on 2026-08-03 when it stopped being wind_down-only;
+# see _sellable_xlm's docstring for why the ordinary sell path now honours it too.
+MIN_TRUSTLINE_RESERVE_XLM = MIN_XLM_OPERATING_BUFFER + MAX_OPEN_NONBASE_ASSETS * _BASE_RESERVE_XLM
 
 
 def _paper_only():
@@ -275,14 +285,28 @@ def _spendable_xlm(account_json):
 
 
 def _sellable_xlm(account_json):
-    """Spendable XLM that wind_down() may liquidate — spendable minus the operating floor.
+    """Spendable XLM that may be sold — spendable minus the trustline/fee reserve.
 
-    Deliberately NOT used by submit_trade: a strategy selling its own position is meant
-    to be able to exit it completely, and flooring that would silently change trading
-    behaviour. This narrower notion applies only to the demotion path, where nothing is
-    live and the leftover XLM is infrastructure rather than a position anyone chose.
+    Used by BOTH wind_down and submit_trade's native sell leg, which is a reversal. This
+    was previously wind_down-only, on the argument that "a strategy selling its own
+    position is meant to be able to exit it completely, and flooring that would silently
+    change trading behaviour".
+
+    That argument assumed the strategy's position and the real balance were the same
+    thing. They are not: the paper book runs at ~$1000 while claudio holds ~$5, so a
+    strategy in a sell regime does not exit a position, it issues sells until the real
+    account hits its protocol floor. Observed 2026-08-03 -- five ordinary sells in 13
+    minutes (.pubnet_ledger.json ts 1785778828..1785779615), the last one a partial
+    $1.4364 because `_spendable_xlm(account) * price` was all that was left. The account
+    ended at 0.0000 spendable, which is precisely the state in which no trustline can be
+    opened, so wind_down would carefully preserve this reserve at a leader change and the
+    next strategy's ordinary sells would spend it straight back down.
+
+    What the floor actually costs a strategy: MIN_TRUSTLINE_RESERVE_XLM is 2.0 XLM, about
+    $0.35, against a MAX_TRADE_USD chunk of $4.00 ≈ 23 XLM. Under 9% of a single chunk,
+    and only ever on the last sell of a full liquidation.
     """
-    return max(0.0, _spendable_xlm(account_json) - WIND_DOWN_RESERVE_XLM)
+    return max(0.0, _spendable_xlm(account_json) - MIN_TRUSTLINE_RESERVE_XLM)
 
 
 def _current_live_name():
@@ -391,12 +415,16 @@ def ensure_trustline(code: str, issuer: str) -> dict:
     Every trustline is a subentry costing 0.5 XLM of base reserve, permanently, and it
     raises the account's minimum balance -- which directly shrinks _spendable_xlm() and
     therefore the account's ability to sell XLM or pay fees. Opening one carelessly can
-    strand the account below its own reserve, which is the failure mode claudio is in
-    right now: 2.0099 XLM against a 2.0 protocol minimum, leaving 0.0 spendable.
+    strand the account below its own reserve. claudio has been in that state twice:
+    2.0099 XLM against a 2.0 protocol minimum (2026-08-02), and again at 2.2600 with 2
+    subentries on 2026-08-03, both times 0.0 spendable.
 
     So this refuses unless the account would still clear MIN_XLM_OPERATING_BUFFER
     *after* the new subentry, and never opens more than MAX_SYSTEM_TRUSTLINES. Called by
-    monitor at promotion time only -- never from a strategy.
+    monitor.promote_live_strategy, once per declared asset, immediately after the
+    outgoing strategy's wind_down and before the incoming one goes live -- never from a
+    strategy. A refusal here is not fatal: the strategy goes live XLM-only and the
+    reason is recorded in live_strategy.json.
     """
     if _paper_only():
         return {'ok': False, 'created': False, 'reason': 'PAPER_ONLY is set'}
@@ -621,12 +649,19 @@ def _most_recent_tx_hash(address):
 
 
 def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
-    """Sign and submit a real XLM/USDC trade on pubnet using the `claudio` identity.
+    """Sign and submit a real trade on pubnet using the `claudio` identity.
 
-    side: 'buy' (spend USDC for XLM) or 'sell' (spend XLM for USDC). usd_amount:
-    requested USD notional — silently clamped to MAX_TRADE_USD, the remaining
-    MAX_DAILY_USD budget, and claudio's real on-chain balance of whatever asset the
-    trade spends, regardless of what the caller asks for.
+    side: 'buy' (spend USDC for `asset`) or 'sell' (spend `asset` for USDC). asset:
+    'XLM', 'CODE:ISSUER', or a {'code','issuer'} dict — a *request*, not an instruction:
+    a non-XLM asset must already have been admitted by monitor and have a trustline, and
+    every cap applies on top regardless. usd_amount: requested USD notional — silently
+    clamped to MAX_TRADE_USD, the remaining MAX_DAILY_USD budget, and claudio's real
+    on-chain balance of whatever asset the trade spends.
+
+    Non-XLM buys are clamped further, by MAX_TRADE_USD_NONBASE, the remaining
+    MAX_DAILY_USD_PER_ASSET budget, MAX_POSITION_USD_PER_ASSET and
+    MAX_TOTAL_NONBASE_EXPOSURE_USD. Sells are not: those cap entry risk, and applying
+    them to an exit is what made a fully-sized leg unsellable for 24h.
 
     Returns {'submitted': bool, 'tx_hash': str|None, 'amount_usd': float, 'reason': str|None}.
     """
@@ -654,9 +689,34 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
     code, issuer = (spec.split(':') + [None])[:2] if not native else ("XLM", None)
 
     if not native:
+        # Admission is absolute for buys -- this is the third and only unskippable
+        # verification gate, and nothing may move money *into* an unadmitted asset.
+        #
+        # It is not absolute for sells. Applied to both sides it made an asset that was
+        # denied, expired, or merely unreachable impossible to exit through the ordinary
+        # path, leaving only wind_down at the next leader change. Worse, _still_tradeable
+        # fails closed and caches for _VERIFY_TTL, so one Horizon hiccup locked the sell
+        # leg for 15 minutes on a position already held. Refusing to let money *out* of
+        # something the system is already holding is not a safety property; it is the
+        # same class of error as charging exits against the daily buy budget.
+        #
+        # The exemption is deliberately narrow: only a position this system actually
+        # opened a trustline for, and actually holds a non-zero balance of. It cannot be
+        # used to reach a new asset, because you cannot sell what you do not hold.
         if not _verified_asset(code, issuer):
-            return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
-                    "reason": f"{spec} is not an admitted asset (or admission expired)"}
+            exempt = False
+            if side == "sell":
+                try:
+                    account = _account(_source_address())
+                    exempt = (spec in _read_json(_TRUSTLINES_PATH, {})
+                              and (_asset_balance(account, code, issuer) or 0.0) > 0)
+                except Exception:
+                    exempt = False
+            if not exempt:
+                return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
+                        "reason": f"{spec} is not an admitted asset (or admission expired)"}
+            print(f"[stellar_trader] {spec} is no longer admitted; allowing the sell of a "
+                  f"position already held")
         # Holding something unsellable while buying more illiquid exposure is exactly
         # the wrong move, so any stuck leg blocks all non-XLM buys.
         if side == "buy" and _stuck_positions():
@@ -670,7 +730,20 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
 
     capped_usd = max(0.0, float(usd_amount))
     capped_usd = min(capped_usd, MAX_TRADE_USD, max(0.0, MAX_DAILY_USD - _daily_spent()))
-    if not native:
+    if not native and side == "buy":
+        # Buy-side only, which wind_down's docstring has argued for all along: "that cap
+        # bounds loss from bad *buys*; applying it to a de-risking sell could trap claudio
+        # holding an unhedged position for days". That reasoning was never carried across
+        # to the non-base path, and the result was a lock rather than a cap: a leg that
+        # reached MAX_POSITION_USD_PER_ASSET ($4) by buying had also spent the whole
+        # MAX_DAILY_USD_PER_ASSET ($4) budget, so its own sells clamped to
+        # min(..., max(0.0, 4.0 - 4.0)) == 0 and it was unsellable for 24h by
+        # construction -- reported as "insufficient balance or caps exhausted".
+        #
+        # A sell stays bounded by MAX_TRADE_USD ($4), the same per-chunk bound wind_down
+        # uses, which is slippage control rather than a risk cap. That is comfortable
+        # against the real books of the assets currently admitted: AQUA 1.48% spread on
+        # $24,239 of bid depth, ARS 1.95% on $970 (.verified_assets.json, 2026-08-03).
         capped_usd = min(
             capped_usd,
             MAX_TRADE_USD_NONBASE,
@@ -694,9 +767,19 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
                     "reason": f"already holding {MAX_OPEN_NONBASE_ASSETS} non-XLM legs"}
 
     spend_spec = _USDC_SPEC if side == "buy" else spec
+    floored_reason = None
     if side == "sell":
         if native:
-            available_usd = _spendable_xlm(account) * price
+            # _sellable_xlm, not _spendable_xlm: the trustline and fee reserve is
+            # infrastructure, not part of any strategy's position. See its docstring.
+            available_usd = _sellable_xlm(account) * price
+            if available_usd <= 0 < _spendable_xlm(account):
+                # Distinct from an empty account, which is what this used to look like.
+                # "insufficient balance or caps exhausted" was 101 of 133 live records on
+                # 2026-08-03 and told an operator nothing about which of the two it was.
+                floored_reason = (
+                    f'native sell floored at MIN_TRUSTLINE_RESERVE_XLM '
+                    f'({MIN_TRUSTLINE_RESERVE_XLM} XLM held back for trustlines and fees)')
         else:
             held = _asset_balance(account, code, issuer)
             available_usd = (held or 0.0) * price
@@ -710,7 +793,7 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
 
     if capped_usd <= 0:
         return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
-                "reason": "insufficient balance or caps exhausted"}
+                "reason": floored_reason or "insufficient balance or caps exhausted"}
 
     dest_spec = spec if side == "buy" else _USDC_SPEC
     send_amount = capped_usd if side == "buy" else capped_usd / price
@@ -723,7 +806,13 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
     except Exception as e:
         return {"submitted": False, "tx_hash": None, "amount_usd": 0.0, "reason": str(e)}
 
-    _record_spend(capped_usd, spec)
+    # Buys only. A sell is not a spend, and counting it as one meant an exit consumed the
+    # very budget the next entry needed -- and, with the buy-side clamp above now the only
+    # reader of _daily_spent(spec), would have left that counter measuring something it no
+    # longer gates. MAX_DAILY_USD is unaffected in practice today (72fc3f4 set it to
+    # 99999.0), but it is the same error and would surface the moment that is fixed.
+    if side == "buy":
+        _record_spend(capped_usd, spec)
     filled = dest_amount if side == "buy" else send_amount
     _log_pubnet_trade(side, capped_usd, filled if native else 0.0, tx_hash, spec=spec)
     return {"submitted": True, "tx_hash": tx_hash, "amount_usd": capped_usd,
@@ -740,7 +829,21 @@ def _asset_price(code, issuer):
 
 
 def _total_nonbase_exposure(account_json):
-    """Mark-to-market USD across every non-XLM, non-USDC leg currently held."""
+    """Mark-to-market USD across the non-XLM legs THIS SYSTEM opened, per _TRUSTLINES_PATH.
+
+    The `ours` filter is the same one open_positions applies, and for the same reason:
+    claudio independently holds a BLND position that predates this system entirely, which
+    open_positions excludes, wind_down never sells and remove_trustline refuses to close.
+
+    Counting it here was a live bug, found by the first real non-XLM trade this system
+    ever attempted (2026-08-03). BLND marked at $10.34 against a
+    MAX_TOTAL_NONBASE_EXPOSURE_USD of $8.00, so headroom was $0.00 and EVERY non-XLM buy
+    was refused -- permanently, and reported as the generic "insufficient balance or caps
+    exhausted". The cap bounds risk this system chooses to take on; a position it can
+    neither manage nor exit is not that, and letting a third party's balance move the
+    limit means an asset nobody here controls decides whether this system may trade.
+    """
+    ours = _read_json(_TRUSTLINES_PATH, {})
     total = 0.0
     for b in account_json.get('balances', []):
         if b.get('asset_type') == 'native':
@@ -750,6 +853,11 @@ def _total_nonbase_exposure(account_json):
             continue
         amount = float(b.get('balance', 0.0))
         if amount <= 0:
+            continue
+        try:
+            if _spec(code, issuer) not in ours:
+                continue
+        except Exception:
             continue
         mark = _asset_price(code, issuer)
         if mark:
@@ -766,7 +874,7 @@ def wind_down() -> dict:
     is attributable to the outgoing live strategy; there's no per-strategy position to
     track, just flatten what's on the account.
 
-    Except that "what's on the account" is not all position. WIND_DOWN_RESERVE_XLM of
+    Except that "what's on the account" is not all position. MIN_TRUSTLINE_RESERVE_XLM of
     spendable XLM is held back, because native XLM is also what pays fees and funds
     trustline reserves. Selling down to the protocol floor — which this function did
     until 2026-08-02 — leaves _spendable_xlm() at exactly 0.0, and from there every
@@ -774,6 +882,10 @@ def wind_down() -> dict:
     strategy can open a position it cannot close, and the failure is invisible until a
     human reads the account. The floor is small in USD terms (~$0.35 at $0.175) and is
     the cheapest way to keep the sell leg alive across a leader change.
+
+    Since 2026-08-03 submit_trade's native sell honours the same floor, so this is no
+    longer the only place it is preserved -- it was being restored here at each leader
+    change and spent back down within the hour by ordinary trading.
 
     Sells in MAX_TRADE_USD-sized chunks to avoid slippage from dumping a large position
     in one market sell, looping until the remaining balance is below the dust threshold
@@ -796,7 +908,7 @@ def wind_down() -> dict:
 
     Returns {'liquidated', 'remaining_xlm', 'chunks', 'reason', 'legs', 'stuck'}.
     monitor.promote_live_strategy gates on 'liquidated' and reports 'remaining_xlm';
-    both now measure the *sellable* balance, i.e. net of WIND_DOWN_RESERVE_XLM. That is
+    both now measure the *sellable* balance, i.e. net of MIN_TRUSTLINE_RESERVE_XLM. That is
     the load-bearing half of the floor: measuring 'liquidated' against raw spendable
     would leave it permanently False once the floor is reached, and a leader change
     would then never complete -- trading one stuck state for a worse one.
@@ -887,13 +999,42 @@ def wind_down() -> dict:
 
 
 if __name__ == "__main__":
+    # The only operator surface for this module. It printed balances and nothing about
+    # the multi-asset state, which meant every question this system's live path can
+    # actually fail on -- is there a trustline, is a leg stuck, are we halted, how much
+    # headroom is there for one more trustline -- had to be answered by hand from
+    # Horizon and four dotfiles. Everything below is read-only.
     address = _source_address()
     account = _account(address)
     xlm = _asset_balance(account, "XLM")
     usdc = _asset_balance(account, "USDC")
+    subentries = account.get("subentry_count", 0)
     print(f"claudio ({address})")
-    print(f"  XLM:  {xlm:.7f} (spendable above reserve: {_spendable_xlm(account):.7f}, "
-          f"wind_down-sellable: {_sellable_xlm(account):.7f})")
+    print(f"  XLM:  {xlm:.7f} ({subentries} subentries; spendable above reserve: "
+          f"{_spendable_xlm(account):.7f}, sellable: {_sellable_xlm(account):.7f})")
     print(f"  USDC: {'no trustline' if usdc is None else f'{usdc:.7f}'}")
     print(f"  daily spend used: ${_daily_spent():.2f} / ${MAX_DAILY_USD:.2f}")
+
+    # Headroom for one more trustline, using ensure_trustline's own arithmetic so the two
+    # cannot disagree about whether the next asset is affordable.
+    after = xlm - (2.5 + subentries + 1) * _BASE_RESERVE_XLM - _FEE_BUFFER_XLM
+    ok = after >= MIN_XLM_OPERATING_BUFFER
+    print(f"  one more trustline would leave {after:.4f} XLM spendable "
+          f"(need >= {MIN_XLM_OPERATING_BUFFER}): {'OK' if ok else 'REFUSED -- fund first'}")
+
+    ours = _read_json(_TRUSTLINES_PATH, {})
+    print(f"  trustlines opened by this system: {len(ours)}/{MAX_SYSTEM_TRUSTLINES}"
+          f"{' -- ' + ', '.join(sorted(ours)) if ours else ' (none)'}")
+
+    positions = open_positions()
+    if positions:
+        for p in positions:
+            print(f"    holding {p['amount']} {p['code']} ({p['spec']})")
+    else:
+        print("    no non-XLM legs held")
+
+    stuck = _stuck_positions()
+    if stuck:
+        print(f"  STUCK: {len(stuck)} leg(s) -- {', '.join(sorted(stuck))}")
+    print(f"  halted: {'YES -- ' + str(_HALT_PATH) if _halted() else 'no'}")
     print("(read-only status check — submit_trade()/wind_down() are not called here)")

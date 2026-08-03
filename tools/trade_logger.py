@@ -263,24 +263,19 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
     live_record = None
     try:
         if is_live:
-            # Phase 1 boundary: paper trades any admitted asset, but real money still only
-            # ever moves in XLM/USDC. stellar_trader.submit_trade has no asset parameter
-            # yet, and extending it needs trustlines, per-asset caps and a multi-leg
-            # wind_down -- none of which are in place, and claudio currently has no XLM
-            # reserve headroom to open a trustline anyway. Removing this branch is the
-            # first step of phase 2, not something a strategy revision may do.
-            if not is_native:
-                print(f'[{agent_name}] LIVE: refusing non-XLM live trade '
-                      f'({_assets.display(spec)}); paper only')
-                # Recorded too: on a live strategy these are trades the paper book made
-                # and real money structurally could not, which is part of the same gap.
-                live_record = _live_fields(side, trade_usd, {
-                    'submitted': False, 'amount_usd': 0.0, 'tx_hash': None,
-                    'reason': 'non-XLM leg; real money is XLM-only'})
-            else:
-                result = submit_trade(side, trade_usd)
-                print(f"[{agent_name}] LIVE: submit_trade({side!r}, {trade_usd}) -> {result}")
-                live_record = _live_fields(side, trade_usd, result)
+            # Every admitted asset, not just XLM, since 2026-08-03. This branch used to
+            # refuse anything non-native on the grounds that submit_trade had no asset
+            # parameter and that trustlines, per-asset caps and a multi-leg wind_down were
+            # "none of which are in place" -- all three had since been built and left
+            # unreachable, because this was the only caller and it never passed `asset`.
+            #
+            # Nothing here decides whether the trade is allowed. submit_trade re-checks
+            # admission, trustline, per-asset and aggregate caps, stuck legs and the halt
+            # file, and refuses with a reason that lands in the log line below.
+            result = submit_trade(side, trade_usd, asset=spec)
+            print(f"[{agent_name}] LIVE: submit_trade({side!r}, {trade_usd}, "
+                  f"asset={spec!r}) -> {result}")
+            live_record = _live_fields(side, trade_usd, result)
     finally:
         try:
             record_trade(
