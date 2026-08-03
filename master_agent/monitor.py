@@ -422,6 +422,14 @@ def _next_reflector_assets(count=2):
     A short tail (one left when two are wanted) yields just that one rather than
     refreshing mid-call to top up a single slot: a refresh costs 1-2 minutes of CLI
     invocations, and the caller is happy with fewer candidates.
+
+    The pool is shuffled on every refresh. reflector_oracle.get_tracked_assets() returns
+    its assets sorted by spec, and this walks them in order, so an unshuffled pool hands
+    out the alphabetical head first every single time the process restarts -- AQUA and ARS
+    to whoever injects first, and the tail end of the alphabet only to a monitor that
+    stays up long enough to walk ~38 assets at two per injection. Restarts are frequent
+    (emperor.sh ends a window every EMPEROR_RUN_HOURS), so in practice the same handful of
+    codes were being proposed over and over and most of the oracle's list never got tried.
     """
     pool = _reflector_pool
     if pool['index'] >= len(pool['assets']):
@@ -433,10 +441,12 @@ def _next_reflector_assets(count=2):
         except Exception as e:
             print(f'  could not refresh the Reflector asset pool: {e}')
             pool['assets'] = []
+        random.shuffle(pool['assets'])
         pool['index'] = 0
         if not pool['assets']:
             return []
-        print(f"  refreshed Reflector asset pool: {len(pool['assets'])} tracked assets")
+        print(f"  refreshed Reflector asset pool: {len(pool['assets'])} tracked assets "
+              f"(shuffled; first few: {', '.join(a['code'] for a in pool['assets'][:4])})")
 
     picks = pool['assets'][pool['index']:pool['index'] + count]
     pool['index'] += len(picks)
