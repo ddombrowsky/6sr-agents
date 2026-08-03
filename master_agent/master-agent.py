@@ -426,7 +426,15 @@ def main():
     }]
     print("Agent ready. Type 'exit' to quit.")
     while True:
-        user_input = input('> ')
+        try:
+            user_input = input('> ')
+        except EOFError:
+            # stdin closed (piped input exhausted, or Ctrl-D) -- exit like 'exit'
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            break
         if not user_input.strip():
             continue
         if user_input.strip().lower() in ('exit', 'quit'):
