@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Real-money XLM/USDC trading on Stellar pubnet using the `claudio` identity.
 
-Design: ../../pubnet-plan.md. This module (not any strategy's config.json, not
-template_repo/main.py) is the actual safety boundary that plan describes: MAX_TRADE_USD
+This module is the actual safety boundary that plan describes: MAX_TRADE_USD
 and MAX_DAILY_USD live only here, are never expressed as caller-supplied parameters, and
 are enforced regardless of what a (possibly LLM-revised) strategy asks for.
 
@@ -14,19 +13,18 @@ reflector_oracle.py uses) doesn't apply here.
 Confirmed live against `claudio`
 (GBTFQJ6VARJYI2C6JLPUXQ4CAKRNJF3KEYXXJ5T74DV47RSSNIJCH5VM), via a plain Horizon GET, not
 assumed:
-- already holds a USDC trustline — issuer GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN,
-  the well-known Circle-issued USDC on pubnet. Contrary to pubnet-plan.md's open question,
-  no manual trustline setup is needed before Rollout phase 1 — it's already there.
+- already holds a USDC trustline - issuer GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN,
+  the well-known Circle-issued USDC on pubnet.
 - currently funded with ~27.9 XLM and ~14.0 USDC (also holds some BLND, irrelevant here).
 
 Trading itself uses a self-payment `path-payment-strict-send` (source == destination ==
-claudio's own address) — the standard way to take a market-order-like swap off the
+claudio's own address) - the standard way to take a market-order-like swap off the
 Stellar DEX orderbook from the CLI, as opposed to manage-buy-offer/manage-sell-offer,
 which post a *resting* limit order that may not fill immediately or in full.
 
-CAUTION: submit_trade()/wind_down() sign and submit real pubnet transactions. Per
-pubnet-plan.md Rollout phase 1, exercise them manually from a REPL with MAX_TRADE_USD
-this low before wiring them into monitor.py/main.py — running this file directly
+CAUTION: submit_trade()/wind_down() sign and submit real pubnet transactions.
+Exercise them manually from a REPL with MAX_TRADE_USD
+this low before wiring them into monitor.py/main.py - running this file directly
 (`python3 stellar_trader.py`) only prints a read-only status report, it does not trade.
 """
 import json

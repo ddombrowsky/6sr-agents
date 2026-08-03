@@ -34,19 +34,25 @@ python agent-bootstrap.py
 `create.sh` starts a detached `ubuntu` container (`docker run -d --name agenttest
 --volume ./v:/opt ubuntu sleep infinity`) with the `v/` directory bind-mounted to
 `/opt`. `v/` is gitignored; `v/agents/` holds a working copy of the agent scripts for
-execution/testing inside that container, refreshed from the root copies by `copy.sh`
-(which copies `requirements.txt`, `agent-bootstrap.py`, `sr_agent_tools.py`, and
-`tools.json`, backing up the previous copy into `v/agents/bak.<random>/` first) — don't
-assume it's in sync unless `copy.sh` has been run recently. `v/` has since grown well
-beyond a script mirror into a separate multi-repo trading-agent system (`master_agent/`,
-`template_repo/`, `tools/`, `trades/`); see `v/CLAUDE.md` for that.
+execution/testing inside that container. `v/` has since grown well beyond a script mirror
+into a separate multi-repo trading-agent system (`master_agent/`, `template_repo/`,
+`tools/`, `strategies/`, `trades/`); see `v/CLAUDE.md` for that.
+
+`copy.sh` moves files between the two, and the direction depends on the flag:
+
+- `./copy.sh --to` — root → `v/agents/`: copies `requirements.txt`,
+  `agent-bootstrap.py`, `sr_agent_tools.py` and `tools.json` in, backing up the previous
+  copy into `v/agents/bak.<random>/` first.
+- `./copy.sh` (no args) — `v/` → root: copies `v/agents/*` to the repo root and
+  `v/{master_agent,tools,template_repo}/*` over their root-level counterparts.
 
 The top-level `master_agent/`, `template_repo/`, and `tools/` directories in *this* repo
-(not `v/`) are a git-tracked, point-in-time snapshot of their `v/` counterparts, added in
-one commit for reference/backup. They are not kept in sync automatically — the live
-versions are the ones under `v/`, which are separate repos that get rewritten by the
-self-modifying agent while the container runs. Don't edit the root-level copies expecting
-it to affect a running system, and don't assume they reflect current behavior.
+(not `v/`) are the git-tracked mirror maintained by that no-arg direction, so their
+history is the backup/reference record of what the live system has done to itself. The
+sync is manual, though, so don't assume they're current unless `copy.sh` has been run
+recently — and don't edit the root-level copies expecting it to affect a running system.
+The live versions are the ones under `v/`, separate repos that get rewritten by the
+self-modifying agent while the container runs.
 
 ## Architecture: tool-calling loop
 

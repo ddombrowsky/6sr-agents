@@ -11,7 +11,7 @@ STRATEGIES_DIR = Path('/opt/strategies')
 STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
 TRADES_DIR = Path('/opt/trades')  # also where run.log lives, alongside the trade logs
 TRADES_DIR.mkdir(parents=True, exist_ok=True)
-LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json')  # written by monitor.py (pubnet-plan.md)
+LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json')  # written by monitor.py
 
 def load_live_strategy():
     if LIVE_STRATEGY_FILE.exists():
@@ -128,7 +128,7 @@ def rm_strategy(name):
         return
     if name == live_strategy_name():
         # Untracking the live strategy would strand a real pubnet position: monitor.py
-        # could no longer score it, and nothing would ever wind it down (pubnet-plan.md).
+        # could no longer score it, and nothing would ever wind it down.
         print(f"Strategy '{name}' is the live pubnet strategy; refusing to remove it.")
         return
     path = state[name]['path']

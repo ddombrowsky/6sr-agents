@@ -36,7 +36,7 @@ MASTER_AGENT_SCRIPT = Path('/opt/master_agent/master-agent.py')
 REVISION_TIMEOUT = int(os.environ.get('REVISION_TIMEOUT', 60000))
 KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycle
 RETIRE_BELOW_RANK = KEEP_TOP_N * 3 # stopped, never-traded strategies below this get untracked
-LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money (pubnet-plan.md)
+LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money
 
 # Repos whose contents decide how real money moves. Watched every cycle by
 # check_boundary_integrity(); see that function for why.
@@ -949,7 +949,7 @@ def save_live_strategy(name):
 def set_live_flag(name, live):
     # Plain marker file main.py polls for, not a config.json key, so it survives a
     # revision rewriting config.json from scratch. monitor.py alone writes/deletes it
-    # — a strategy's own code never decides it's live (pubnet-plan.md).
+    # a strategy's own code never decides if it's live
     flag_path = STRATEGIES_DIR / name / 'live.flag'
     if live:
         flag_path.touch()
@@ -1210,8 +1210,8 @@ def run():
         # stopped). Re-derived from full-population rank every cycle, so a
         # stopped strategy can't get stuck occupying a "cull" slot forever the
         # way a fixed "worst two" window could. The live strategy is exempt even if
-        # it falls out of the top N — it must not be killed while holding a real
-        # pubnet position (pubnet-plan.md).
+        # it falls out of the top N, it must not be killed while holding a real
+        # pubnet position.
         for name, _ in performances[KEEP_TOP_N:]:
             info = state.get(name)
             if info and info.get('status') == 'running':
