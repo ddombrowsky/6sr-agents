@@ -31,6 +31,9 @@ import uuid
 from pathlib import Path
 
 from score import score_from_strategy_path
+# One definition of "which python runs a strategy", shared with the process that actually
+# starts them, so the smoke test can never gate on a different environment than the run.
+from strat_manager import _strategy_python
 
 STATE_FILE = Path('/opt/strategy_state.json')
 STRATEGIES_DIR = Path('/opt/strategies')
@@ -951,7 +954,15 @@ def main_py_is_sane(strategy_dir, name, price, marks=None, *, baseline_source=No
         # PAPER_ONLY makes the no-live-trading guarantee structural rather than relying
         # on having remembered to drop live.flag from the copy.
         env = dict(os.environ, PAPER_ONLY='1')
-        proc = subprocess.Popen(['python3', '-u', 'main.py'], cwd=str(tmp_dir),
+        # Not 'python3' -- the same bug as _check_revision_interpreter. This must be the
+        # interpreter strat_manager will really start this main.py under, which is why it
+        # calls that resolution rather than reimplementing it or just using sys.executable:
+        # otherwise the smoke test measures a different environment than the one that runs.
+        # A revision importing a package the venv has and /usr/bin/python3 does not would
+        # pass here and die on its first real tick, or be reverted for an import that would
+        # in fact have resolved -- and either way the gate would be reporting on code other
+        # than the code that trades.
+        proc = subprocess.Popen([_strategy_python(), '-u', 'main.py'], cwd=str(tmp_dir),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, preexec_fn=os.setsid, env=env)
         try:

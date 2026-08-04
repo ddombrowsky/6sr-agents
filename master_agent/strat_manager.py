@@ -14,6 +14,33 @@ TRADES_DIR = Path('/opt/trades')  # also where run.log lives, alongside the trad
 TRADES_DIR.mkdir(parents=True, exist_ok=True)
 LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json')  # written by monitor.py
 
+# Preferred interpreter for a strategy's main.py, same path emperor.sh picks for monitor.
+VENV_PYTHON = os.environ.get('STRATEGY_PYTHON', '/opt/agents/venv/bin/python')
+
+
+def _strategy_python():
+    """Which python runs a strategy's main.py.
+
+    This used to be a bare 'python3', which resolves to /usr/bin/python3 under setsid,
+    cron and `docker exec` -- the same word that had silently disabled the whole LLM
+    layer (see emperor.sh's PYTHON comment). Here the cost is narrower but real: third
+    party packages are installed into /opt/agents/venv, so a strategy started by
+    /usr/bin/python3 raises ModuleNotFoundError on its first tick for anything the
+    revision prompt's requirements manifest says is available.
+
+    sys.executable is already correct whenever monitor.py spawned us, since it runs under
+    emperor.sh's chosen interpreter and subprocesses inherit it. It is wrong in exactly
+    one case: strat_manager started from its own `#!/usr/bin/env python3` shebang, which
+    is how monitor invokes it (`/opt/strat_manager.py start ...`) and how an operator runs
+    it by hand. `sys.prefix == sys.base_prefix` is the standard "not inside a venv" test,
+    so this prefers the venv only when we are not already in one -- a monitor deliberately
+    started under some other venv still wins.
+    """
+    if sys.prefix == sys.base_prefix and os.path.exists(VENV_PYTHON):
+        return VENV_PYTHON
+    return sys.executable
+
+
 def load_live_strategy():
     if LIVE_STRATEGY_FILE.exists():
         try:
@@ -173,7 +200,7 @@ def start_strategy(name, command=None):
             # -u: unbuffered stdout/stderr. Without it, Python fully buffers output when
             # it isn't a TTY, and SIGTERM (how stop_strategy ends a process) doesn't flush
             # that buffer — run.log would stay empty even though the process did real work.
-            cmd = ['python3', '-u', str(main_py)]
+            cmd = [_strategy_python(), '-u', str(main_py)]
         else:
             print(f"No command supplied and no main.py found for strategy '{name}'.")
             return

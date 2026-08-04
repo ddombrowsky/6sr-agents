@@ -70,6 +70,12 @@ STRATEGY_STATE_FILE = Path('/opt/strategy_state.json')
 REVISION_HISTORY_FILENAME = '.strategy-revision-history.json'
 REVISION_HISTORY_MAX_MESSAGES = 5
 
+# The third-party package manifest, named in REVISION_SYSTEM_PROMPT so the revision model
+# can read the current list instead of trusting a list hardcoded in a prompt that goes
+# stale the next time someone pip-installs something. Overridable because this file is
+# also run from the repo root outside the container, where /opt does not exist.
+REQUIREMENTS_PATH = os.environ.get('REQUIREMENTS_PATH', '/opt/agents/requirements.txt')
+
 # The two jobs a newcomer can be handed, passed by monitor.py as the 6th argv of
 # `revise-strategy`. `refine` is a clone of a leader: improve on a parent with a real
 # record. `explore` is a fresh template spawn with no meaningful parent, asked for
@@ -533,7 +539,32 @@ REVISION_SYSTEM_PROMPT = (
     'book from the Stellar DEX: best bid/ask, spread, and USD depth/imbalance on each '
     'side, a liquidity signal distinct from price or sentiment; a wide spread means '
     'higher slippage risk right now, a lopsided imbalance means resting supply/demand '
-    'is skewed). None of the indicator/signal modules are wired into template_repo\'s main.py '
+    'is skewed). '
+    # A revision imported numpy on 2026-08-04. It was not installed then, so main.py raised
+    # ModuleNotFoundError on its first tick, the smoke test caught it and the whole
+    # revision was reverted -- the gate worked, but a whole cycle's slot bought nothing.
+    # The fix was to state the rule and give the model a way to check it, NOT to name the
+    # packages here: this prompt is edited by hand and by the emperor pass, and any list
+    # baked into it goes stale the moment someone pip-installs something. REQUIREMENTS_PATH
+    # is the manifest, and the import probe below is what settles it, because the manifest
+    # records what was installed *somewhere* and the only thing that matters is whether the
+    # interpreter that runs main.py can import it.
+    'What a strategy may import is limited to the Python standard library, the modules '
+    'in /opt/tools, and whatever is actually installed in the interpreter that runs it. '
+    'DO NOT ASSUME a third-party package is present, and do not assume it is absent '
+    f'either -- the installed set changes. Read {REQUIREMENTS_PATH} with `read_file` to '
+    'see what has been installed for this system; that manifest is the list of packages '
+    'you may reach for. Before you depend on one, confirm the import actually resolves '
+    'for a strategy process by running it the way strategies are run -- '
+    '`exec` with `python3 -c "import numpy"` (substitute the package) and check it exits '
+    '0. That probe is authoritative and the manifest is not, because a package can be '
+    'installed into a different interpreter than the one that starts main.py. If you want '
+    'something the manifest does not list, `install_package` it and then run the same '
+    'probe. A main.py that imports an unresolvable module raises ModuleNotFoundError on '
+    'its first tick, fails the smoke test, and gets reverted, so the whole revision is '
+    'wasted -- when in doubt, write the arithmetic yourself (the indicator modules above '
+    'are all plain Python and do exactly this). '
+    'None of the indicator/signal modules are wired into template_repo\'s main.py '
     'by default -- that wiring is exactly the kind of change you should be making. Prefer '
     'changes like: wiring in an indicator or the news sentiment score to gate or size '
     'trades, adding a stop-loss/take-profit rule, changing position sizing or order '
