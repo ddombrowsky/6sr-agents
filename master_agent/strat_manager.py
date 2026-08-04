@@ -61,15 +61,31 @@ def clone_strategy(name, repo_url):
     save_state(state)
 
 def _is_alive(pid):
+    # Deliberately NOT os.kill(pid, 0), which was what this used to be: that
+    # succeeds on a zombie, and every strategy here becomes one and stays one.
+    # start_strategy detaches main.py and then exits (monitor invokes this file as
+    # a subprocess), so the strategy is orphaned onto PID 1 -- which in the
+    # agenttest container is `sleep infinity`, an init that never wait()s. Nothing
+    # reaps it, the PID entry survives, and os.kill(pid, 0) reports it alive
+    # forever. So stop_strategy polled out the full STOP_GRACE_SECONDS and
+    # SIGKILLed a corpse on every single cull ("ignored SIGTERM for 15s" on a
+    # process that had died instantly), reconcile_state could never detect a
+    # crashed strategy, and 537 zombies had accumulated in under three days.
+    # Reading the state field from /proc is the only way to tell the difference.
     if not pid:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+        with open(f'/proc/{pid}/stat') as f:
+            # comm is field 2 and can contain spaces and parens, so split on the
+            # LAST ')' -- state is the first field after it.
+            state = f.read().rpartition(')')[2].split()[0]
+        return state != 'Z'
+    except FileNotFoundError:
         return False
-    except PermissionError:
-        # Process exists but is owned by someone else -- still alive.
+    except (PermissionError, IndexError, OSError):
+        # Can't tell -- assume alive, as the old PermissionError branch did.
+        # Over-reporting alive costs a grace period; under-reporting would let
+        # the cull believe it killed something that is still trading.
         return True
 
 def reconcile_state():
