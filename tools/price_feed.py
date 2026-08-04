@@ -6,10 +6,72 @@ Tries multiple keyless sources in order and returns the first that succeeds, so 
 single API outage/rate-limit doesn't take down the trading loop. Each source has its
 own response shape, so each gets its own small parser.
 
+## Why the result is cached on disk, not in-process
+
+Every strategy is its own `main.py` process on a 30s tick, and each one called
+straight through to Coinbase -- so the fleet's request rate was (strategies x 2)/min
+from a single IP, scaling with the population rather than with anything about the
+market. At 22 strategies the run logs already showed CoinGecko returning 429 and ten
+"all sources failed" ticks. An in-process cache fixes nothing here: the processes are
+separate, so the file *is* the shared state. Same pattern as
+dex_price.py's .asset_price_cache.json.
+
+This matters beyond paper trading: the live strategy prices its real pubnet orders
+through this function, and monitor's per-cycle fetch sleeps 300s and burns the cycle
+when it comes back None. Both share whatever rate-limit budget the paper strategies
+leave behind.
+
+Failures are cached too, for a shorter _ERROR_TTL: a rate-limit storm is exactly when
+every source fails, and 22 processes each retrying six sources -- the last of which is
+a ~20s reflector CLI subprocess -- is the worst possible response to being throttled.
+_ERROR_TTL is deliberately shorter than monitor's PRICE_RETRY_DELAY (60s) so that its
+retry loop always re-fetches instead of being handed back its own cached failure.
 """
+import json
+import math
+import os
+import time
+from pathlib import Path
+
 import requests
 
 _TIMEOUT = 10
+
+# Shared on-disk cache; see the module docstring.
+_CACHE_PATH = Path(__file__).resolve().parent / '.xlm_price_cache.json'
+_CACHE_TTL = 60
+_ERROR_TTL = 20
+_CACHE_KEY = 'xlm_usd'
+
+
+def _cache_read(max_age):
+    """Cached (price, True) if still fresh, else (None, False).
+
+    A cached failure is a stored value of None and expires after _ERROR_TTL rather
+    than max_age. The second element distinguishes "cached failure" from "no entry",
+    which a bare None return could not.
+    """
+    try:
+        entry = json.loads(_CACHE_PATH.read_text()).get(_CACHE_KEY)
+        if entry:
+            ttl = max_age if entry['value'] is not None else min(max_age, _ERROR_TTL)
+            if time.time() - entry['ts'] < ttl:
+                return entry['value'], True
+    except Exception:
+        pass
+    return None, False
+
+
+def _cache_write(price):
+    try:
+        # Unique tmp name per process: ~22 strategies write this concurrently, and a
+        # shared tmp path lets one writer's replace() publish another's half-written
+        # file. replace() itself is atomic, so readers never see a partial file.
+        tmp = _CACHE_PATH.with_suffix(f'.tmp.{os.getpid()}')
+        tmp.write_text(json.dumps({_CACHE_KEY: {'ts': time.time(), 'value': price}}))
+        tmp.replace(_CACHE_PATH)
+    except Exception:
+        pass
 
 
 def _from_coingecko():
@@ -82,11 +144,28 @@ _SOURCES = [
 ]
 
 
-def get_price():
+def get_price(max_age=_CACHE_TTL):
+    """Current XLM/USD, or None if every source failed.
+
+    Served from the shared on-disk cache when the last result is younger than
+    `max_age` seconds. Pass max_age=0 to force a live fetch.
+    """
+    price, hit = _cache_read(max_age)
+    if hit:
+        return price
+
     for name, fetch in _SOURCES:
         try:
-            return fetch()
+            price = fetch()
+            # Only a sane number is worth pinning into shared state for the whole TTL.
+            # A source that hands back nan/0 is returned to this caller exactly as it
+            # always was -- trade_logger refuses those -- but caching it would serve
+            # the same bad number to every strategy for the next minute.
+            if isinstance(price, (int, float)) and math.isfinite(price) and price > 0:
+                _cache_write(price)
+            return price
         except Exception as e:
             print(f"[price_feed] {name} error: {e}")
     print("[price_feed] all sources failed")
+    _cache_write(None)
     return None
