@@ -3,7 +3,7 @@
 # Emperor script (higher than master)
 #
 # Runs forever by default, repeating this cycle:
-# 1. Run monitor.py for a bounded window (default 2.5h), capturing its log,
+# 1. Run monitor.py for a bounded window (default 12h), capturing its log,
 #    then ask it to stop by touching /opt/.monitor.py.exit (it exits at its
 #    next cycle-boundary sleep); TERM its process group only if that is still
 #    not enough after another full window.
@@ -100,7 +100,7 @@ done
 cd /opt
 . ./env.sh
 
-RUN_HOURS=${EMPEROR_RUN_HOURS:-2.5h}
+RUN_HOURS=${EMPEROR_RUN_HOURS:-12h}
 LOG_DIR=/opt/emperor_logs
 LOG_RETENTION_CYCLES=${EMPEROR_LOG_RETENTION:-48}
 # Cooperative stop request read by monitor.py at every cycle-boundary sleep
@@ -187,7 +187,7 @@ while true; do
     # synchronous, non-detached subprocess.run()s that can take up to
     # REVISION_TIMEOUT (60000s) each, times REVISIONS_PER_CYCLE (3) -- a single
     # monitor.py cycle can legitimately take longer than this window's default
-    # (2.5h), so a plain `timeout monitor.py` would only kill monitor.py itself
+    # so a plain `timeout monitor.py` would only kill monitor.py itself
     # and orphan any in-flight revise-strategy subprocess, leaving it running
     # unsupervised alongside the next cycle's fresh monitor.py.
     setsid "$PYTHON" -u /opt/monitor.py > "$MONITOR_LOG" 2>&1 &
