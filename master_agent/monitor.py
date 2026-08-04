@@ -498,6 +498,53 @@ def _record_admission(code, issuer, verdict):
         print(f'  could not record admission for {spec}: {e}')
 
 
+def _normalize_config(cfg_path, name):
+    """Fill the three required keys monitor always knows the right value for.
+
+    _required_keys_are_sane demands name, schema_version and trade_amount_usd. On
+    2026-08-04, 101 of 141 strategy configs had no schema_version at all -- it predates
+    them -- so requiring it without this would reject most revised clones over a key
+    their parent never had, discard the model's work, and fall through to a random
+    tweak. Rejecting is only the right answer when monitor cannot know the correct
+    value; for these three it always can, so it supplies them instead.
+
+    ABSENT KEYS ONLY. This deliberately does not correct a key that is present but
+    wrong. A `name` naming some other strategy means the model copied a whole
+    config.json from somewhere -- most likely the parent's, which the refine prompt
+    hands it verbatim -- and that is a revision to reject, not to patch: whatever else
+    it copied is suspect too. Overwriting it here would make the name check dead code.
+
+    Returns True if it rewrote the file.
+    """
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        return False        # unparseable; _config_is_sane will fail it and the
+                            # fallback rebuilds the file from scratch
+    if not isinstance(cfg, dict):
+        return False
+
+    filled = {}
+    if 'name' not in cfg:
+        filled['name'] = name
+    if 'schema_version' not in cfg:
+        filled['schema_version'] = 2
+    if 'trade_amount_usd' not in cfg:
+        filled['trade_amount_usd'] = 10.0
+    if not filled:
+        return False
+
+    cfg.update(filled)
+    try:
+        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+    except Exception as e:
+        print(f'  could not normalize config for {name}: {e}')
+        return False
+    print(f'  filled missing config keys for {name}: '
+          f'{", ".join(f"{k}={v!r}" for k, v in filled.items())}')
+    return True
+
+
 def _sanitize_assets(cfg_path, marks=None):
     """Re-verify every extra asset a config declares and delete the ones that fail.
 
@@ -852,7 +899,45 @@ def _assets_are_sane(cfg, marks):
     return True
 
 
-def _config_is_sane(cfg, price, marks=None):
+def _required_keys_are_sane(cfg, name=None):
+    """The keys every config must carry, beyond the thresholds.
+
+    These went unchecked for a long time because they look like bookkeeping. `name` is
+    not: trade_logger writes to /opt/trades/<config name>.log, and that log is what
+    score.py and qualifies_for_live() read. A clone whose config says someone else's
+    name logs its trades under that name -- so it looks like it never trades, while
+    inflating the trade count of a strategy that might be promoted to real money on it.
+    That is the specific failure `name` is passed in to catch, and it is a plausible one:
+    the refine prompt hands the model the parent's entire config.json, so copying it
+    wholesale (name included) is one lazy write_file away.
+
+    schema_version is accepted as any positive int rather than pinned to 2. Nothing in
+    the system actually reads config's schema_version -- portfolio.SCHEMA_VERSION is
+    state.json's, a different thing -- so pinning it would reject a config over a fact
+    no consumer has an opinion about.
+
+    Missing keys are normally filled by _normalize_config before this runs; what is left
+    for this to catch is present-but-wrong, which monitor cannot safely guess a fix for.
+    """
+    cfg_name = cfg.get('name')
+    if not isinstance(cfg_name, str) or not cfg_name.strip():
+        return False
+    if name is not None and cfg_name != name:
+        return False
+    try:
+        if int(cfg['schema_version']) <= 0:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    try:
+        if float(cfg['trade_amount_usd']) <= 0:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _thresholds_are_sane(cfg, price):
     # Guards against a revision that "succeeds" (subprocess returncode 0) but
     # leaves the clone dead-on-arrival: unset/inverted thresholds never
     # trade, and thresholds set implausibly far from the real fetched price
@@ -869,7 +954,16 @@ def _config_is_sane(cfg, price, marks=None):
         return False
     if price and (buy_below < price * 0.5 or sell_above > price * 1.5):
         return False
-    return _assets_are_sane(cfg, marks)
+    return True
+
+
+def _config_is_sane(cfg, price, marks=None, name=None):
+    # Split into three so the smoke-test prep in main_py_is_sane can ask the narrower
+    # question it actually means (are the thresholds usable?) without a missing
+    # schema_version causing it to overwrite thresholds the model deliberately chose.
+    return (_required_keys_are_sane(cfg, name)
+            and _thresholds_are_sane(cfg, price)
+            and _assets_are_sane(cfg, marks))
 
 def main_py_is_sane(strategy_dir, name, price, marks=None, *, baseline_source=None):
     """Check that a revised main.py actually parses, runs, and persists state.
@@ -942,7 +1036,7 @@ def main_py_is_sane(strategy_dir, name, price, marks=None, *, baseline_source=No
         except Exception:
             pass
         cfg['name'] = scratch_name
-        if not _config_is_sane(cfg, price, marks):
+        if not _thresholds_are_sane(cfg, price):
             # Thresholds are validated separately; don't let a bad config mask a
             # main.py that would run fine once the fallback fixes them. The `assets`
             # list is deliberately preserved here -- stripping it would mean the smoke
@@ -1154,29 +1248,35 @@ def apply_seed_thresholds(cfg_path, name, price):
     # buy_below=sell_above=0.0, which never trades and can't be nudged by
     # apply_random_tweak (0.0 * anything is still 0.0). Seed a real range
     # around the current price instead.
-    trade_amount_usd = 10.0
-    existing_assets = []
+    existing = {}
     if cfg_path.exists():
         try:
-            existing = json.load(open(cfg_path))
-            trade_amount_usd = existing.get('trade_amount_usd', 10.0)
-            existing_assets = existing.get('assets') or []
+            loaded = json.load(open(cfg_path))
+            if isinstance(loaded, dict):
+                existing = loaded
         except Exception:
             pass
-    new_cfg_data = {
+    trade_amount_usd = existing.get('trade_amount_usd', 10.0)
+    existing_assets = existing.get('assets') or []
+    # Start from whatever is already in the file rather than a fresh literal -- see the
+    # same change in apply_random_tweak for why. A template spawn reaching this fallback
+    # has usually had a revision fail a gate, and any config knob that revision invented
+    # is still in the file; there is no reason for the threshold repair to take it out.
+    new_cfg_data = dict(existing)
+    new_cfg_data.update({
         'name': name,
-        'schema_version': 2,
+        'schema_version': existing.get('schema_version', 2),
         'buy_below': round(price * 0.98, 6),
         'sell_above': round(price * 1.02, 6),
         'trade_amount_usd': trade_amount_usd,
-        # This rebuilds config.json from scratch, so `assets` has to be carried across
-        # explicitly. It used to hard-write [], which was fine while seeds were always
-        # XLM-only -- but this runs in the `not revised` branch, exactly the case
+        # Carried across explicitly rather than left to the dict copy above, because it
+        # used to hard-write [] -- which was fine while seeds were always XLM-only, but
+        # this runs in the `not revised` branch, exactly the case
         # _inject_discovered_assets targets, so clearing it here would wipe every
         # injected leg moments after it was written. Only the XLM thresholds are seeded;
         # the extra legs already carry their own, derived from their marks.
         'assets': existing_assets if isinstance(existing_assets, list) else [],
-    }
+    })
     json.dump(new_cfg_data, open(cfg_path, 'w'), indent=2)
 
 def _revision_budget():
@@ -1314,6 +1414,14 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     if inject and cfg_path.exists():
         injected = _inject_discovered_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
 
+    # Supply any of the three required keys the config is missing before the gate asks
+    # for them. Here rather than before the revision, deliberately: this writes
+    # config.json, and `touched` above is a dirty-tree check -- normalizing any earlier
+    # would mark every clone as touched and force the SMOKE_TEST_SECONDS smoke run on
+    # clones nothing had actually changed. Same reason _sanitize_assets sits here.
+    if cfg_path.exists():
+        _normalize_config(cfg_path, name)
+
     # Always re-verify declared assets, revised or not: `assets` is committed to git and
     # inherited by every future clone of this lineage, apply_random_tweak copies it forward
     # verbatim, and an asset that was fine when admitted can be rugged later. Before the
@@ -1337,7 +1445,7 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
 
     if revised and cfg_path.exists():
         cfg = json.load(open(cfg_path))
-        if not _config_is_sane(cfg, price, marks):
+        if not _config_is_sane(cfg, price, marks, name=name):
             print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
             revised = False
 
@@ -1388,13 +1496,24 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     # config with thresholds nudged by a small random factor (e.g. 0.95 - 1.05).
     parent = json.load(open(parent_cfg_path))
     tweak = random.uniform(0.95, 1.05)
-    new_cfg_data = {
+    # Start from the parent's whole config rather than a fresh literal. This used to
+    # rebuild the file from a fixed key set, so every key outside it was silently
+    # deleted the moment a clone fell through to this fallback -- the template's own
+    # news_veto_below, and any knob a revision had invented (rsi_period, stop_loss_pct,
+    # take_profit_pct and friends are all live in the population right now). The
+    # stripped config was then committed and inherited by the whole lineage, so a
+    # parameter the explore role discovered could not survive a single unrevised
+    # generation. Discovering new config parameters is the point of that role; erasing
+    # them here made it unreachable. Note this can leave a knob behind whose main.py was
+    # reverted -- inert data the next revision can see, which costs nothing.
+    new_cfg_data = dict(parent)
+    new_cfg_data.update({
         'name': new_name,
         'schema_version': parent.get('schema_version', 2),
         'buy_below': round(parent['buy_below'] * tweak, 6),
         'sell_above': round(parent['sell_above'] * tweak, 6),
         'trade_amount_usd': parent.get('trade_amount_usd', 10.0)
-    }
+    })
 
     # Carry the parent's extra assets across, nudging each leg by its OWN factor so the
     # fallback explores per-leg thresholds rather than moving every leg in lockstep.
@@ -1412,8 +1531,13 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
             except (KeyError, TypeError, ValueError):
                 pass
         inherited.append(leg)
+    # Explicit both ways, so the dict copy above cannot change what `assets` means: a
+    # parent whose assets value is empty or malformed produced a child with no `assets`
+    # key before this function copied the parent wholesale, and still does.
     if inherited:
         new_cfg_data['assets'] = inherited
+    else:
+        new_cfg_data.pop('assets', None)
 
     json.dump(new_cfg_data, open(new_cfg_path, 'w'), indent=2)
 

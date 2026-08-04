@@ -98,6 +98,14 @@ SIGNAL_MODULES = (
     'price_history_fetcher', 'reflector_oracle', 'rsi',
 )
 
+# The config.json keys the system itself defines. Everything else in a config was
+# invented by some revision, and the census reports those back so an explore spawn can
+# see which parameters have already been tried before inventing another.
+STANDARD_CONFIG_KEYS = frozenset((
+    'name', 'schema_version', 'buy_below', 'sell_above', 'trade_amount_usd', 'assets',
+    'news_veto_below',
+))
+
 _API_KEY = os.environ.get('OLLAMA_API_KEY')
 if not _API_KEY:
     # Previously this line was `'Bearer ' + os.environ.get('OLLAMA_API_KEY')`, which
@@ -639,6 +647,33 @@ def _main_py_shape(source: str):
     return sorted(imports), defs
 
 
+def _custom_config_keys(names) -> str:
+    """One line naming the config.json keys revisions have invented, with counts.
+
+    The main.py census tells an explore spawn what logic exists; this tells it what
+    *parameters* exist. Without it "invent a new config knob" is a blind guess that
+    lands on rsi_period for the fourth time. Separate try/except from the caller's on
+    purpose: a config census failure must not cost the main.py census too.
+    """
+    try:
+        counts = {}
+        for name in names:
+            cfg = _read_json(STRATEGIES_DIR / name / 'config.json', {})
+            if not isinstance(cfg, dict):
+                continue
+            for key in cfg:
+                if key not in STANDARD_CONFIG_KEYS:
+                    counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return ('Custom config.json keys already in use: (none -- no strategy has '
+                    'added one yet).')
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return ('Custom config.json keys already in use: '
+                + ', '.join(f'{k} ({n})' for k, n in ranked) + '.')
+    except Exception as e:
+        return f'(custom config key census unavailable: {e})'
+
+
 def _population_census(limit: int = CENSUS_CLUSTERS) -> str:
     """What logic the tracked population already runs, rendered as prompt text.
 
@@ -710,6 +745,7 @@ def _population_census(limit: int = CENSUS_CLUSTERS) -> str:
         unused = [m for m in SIGNAL_MODULES if m not in all_imports]
         lines.append('Signal modules in /opt/tools that NO tracked strategy imports: '
                      + (', '.join(unused) if unused else '(none -- all are in use)'))
+        lines.append(_custom_config_keys(names))
         return '\n'.join(lines)
     except Exception as e:
         return f'(population census unavailable: {e})'
@@ -789,11 +825,44 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
         f'{price_line}'
         f'Its config.json right now: {json.dumps(own_config)}\n'
         f'Note the template ships buy_below and sell_above at 0.0, which never trades. '
-        f'monitor.py checks the config you leave behind: both thresholds must be '
-        f'present, positive, buy_below < sell_above, and within 50% of the current price '
-        f'above. Even if your logic does not use plain thresholds at all, you must still '
-        f'leave a sane band anchored to that price -- otherwise monitor discards your '
-        f'config and rebuilds it from scratch at price*0.98 / price*1.02.\n\n'
+        f'monitor.py checks the config you leave behind: `name` must still be exactly '
+        f'"{strategy_name}", `schema_version` and `trade_amount_usd` must still be '
+        f'present and positive, and both thresholds must be present, positive, '
+        f'buy_below < sell_above, and within 50% of the current price above. Even if '
+        f'your logic does not use plain thresholds at all, you must still leave a sane '
+        f'band anchored to that price -- otherwise monitor discards your config and '
+        f'rebuilds it from scratch at price*0.98 / price*1.02.\n\n'
+        # The invitation below is in the explore prompt only, never in
+        # REVISION_SYSTEM_PROMPT: that text is shared with refine, and _refine_prompt is
+        # the character-for-character control arm. Six novel keys already exist in the
+        # population (rsi_period, ema_period, stop_loss_pct, ...), invented by models
+        # that were never told they were allowed to -- and until the fallbacks in
+        # monitor.py were fixed to preserve unknown keys, every one of them was deleted
+        # the first time a descendant went unrevised.
+        f'CONFIG.JSON IS YOURS TO EXTEND. Those keys are the required minimum, not the '
+        f'whole schema. Nothing here validates config.json against a schema and nothing '
+        f'strips a key it does not recognise, and the ENTIRE config dict is handed to '
+        f'your `decide(price, history, state, config)` and `decide_asset(...)` '
+        f'unchanged -- in live trading and inside backtest_strategy alike. So every '
+        f'number your logic depends on belongs in config.json under a name that says '
+        f'what it means, rather than hardcoded in main.py: an EMA/SMA period, an RSI '
+        f'period with its overbought/oversold levels, a momentum or volatility '
+        f'lookback, a stop-loss or take-profit percentage, a minimum edge in basis '
+        f'points to clear the round-trip cost, a regime or basis gate, a '
+        f'position-sizing fraction, a cooldown between trades -- or a knob nobody here '
+        f'has thought of yet. Inventing a genuinely new parameter is a good outcome for '
+        f'this slot. Two rules:\n'
+        f'  * ALWAYS read your own keys as `config.get("your_key", <sensible '
+        f'default>)`, never `config["your_key"]`. A main.py that raises KeyError on its '
+        f'first tick fails the smoke test and is reverted, and monitor\'s fallback '
+        f'paths can rebuild config.json without your additions.\n'
+        f'  * Do not rename, repurpose or drop `name`, `schema_version`, `buy_below`, '
+        f'`sell_above`, `trade_amount_usd` or `assets` -- monitor and the shared tools '
+        f'read those. Add alongside them, and remove only keys you introduced yourself '
+        f'and no longer use.\n'
+        f'A knob in config.json is visible to every later revision of your descendants '
+        f'-- each of them is shown its parent\'s config.json verbatim -- while the same '
+        f'number buried in main.py can only ever be reached by a full code rewrite.\n\n'
         f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
         f'proven code, so you are free to restructure it):\n'
         f'```python\n{own_main_py}\n```\n\n'
