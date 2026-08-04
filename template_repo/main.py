@@ -45,6 +45,27 @@ Which is also the honest limitation: there is no historical headline archive her
 a news component is invisible to `beats_buy_hold` -- the backtest always judges it at
 neutral. What *does* see it is score.py, which ranks real paper net worth. A news edge
 has to prove itself in live paper trading over hours, not in the backtest.
+
+## The DEX/CEX basis: the same pattern, with one difference that matters
+
+`state['basis_bp']` and `state['basis_tradeable_bp']` arrive exactly like sentiment does
+-- fetched once per tick by `main()`, read from `state` with a neutral default. They are
+the gap between the CEX aggregate this strategy *decides* on (`price_feed.get_price()`)
+and the Stellar DEX book it *executes* against. Positive means the DEX is rich (a good
+place to sell, a bad place to buy); `basis_tradeable_bp` is that gap minus the cost of
+crossing to capture it, and is usually negative -- which is itself the signal, because it
+says when NOT to trade.
+
+Fetch it with `basis.latest()`, which reads a recorded series, and NEVER with
+`basis.get_basis()` / `dex_is_cheap()` / `dex_is_rich()`, which each do live Horizon
+calls. Those belong to tooling, not to a tick loop -- see basis.py's docstring.
+
+The difference from news: this one IS partially replayable. `market_recorder` keeps a
+per-minute history, and `backtest.py` joins it to the candle grid, so a basis rule does
+reach its own fitness check -- but only on a 1-minute replay (`interval=1, days=0.5`)
+and only as far back as the recording goes. Check `basis_coverage` in the result before
+believing any of it, and read `basis_edge_excess_bp` / `beats_basis_null` rather than
+`beats_buy_hold` on such a short window.
 """
 import json
 import sys
@@ -54,6 +75,7 @@ from pathlib import Path
 # Plain assignment, deliberately. See the module docstring.
 sys.path = sys.path + ['/opt/tools']
 
+import basis
 import news_feed
 import portfolio
 from dex_price import get_mark
@@ -101,6 +123,54 @@ def current_sentiment(asset='XLM'):
         return 0.0
 
 
+def current_basis(spec='XLM'):
+    """This tick's recorded DEX/CEX basis dict, or None if there isn't a usable one.
+
+    Called once per tick from main(), never from decide(). basis.latest() reads the
+    series market_recorder's daemon writes once a minute, so this is a small file read
+    rather than a Horizon call -- which is the entire reason it is latest() and not
+    get_basis(): every running strategy calling get_basis() on a 30s tick would be tens
+    of order-book requests a minute against a book nobody caches.
+
+    Never raises. main() is started once by strat_manager and never restarted, so an
+    exception here would not degrade a strategy, it would end it.
+    """
+    try:
+        return basis.latest(spec)
+    except Exception as e:
+        print(f'basis unavailable ({e}); treating as unknown')
+        return None
+
+
+def basis_ok(side, state, config):
+    """Does the venue currently justify this trade? True whenever it can't be answered.
+
+    Fails NEUTRAL, and the distinction from basis.dex_is_cheap() is the point: that
+    function answers "is there an edge here" and correctly says False when it cannot
+    tell. This is a veto on a trade the price rule already wants, so unknown must mean
+    "don't block". A veto that failed closed would silently halt all buying the moment
+    the recorder died, and since score.py ranks realized net worth, that would look like
+    a strategy choice rather than an outage.
+
+    Off unless config.json carries `basis_min_bp`, so a strategy without the knob
+    behaves byte-for-byte as it did before this existed.
+    """
+    threshold = config.get('basis_min_bp')
+    if threshold is None:
+        return True
+
+    tradeable = state.get('basis_tradeable_bp')
+    basis_bp = state.get('basis_bp')
+    if tradeable is None or basis_bp is None:
+        return True                       # unknown -> neutral, never a block
+
+    if tradeable < threshold:
+        return False                      # the dislocation isn't worth the toll
+    # Sign check: a dislocation only helps the side it points at. Negative basis means
+    # the DEX is cheap against the CEX, which is good to buy into and bad to sell into.
+    return basis_bp < 0 if side == 'buy' else basis_bp > 0
+
+
 def decide(price, history, state, config):
     """XLM leg. Returns (side, action, requested_usd) or None.
 
@@ -126,6 +196,11 @@ def decide(price, history, state, config):
 
     if buy_below and price <= buy_below:
         if veto_below is not None and sentiment <= veto_below:
+            return None
+        # Buys only, for the same reason sentiment vetoes buys only: a venue reading
+        # that can block an exit can strand a position. A revision is free to extend
+        # this to sells -- basis_report.py will say whether that helped.
+        if not basis_ok('buy', state, config):
             return None
         return ('buy', 'buy', size)
     if sell_above and price >= sell_above:
@@ -185,6 +260,19 @@ def main():
         # Fetched here, once per tick, and handed to decide() through state -- never
         # fetched inside decide() itself. See the module docstring for why.
         state['news_sentiment'] = current_sentiment()
+
+        # Same contract, and note the pop. state is persisted to state.json and reloaded
+        # on restart, so leaving the last known basis in place when the recorder goes
+        # quiet would let a strategy gate on a reading from before it was restarted --
+        # stale but indistinguishable from fresh. Absent means unknown, and basis_ok
+        # treats unknown as neutral.
+        b = current_basis()
+        if b:
+            state['basis_bp'] = b['basis_bp']
+            state['basis_tradeable_bp'] = b['tradeable_bp']
+        else:
+            state.pop('basis_bp', None)
+            state.pop('basis_tradeable_bp', None)
 
         decision = decide(price, history, state, config)
         if decision:

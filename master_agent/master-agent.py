@@ -103,7 +103,7 @@ SIGNAL_MODULES = (
 # see which parameters have already been tried before inventing another.
 STANDARD_CONFIG_KEYS = frozenset((
     'name', 'schema_version', 'buy_below', 'sell_above', 'trade_amount_usd', 'assets',
-    'news_veto_below',
+    'news_veto_below', 'basis_min_bp',
 ))
 
 _API_KEY = os.environ.get('OLLAMA_API_KEY')
@@ -527,20 +527,35 @@ REVISION_SYSTEM_PROMPT = (
     # New 2026-08-03. Both are the emperor pass's answer to "where would a new edge come
     # from" -- one measures a dislocation nothing was looking at, the other keeps the
     # history that would let a later revision find more of them.
-    'basis.py (`get_basis()` / `dex_is_cheap()` / `dex_is_rich()` -- THE DEX/CEX BASIS. '
-    'Every strategy here decides on price_feed\'s centralized-exchange aggregate but '
-    'executes against the Stellar DEX order book, and those are two different venues at '
-    'two different prices. get_basis() returns `basis_bp` (how far the DEX is from the '
-    'CEX right now) and `tradeable_bp` (that gap MINUS the cost of crossing to capture '
-    'it). Only tradeable_bp is actionable, and it is negative most of the time -- which '
-    'is itself the useful signal, because it tells you when NOT to trade. A strategy '
-    'that already wants to buy can wait for the DEX to be the cheap venue instead of '
-    'lifting a rich book, and that is an improvement which requires predicting nothing), '
-    'market_recorder.py (`read_history(hours)` / `series(field, hours)` -- an hourly '
+    'basis.py (THE DEX/CEX BASIS. Every strategy here decides on price_feed\'s '
+    'centralized-exchange aggregate but executes against the Stellar DEX order book, '
+    'and those are two different venues at two different prices. The gap is `basis_bp`; '
+    '`tradeable_bp` is that gap MINUS the cost of crossing to capture it. Only '
+    'tradeable_bp is actionable, and it is negative most of the time -- which is itself '
+    'the useful signal, because it tells you when NOT to trade. A strategy that already '
+    'wants to buy can wait for the DEX to be the cheap venue instead of lifting a rich '
+    'book, and that is an improvement which requires predicting nothing. '
+    'HOW TO READ IT, and this is not optional: the basis arrives through `state`, '
+    'exactly like news sentiment. main()\'s tick loop calls `basis.latest()` once per '
+    'tick and sets `state["basis_bp"]` and `state["basis_tradeable_bp"]`; decide() reads '
+    'them with a neutral `.get` default and treats absent as "unknown, do not block". '
+    'template_repo/main.py\'s `current_basis()` and `basis_ok()` are the worked example, '
+    'and `config.json`\'s optional `basis_min_bp` is the knob that arms them. Do NOT '
+    'call `basis.get_basis()`, `dex_is_cheap()` or `dex_is_rich()` from decide() or from '
+    'any per-tick code: each does live Horizon order-book requests, the book is not '
+    'cached, and under backtest they would fire once per replayed tick while answering '
+    'every historical candle with today\'s number. They are for one-off inspection, '
+    'which is what the get_dex_cex_basis tool is), '
+    'market_recorder.py (`read_history(hours)` / `series(field, hours)` -- a PER-MINUTE '
     'record of the DEX book width, depth, the basis and news sentiment, going back as '
     'far as it has been running. This is the only persistent history of anything other '
     "than price; `series('basis_bp', 72)` feeds straight into an EMA or RSI if you "
-    'want to trade the basis rather than just gate on it), '
+    'want to trade the basis rather than just gate on it. It is also what makes basis '
+    'logic REPLAYABLE, unlike news: backtest joins these rows to the candle grid, so '
+    'call backtest_strategy with interval=1 and days=0.5 and then read `basis_coverage`, '
+    '`basis_edge_excess_bp` and `beats_basis_null` -- not `beats_buy_hold`, which over '
+    'half a day is just whatever XLM did this morning. Use `tail(n)`, never '
+    'read_history(), if you read it from a tick loop), '
     'friction.py (`round_trip_bp(spec)` -- what a round trip in an asset costs, if you '
     'want to size a threshold band against it programmatically rather than hardcoding a '
     "number), and orderbook_depth.py (`get_orderbook_metrics()` -- live XLM/USDC order "

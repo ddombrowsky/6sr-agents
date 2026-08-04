@@ -107,18 +107,23 @@ def exec(command: str) -> str:
         return f'error: {e}'
 
 
-def backtest_strategy(strategy_path: str, days: int = 30, ticks_per_candle: int = 1) -> str:
+def backtest_strategy(strategy_path: str, days: float = 30, ticks_per_candle: int = 1,
+                      interval: int = 60) -> str:
     """Replay a strategy over real historical candles and return a JSON result summary.
 
     Imported lazily so a broken/missing /opt/tools module can never stop the agent from
     starting -- the same reason the price feed is imported inside monitor.py's helper.
+
+    `days` is a float and `interval` is the candle size in minutes so that a basis-aware
+    revision can ask for the only grid its logic is visible on: interval=1, days=0.5.
     """
     try:
         from backtest import backtest
         # legs=True costs nothing for an XLM-only strategy (no declared assets means no
         # extra work) and is what makes a multi-asset revision reviewable at all.
-        result = backtest(strategy_path, days=int(days),
-                          ticks_per_candle=int(ticks_per_candle), legs=True)
+        result = backtest(strategy_path, days=float(days),
+                          ticks_per_candle=int(ticks_per_candle),
+                          interval=int(interval), legs=True)
         # decide_source has always been in the payload, and was never noticed: models read
         # the field they came for (beats_buy_hold), which the prompt tells them is
         # authoritative -- and which, on a config-thresholds replay, is a confident number
@@ -135,6 +140,20 @@ def backtest_strategy(strategy_path: str, days: int = 30, ticks_per_candle: int 
                 f"guard, with the logic in a top-level "
                 f"decide(price, history, state, config). Then re-run this tool and check "
                 f"that decide_source is 'main.py:decide' before trusting any result.")
+        # Same failure shape, one signal over: a strategy that gates on the basis but is
+        # replayed over candles with no recorded basis behind them backtests identically
+        # to one that ignores it, and the result looks like a clean verdict on logic
+        # that never ran. Coverage is the field that says so.
+        if isinstance(result, dict) and 'basis_coverage' in result:
+            coverage = result.get('basis_coverage') or 0.0
+            if coverage < 0.5:
+                result['BASIS_WARNING'] = (
+                    f"basis_coverage is {coverage}: only {result.get('basis_candles', 0)} "
+                    f"of {result.get('candles')} candles had a recorded DEX/CEX basis, so "
+                    f"any basis logic in this strategy was inert for the rest of the "
+                    f"replay and basis_edge_excess_bp/beats_basis_null are not "
+                    f"conclusions. The recorded series is per-minute and recent: use "
+                    f"interval=1 with days=0.5 to replay on a grid it actually covers.")
         return json.dumps(result)
     except Exception as e:
         return f'error: {type(e).__name__}: {e}'
@@ -251,18 +270,28 @@ def get_friction(code: str = 'XLM', issuer: str = '') -> str:
 
 
 def get_market_history(hours: int = 168) -> str:
-    """Recorded hourly market conditions: book width, depth, basis, sentiment.
+    """Recorded per-minute market conditions: book width, depth, basis, sentiment.
 
-    Returns a summary plus the raw rows. The summary alone is usually what a revision
-    needs, and the rows can be long, so they are capped -- a model that wants the full
-    series should call series() from inside main.py rather than reading it here.
+    Returns a summary plus a sample of the raw rows. The summary alone is usually what a
+    revision needs, and the rows can be long, so they are capped -- a model that wants
+    the full series should call series() from inside main.py rather than reading it here.
+
+    The sample is an even STRIDE across the window, not the tail. These rows were hourly
+    when this tool was written; at one a minute, `rows[-200:]` answered "the last week"
+    with the last three hours and nothing in the payload said so, which is precisely the
+    kind of silently-narrowed window that makes a model confident about the wrong thing.
     """
     try:
         import market_recorder
         rows = market_recorder.read_history(hours=int(hours))
+        stride = max(1, len(rows) // 200)
+        sample = rows[::stride][-200:]
         return json.dumps({
             'summary': market_recorder.summary(hours=int(hours)),
-            'rows': rows[-200:],
+            'span': market_recorder.span(),
+            'rows': sample,
+            'rows_are': (f'every {stride}th row across the whole window'
+                         if stride > 1 else 'every row'),
             'total_rows': len(rows),
         }, indent=2)
     except Exception as e:

@@ -30,14 +30,28 @@ tradeable_bp to be negative most of the time. That is the honest answer, and a s
 that trades only when it is positive is doing something the population currently cannot.
 
 Read-only: two HTTP GETs, no keys, no signing, no relationship to the live-money path.
+
+TWO ENTRY POINTS, and picking the wrong one is the failure mode this module has to
+guard against. `get_basis()` measures the basis live and is for tooling, the CLI and
+one-off inspection. `latest()` reads the basis market_recorder's daemon already
+measured, does no network I/O at all, and is the ONLY one a strategy tick loop or
+anything running per-candle may call. See each function's docstring.
 """
 import time
 
 QUOTE_SPREAD_SANITY = 0.05      # a book wider than 5% is not a quote worth basing on
 
 
-def get_basis(spec='XLM'):
+def get_basis(spec='XLM', book=None):
     """DEX-vs-CEX dislocation for `spec`, or None if either side is unavailable.
+
+    LIVE I/O -- one to two Horizon GETs per call, because dex_price.get_orderbook is not
+    cached. This is a tooling and one-off-inspection entry point. Do NOT call it from a
+    decide() step or any per-tick loop: ~10 running strategies on a 30s tick would be up
+    to 40 order-book calls a minute, and under backtest it would fire once per replayed
+    tick while answering every historical candle with today's number. `latest()` below
+    is what a loop calls. Same warning applies to dex_is_cheap/dex_is_rich, which are
+    each a fresh get_basis().
 
     Returns:
         cex_mid          reference price from price_feed (the CEX aggregate)
@@ -67,10 +81,11 @@ def get_basis(spec='XLM'):
     if not cex_mid or cex_mid <= 0:
         return None
 
-    try:
-        book = dex_price.get_orderbook(spec)
-    except Exception:
-        book = None
+    if book is None:
+        try:
+            book = dex_price.get_orderbook(spec)
+        except Exception:
+            book = None
     if not book or not book.get('mid') or book['mid'] <= 0:
         return None
     if book.get('spread_pct', 1.0) > QUOTE_SPREAD_SANITY:
@@ -78,7 +93,10 @@ def get_basis(spec='XLM'):
 
     dex_mid = float(book['mid'])
     basis_bp = (dex_mid - cex_mid) / cex_mid * 10000
-    half_bp = friction.half_spread(spec) * 10000
+    # The width of THIS book, not of whatever book friction last cached. Without the
+    # passthrough these two numbers -- which tradeable_bp subtracts from each other --
+    # could come from books up to friction._CACHE_TTL apart.
+    half_bp = friction.half_spread(spec, book) * 10000
 
     return {
         'spec': spec,
@@ -96,6 +114,51 @@ def get_basis(spec='XLM'):
         'ask_depth_usd': book.get('ask_depth_usd'),
         'ts': time.time(),
     }
+
+
+def latest(spec='XLM', max_age_s=180):
+    """The most recent RECORDED basis for `spec`, or None if there isn't a usable one.
+
+    What a 30s trading loop calls. Zero network I/O: it tails the single JSONL that
+    market_recorder's daemon appends to once a minute, so cost is one small seek-read
+    regardless of how many strategies are running or how long the file has grown.
+
+    Never raises and NEVER falls back to a live fetch. The fallback is the tempting bug:
+    it would turn one writer into N, and it would do so precisely when Horizon is
+    already struggling, which is the moment the recorder went quiet. A None here means
+    "the basis is unknown right now", and every caller must treat that as neutral rather
+    than as a reading of zero -- zero is a real basis and a meaningfully different claim.
+
+    max_age_s defaults to three recorder intervals, so a single missed row is tolerated
+    and a dead recorder is not.
+    """
+    try:
+        import market_recorder
+        rows = market_recorder.tail(3)
+    except Exception:
+        return None
+    now = time.time()
+    for row in reversed(rows or []):
+        try:
+            if row.get('spec') != spec:
+                continue
+            if row.get('basis_bp') is None or not row.get('ts'):
+                continue
+            age = now - float(row['ts'])
+            if age < 0 or age > max_age_s:
+                continue
+            return {
+                'spec': spec,
+                'basis_bp': row['basis_bp'],
+                'tradeable_bp': row.get('tradeable_bp'),
+                'spread_bp': row.get('spread_bp'),
+                'ts': row['ts'],
+                'age_s': round(age, 1),
+                'src': 'recorded',
+            }
+        except Exception:
+            continue
+    return None
 
 
 def dex_is_cheap(spec='XLM', min_bp=0.0):

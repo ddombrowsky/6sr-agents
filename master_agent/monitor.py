@@ -91,6 +91,26 @@ MAIN_PY_IMPORTABILITY = os.environ.get('MAIN_PY_IMPORTABILITY', 'non-regression'
 REFLECTOR_INJECT_CHANCE = 0.5
 REFLECTOR_INJECT_COUNT = 2
 
+# The market recorder. It used to be one snapshot per cycle taken inline in run(), which
+# was fine while nothing read the rows back. The DEX/CEX basis changed that: it is a
+# per-tick input, and dex_price.get_orderbook is uncached, so every strategy measuring
+# its own would be ~40 Horizon order-book GETs a minute. One supervised writer at 60s
+# feeds all of them through /opt/trades/.market_history.jsonl instead. The daemon
+# deliberately outlives a single cycle -- a per-cycle process would leave gaps exactly
+# as long as a revision takes.
+RECORDER_SCRIPT = Path('/opt/tools/market_recorder.py')
+RECORDER_INTERVAL = 60
+RECORDER_PID_FILE = TRADES_DIR / '.market_recorder.pid'
+RECORDER_LOG = TRADES_DIR / 'market_recorder.log'
+
+# Odds that a template spawn is seeded with a `basis_min_bp` gate, and the percentile of
+# the recorded tradeable_bp distribution used as its threshold. A coin flip for the same
+# reason REFLECTOR_INJECT_CHANCE is one: the un-seeded spawns are the control arm that
+# basis_report.py compares the seeded ones against. See _inject_basis_gate.
+BASIS_INJECT_CHANCE = 0.5
+BASIS_INJECT_PERCENTILE = 0.25
+BASIS_MIN_RECORDED_HOURS = 6
+
 # What one cycle adds to the population: two clones of the best distinct performers, plus
 # one strategy pulled fresh from template_repo. The template spawn exists because every
 # other newcomer descends from an existing strategy -- without it the population can only
@@ -408,6 +428,71 @@ def _importability_check(source_or_path):
     except Exception as e:
         print(f'importability check unavailable ({e}); not gating on it')
         return None
+
+
+def _recorder_alive():
+    """Is the market recorder daemon running? Pid file plus two confirmations.
+
+    os.kill(pid, 0) alone is not enough. This pid file survives a container restart,
+    and pids are recycled, so a stale file can name a live and entirely unrelated
+    process -- at which point monitor would believe it had a recorder forever and every
+    basis reader would silently degrade to neutral. /proc/<pid>/cmdline settles it.
+    """
+    try:
+        pid = int(RECORDER_PID_FILE.read_text().strip())
+    except Exception:
+        return False
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().decode('utf-8', 'replace')
+    except Exception:
+        return False    # cannot confirm -> assume not ours and respawn
+    return 'market_recorder' in cmdline
+
+
+def ensure_market_recorder():
+    """Start the market recorder daemon if it is not already running, then report.
+
+    Idempotent, and called once per cycle: the daemon outlives a cycle (and an emperor
+    window, since it is setsid'd out of monitor's process group), so the common path
+    here is the _recorder_alive() check and nothing else.
+
+    _strategy_python(), never a bare python3. /usr/bin/python3 cannot import the
+    third-party packages in /opt/agents/venv, and a bare python3 is exactly what made
+    every revision fail silently for weeks -- the same trap, one directory over.
+    """
+    if not _recorder_alive():
+        TRADES_DIR.mkdir(parents=True, exist_ok=True)
+        log = open(RECORDER_LOG, 'a')
+        proc = subprocess.Popen(
+            [_strategy_python(), '-u', str(RECORDER_SCRIPT),
+             '--daemon', '--interval', str(RECORDER_INTERVAL)],
+            stdout=log, stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,   # survives a TERM to monitor's process group
+        )
+        RECORDER_PID_FILE.write_text(str(proc.pid))
+        print(f'Started market recorder (pid {proc.pid}, every {RECORDER_INTERVAL}s) '
+              f'-> {RECORDER_LOG}')
+
+    if '/opt/tools' not in sys.path:
+        sys.path.append('/opt/tools')
+    import market_recorder
+    span = market_recorder.span()
+    # A cycle in which the recorder was just started legitimately has no fresh row yet;
+    # one in which it has been up for hours and still has none is the failure that would
+    # otherwise be invisible, because every basis reader degrades to neutral in silence.
+    row = market_recorder.tail(1)
+    last = row[0] if row else {}
+    age = round(time.time() - last['ts']) if last.get('ts') else None
+    print(f"Market history: {span['rows']} rows over {span['hours']}h; "
+          f"last row {age}s ago, basis {last.get('basis_bp')} bp, "
+          f"tradeable {last.get('tradeable_bp')} bp, spread {last.get('spread_bp')} bp")
+    if age is not None and age > RECORDER_INTERVAL * 5:
+        print(f'WARNING: market history is {age}s stale; every basis reader is '
+              f'degrading to neutral. Check {RECORDER_LOG}')
 
 
 def fetch_marks_for_cycle(state, price):
@@ -773,6 +858,75 @@ def _next_reflector_assets(count=2):
     picks = pool['assets'][pool['index']:pool['index'] + count]
     pool['index'] += len(picks)
     return picks
+
+
+def _inject_basis_gate(cfg_path):
+    """Give a template spawn a coin flip at trading on the DEX/CEX basis.
+
+    Returns True if config.json was written. Same shape and the same reasoning as
+    _inject_discovered_assets below: the population cannot invent this on its own, since
+    apply_random_tweak only scales existing thresholds and apply_seed_thresholds only
+    rebuilds the price band, so without a mechanical channel `basis_min_bp` would enter
+    the population only if the revision model happened to write it. A coin flip rather
+    than always, because the un-gated spawns ARE the control arm -- basis_report.py's
+    whole output is the comparison between the two, and seeding every spawn would leave
+    nothing to compare against.
+
+    The threshold is derived from the recorded distribution rather than being a literal,
+    for a reason worth stating plainly: tradeable_bp is negative nearly all the time (the
+    basis is typically a fraction of the spread -- see basis.py's calibration note), so a
+    positive literal would produce a strategy that never buys, holds cash forever, scores
+    a flat 1000.00, and is indistinguishable on the leaderboard from a broken one. The
+    25th percentile of the recent distribution instead means "skip the buy when the venue
+    is unusually bad", which is a gate that actually fires and can therefore be wrong --
+    the only kind worth an experimental arm.
+
+    Self-sequencing: refuses until there are BASIS_MIN_RECORDED_HOURS of history to draw
+    that percentile from. No arm is created before there is data to feed it, so this
+    needs no operator timing and no second deploy.
+    """
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        return False
+    if cfg.get('basis_min_bp') is not None:
+        return False    # already gated (inherited or model-written); leave it alone
+
+    if random.random() >= BASIS_INJECT_CHANCE:
+        return False
+
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import market_recorder
+        span = market_recorder.span()
+        if span['hours'] < BASIS_MIN_RECORDED_HOURS:
+            print(f"  no basis gate: only {span['hours']}h of recorded history "
+                  f"(need {BASIS_MIN_RECORDED_HOURS}h)")
+            return False
+        # spec='XLM' explicitly: the gate is on the XLM leg, and the recorder can be
+        # pointed at another spec, at which point an unfiltered series would mix two
+        # assets' dislocations into one percentile.
+        values = sorted(v for v in market_recorder.series('tradeable_bp', hours=72,
+                                                          spec='XLM')
+                        if v is not None)
+        if len(values) < 30:
+            print(f'  no basis gate: only {len(values)} tradeable_bp readings')
+            return False
+    except Exception as e:
+        print(f'  no basis gate: recorded history unavailable ({e})')
+        return False
+
+    threshold = round(values[int(len(values) * BASIS_INJECT_PERCENTILE)], 2)
+    cfg['basis_min_bp'] = threshold
+    try:
+        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+    except Exception as e:
+        print(f'  could not write basis gate ({e})')
+        return False
+    print(f'  basis gate: basis_min_bp={threshold} '
+          f'(p{int(BASIS_INJECT_PERCENTILE * 100)} of {len(values)} readings)')
+    return True
 
 
 def _inject_discovered_assets(cfg_path, marks=None, count=2):
@@ -1413,6 +1567,11 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     injected = False
     if inject and cfg_path.exists():
         injected = _inject_discovered_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
+        # The other mechanical channel, and the same `inject` (template-derived) gate:
+        # clones inherit their parent's knob or absence of one, which is what makes a
+        # lineage stay in the arm it was born into. `or injected` order matters only in
+        # that both must run -- a spawn can legitimately get assets and a basis gate.
+        injected = _inject_basis_gate(cfg_path) or injected
 
     # Supply any of the three required keys the config is missing before the gate asks
     # for them. Here rather than before the revision, deliberately: this writes
@@ -1557,8 +1716,12 @@ def _config_signature(state_entry):
     asset_sig = tuple(sorted(
         (a.get('code'), a.get('issuer'), a.get('buy_below'), a.get('sell_above'))
         for a in assets if isinstance(a, dict)))
+    # basis_min_bp for the same reason assets are here: it is the entire difference
+    # between the gated arm and the control arm, and without it two spawns that differ
+    # only in whether they trade on the basis look identical, select_parents drops one
+    # as a duplicate, and the experiment loses half its population to a dedup rule.
     return (cfg.get('buy_below'), cfg.get('sell_above'),
-            cfg.get('trade_amount_usd'), asset_sig)
+            cfg.get('trade_amount_usd'), asset_sig, cfg.get('basis_min_bp'))
 
 def select_parents(performances, state, count=2):
     """Pick `count` distinct strategies to clone and revise this cycle.
@@ -1996,22 +2159,24 @@ def run():
         except Exception as e:
             print(f'turnover report unavailable ({e})')
 
-        # One row an hour into /opt/trades/.market_history.jsonl: the DEX book, its
+        # One row a minute into /opt/trades/.market_history.jsonl: the DEX book, its
         # width and depth, the CEX/DEX basis and news sentiment. Nothing recorded any of
         # this before, so no strategy could condition on it and no post-mortem could
         # reconstruct the conditions a result happened under.
         try:
-            if '/opt/tools' not in sys.path:
-                sys.path.append('/opt/tools')
-            import market_recorder
-            row = market_recorder.record_snapshot()
-            if row:
-                print(f"Market: XLM ${row.get('cex_mid')}, DEX spread "
-                      f"{row.get('spread_bp')} bp, basis {row.get('basis_bp')} bp, "
-                      f"tradeable {row.get('tradeable_bp')} bp, "
-                      f"sentiment {row.get('sentiment')}")
+            ensure_market_recorder()
         except Exception as e:
-            print(f'market snapshot unavailable ({e})')
+            print(f'market recorder unavailable ({e})')
+
+        # The gated-vs-control readout for the basis arm, in the log the next emperor
+        # pass reads. Net worth cannot answer this question in any reasonable time --
+        # it is one noisy sample an hour -- while realized venue edge is one observation
+        # per fill. Swallowed like every other reporter here.
+        try:
+            import basis_report
+            print(basis_report.summary_line(24))
+        except Exception as e:
+            print(f'basis edge report unavailable ({e})')
 
         current_leader, leader_score = performances[0]
         promote_live_strategy(current_leader, leader_score)

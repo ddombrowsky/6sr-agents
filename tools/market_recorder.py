@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""A durable record of market conditions, one row per monitor cycle.
+"""A durable record of market conditions, one row a minute.
+
+This is now the shared transport for the DEX/CEX basis, and the cadence is the whole
+reason. It was one row per monitor cycle (~1h) when it only had to answer post-mortem
+questions. A basis is a per-tick input: a strategy on a 30s loop, and backtest.py on a
+1-minute candle grid, both need a reading no older than a few minutes, and neither may
+fetch its own -- dex_price.get_orderbook is uncached, so ~10 running strategies calling
+basis.get_basis() on every tick is up to 40 Horizon order-book GETs a minute, which is a
+rate-limit incident rather than a signal.
+
+So: ONE writer (the daemon below, supervised by monitor._ensure_recorder), MANY readers
+(basis.latest() tails this file, backtest._basis_series joins it to candles,
+basis_report joins it to trade logs). That single-writer property is the safety
+property; do not add a live-network fallback to any of the readers.
 
 What history this system keeps today is entirely price and entirely one venue:
 ohlc_history.py caches ~30 days of Kraken/Coinbase XLM candles, and
@@ -11,7 +24,7 @@ strategy has ever consumed.
 
 That absence is why every post-mortem in this repo has had to re-derive conditions from
 scratch, and why no strategy can condition on anything but price: you cannot regress
-against data you never wrote down. One row an hour is ~9 KB a day and makes questions
+against data you never wrote down. One row a minute is ~430 KB a day and makes questions
 like "does our edge survive when the book is wide?" or "is the basis mean-reverting on
 an hourly scale?" answerable at all.
 
@@ -27,9 +40,19 @@ from pathlib import Path
 
 HISTORY_PATH = Path('/opt/trades/.market_history.jsonl')
 
-# ~1 row/hour, so this is a bit over a year. Trimming happens on write and only when the
-# file is over the cap, which at one row an hour means approximately never.
-MAX_ROWS = 10000
+# ~1 row/minute, so this is about 41 days. Trimming happens on write and only when the
+# file is plausibly over the cap.
+MAX_ROWS = 60000
+
+# Deliberately an OVER-estimate of a row (real ones measure ~300 B), because it is only
+# ever used as the cheap size guard in _trim(). Under-estimate it and the guard trips
+# while the file is still short of MAX_ROWS lines, at which point _trim reads and
+# rewrites the entire file on EVERY append, forever, and never gets under the guard
+# because there is nothing to remove. The old constant was 200, which was harmless at
+# one row an hour and would have become a multi-megabyte rewrite per minute here.
+_ROW_BYTES = 400
+
+RECORD_INTERVAL = 60        # what the daemon uses, and what basis.latest() assumes
 
 
 def _safe(fn, *args, **kwargs):
@@ -66,7 +89,11 @@ def snapshot(spec='XLM'):
     row['bid_depth_usd'] = book.get('bid_depth_usd')
     row['ask_depth_usd'] = book.get('ask_depth_usd')
 
-    half = _safe(friction.half_spread, spec)
+    # The book we just fetched, not another one. get_orderbook is uncached, so letting
+    # half_spread fetch its own doubled the Horizon load per row and let spread_bp and
+    # half_spread_bp -- which are the same measurement -- come from books up to
+    # friction._CACHE_TTL apart, making tradeable_bp an incoherent mix.
+    half = _safe(friction.half_spread, spec, book) if book else _safe(friction.half_spread, spec)
     row['half_spread_bp'] = round(half * 10000, 2) if half else None
 
     if row.get('cex_mid') and row.get('dex_mid'):
@@ -106,7 +133,8 @@ def _trim():
         if not HISTORY_PATH.exists():
             return
         # Cheap guard: only pay for reading the file when it is plausibly too long.
-        if os.path.getsize(HISTORY_PATH) < MAX_ROWS * 200:
+        # See _ROW_BYTES on why this estimate must sit above the true row size.
+        if os.path.getsize(HISTORY_PATH) < MAX_ROWS * _ROW_BYTES:
             return
         lines = HISTORY_PATH.read_text().splitlines()
         if len(lines) <= MAX_ROWS:
@@ -116,6 +144,106 @@ def _trim():
         tmp.replace(HISTORY_PATH)
     except Exception:
         pass
+
+
+def tail(n=1, max_bytes=65536):
+    """The last `n` rows, oldest first, without reading the whole file.
+
+    THE ONLY function in this module a 30s trading loop may call. read_history() scans
+    every line of a file that now grows by 1440 rows a day; on a tick loop that is a
+    linear scan per tick per strategy. This seeks from EOF instead, so cost is constant
+    in the file's length.
+
+    The first fragment of the read window is dropped unless the window covers the whole
+    file: seeking to an arbitrary byte offset lands mid-line, and that partial line is
+    not a torn write to be tolerated but a slice artifact to be discarded. Malformed
+    lines are skipped for the reason read_history skips them -- a daemon appends here,
+    so a torn final line is a normal state.
+    """
+    try:
+        if not HISTORY_PATH.exists():
+            return []
+        size = os.path.getsize(HISTORY_PATH)
+        want = max(1024, min(int(max_bytes), max(1, int(n)) * _ROW_BYTES * 4))
+        start = max(0, size - want)
+        with HISTORY_PATH.open('rb') as f:
+            f.seek(start)
+            chunk = f.read()
+        lines = chunk.decode('utf-8', 'replace').splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]
+        out = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+        return out[-max(1, int(n)):]
+    except Exception:
+        return []
+
+
+def span():
+    """{'rows', 'first_ts', 'last_ts', 'hours'} over the whole file.
+
+    How much history exists, which is what monitor logs each cycle and what
+    monitor._inject_basis_gate gates on: an arm that conditions on the basis must not be
+    created before there are enough rows to derive its threshold from.
+    """
+    out = {'rows': 0, 'first_ts': None, 'last_ts': None, 'hours': 0.0}
+    try:
+        if not HISTORY_PATH.exists():
+            return out
+        with HISTORY_PATH.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ts = json.loads(line).get('ts')
+                except Exception:
+                    continue
+                if not ts:
+                    continue
+                out['rows'] += 1
+                if out['first_ts'] is None:
+                    out['first_ts'] = ts
+                out['last_ts'] = ts
+    except Exception:
+        pass
+    if out['first_ts'] and out['last_ts']:
+        out['hours'] = round((out['last_ts'] - out['first_ts']) / 3600.0, 2)
+    return out
+
+
+def daemon(interval=RECORD_INTERVAL, spec='XLM'):
+    """Append one row every `interval` seconds, forever. The single writer.
+
+    Sleeps to the next wall-clock interval boundary rather than for a flat `interval`,
+    so timestamps land on tidy multiples of a minute. That is not cosmetic: backtest
+    joins these rows to candle close times, and drift-free row timestamps keep the join
+    from straddling a bucket boundary differently on every candle.
+
+    Every iteration is individually guarded. This process is supervised by monitor but
+    outlives a single monitor cycle, so one bad snapshot must cost one row.
+    """
+    while True:
+        try:
+            row = record_snapshot(spec)
+            if row:
+                print(f"{row.get('ts')} basis {row.get('basis_bp')} bp, "
+                      f"tradeable {row.get('tradeable_bp')} bp, "
+                      f"spread {row.get('spread_bp')} bp", flush=True)
+        except Exception as e:
+            print(f'snapshot failed ({e})', flush=True)
+        try:
+            now = time.time()
+            time.sleep(max(1.0, interval - (now % interval)))
+        except Exception:
+            time.sleep(interval)
 
 
 def read_history(hours=168, spec=None):
@@ -175,9 +303,19 @@ def summary(hours=24, spec='XLM'):
 
 if __name__ == '__main__':
     import sys
-    if '--record' in sys.argv:
+    if '--daemon' in sys.argv:
+        every = RECORD_INTERVAL
+        if '--interval' in sys.argv:
+            try:
+                every = int(sys.argv[sys.argv.index('--interval') + 1])
+            except Exception:
+                pass
+        print(f'recording {HISTORY_PATH} every {every}s', flush=True)
+        daemon(every)
+    elif '--record' in sys.argv:
         print(json.dumps(record_snapshot(), indent=2))
     else:
         print(json.dumps(snapshot(), indent=2))
+        print('\nspan:', json.dumps(span(), indent=2))
         s = summary()
         print('\nlast 24h:', json.dumps(s, indent=2) if s else 'no history recorded yet')

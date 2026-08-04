@@ -98,27 +98,40 @@ def _floor_for(spec):
         return NONBASE_FLOOR
 
 
-def half_spread(spec='XLM'):
+def half_spread(spec='XLM', book=None):
     """Cost of one fill in `spec`, as a fraction of price. Never raises, never zero.
 
     Read from the live order book (half of dex_price's spread_pct), clamped into
     [MIN_HALF_SPREAD, MAX_HALF_SPREAD], cached for _CACHE_TTL. Falls back to the
     per-class floor on any failure whatsoever -- see the module docstring on why the
     fallback charges rather than exempts.
+
+    Pass `book` when the caller has already fetched dex_price.get_orderbook(spec) and
+    wants the half-spread of *that* book. dex_price.get_orderbook is not cached (its
+    60s _CACHE_TTL covers marks and SAC lookups, not the ladder), so basis.get_basis
+    and market_recorder.snapshot -- both of which fetch the book for their own reasons
+    and then ask for its width -- were each paying two live Horizon GETs per call and
+    could mix a fresh book with a half-spread up to _CACHE_TTL older. One book in, one
+    consistent pair of numbers out.
     """
     try:
         spec = assets.normalize(spec)
     except Exception:
         return NONBASE_FLOOR
 
-    cached = _cache_read(f'half_spread:{spec}')
-    if cached is not None:
-        return cached
+    # Only the fetching path may serve from cache. A caller-supplied book is a specific
+    # request for that book's width, and answering it with a 5-minute-old number from a
+    # different book would silently defeat the reason it was passed.
+    if book is None:
+        cached = _cache_read(f'half_spread:{spec}')
+        if cached is not None:
+            return cached
 
     value = _floor_for(spec)
     try:
-        import dex_price
-        book = dex_price.get_orderbook(spec)
+        if book is None:
+            import dex_price
+            book = dex_price.get_orderbook(spec)
         raw = (book or {}).get('spread_pct')
         if raw is not None and raw == raw and raw > 0:
             value = min(MAX_HALF_SPREAD, max(MIN_HALF_SPREAD, float(raw) / 2.0))

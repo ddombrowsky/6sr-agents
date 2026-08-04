@@ -45,7 +45,7 @@
     "type": "function",
     "function": {
       "name": "get_market_history",
-      "description": "Recorded hourly market conditions going back as far as monitor.py has been running: DEX book width (spread_bp), bid/ask depth, the DEX/CEX basis, and news sentiment. This is the only persistent history of anything other than price -- ohlc_history covers price alone, and it is a CEX price. Use it to check whether an edge you are about to build survives when the book is wide, or whether the basis mean-reverts on a timescale you could trade. Returns a min/mean/max summary plus the most recent raw rows.",
+      "description": "Recorded PER-MINUTE market conditions going back as far as the market recorder daemon has been running: DEX book width (spread_bp), bid/ask depth, the DEX/CEX basis (basis_bp and tradeable_bp) and news sentiment. This is the only persistent history of anything other than price -- ohlc_history covers price alone, and it is a CEX price. Use it to check whether an edge you are about to build survives when the book is wide, or whether the basis mean-reverts on a timescale you could trade. Returns a min/mean/max summary, the recorded span, and a sample of raw rows taken at an even stride across the whole window (not just the tail), with `rows_are` saying which. Note the cadence changed from hourly to per-minute, so a window that spans the change has both.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -62,7 +62,7 @@
     "type": "function",
     "function": {
       "name": "backtest_strategy",
-      "description": "Replay a strategy over ~30 days of real historical hourly XLM/USD candles and return return_pct, buy_hold_pct, beats_buy_hold, trades, win_rate and max_drawdown_pct. Use it as your fitness check instead of guessing. beats_buy_hold is computed on the XLM leg ONLY. If the strategy declares extra assets, each is replayed separately over its own (shorter, thinner, gappier) Stellar DEX history and reported under `legs` -- check `active_buckets` there before trusting a leg's return, since a leg with few traded buckets rests on very little real price discovery. Do not over-fit to leg numbers. Always check `decide_source` first: 'main.py:decide' means your code was replayed; 'config-thresholds' means the backtester could not import decide() from main.py and replayed config.json's plain buy_below/sell_above rule instead -- in that case a top-level `WARNING` key is present and every other number describes the config, not the code, so fix main.py's structure and re-run before trusting beats_buy_hold.",
+      "description": "Replay a strategy over real historical XLM/USD candles and return return_pct, buy_hold_pct, beats_buy_hold, trades, win_rate and max_drawdown_pct. Use it as your fitness check instead of guessing. beats_buy_hold is computed on the XLM leg ONLY. If the strategy declares extra assets, each is replayed separately over its own (shorter, thinner, gappier) Stellar DEX history and reported under `legs` -- check `active_buckets` there before trusting a leg's return, since a leg with few traded buckets rests on very little real price discovery. Do not over-fit to leg numbers. Always check `decide_source` first: 'main.py:decide' means your code was replayed; 'config-thresholds' means the backtester could not import decide() from main.py and replayed config.json's plain buy_below/sell_above rule instead -- in that case a top-level `WARNING` key is present and every other number describes the config, not the code, so fix main.py's structure and re-run before trusting beats_buy_hold. IF YOUR STRATEGY USES THE DEX/CEX BASIS (state['basis_bp'] / state['basis_tradeable_bp']): the default 30-day hourly replay cannot see it, because the recorded basis series is per-minute and recent. Re-run with interval=1 and days=0.5 for a 12-hour replay on a 1-minute grid, then read basis_coverage (how much of the window had a real recorded basis behind it), basis_edge_excess_bp (how much better your fills were timed against the venue than luck would give) and beats_basis_null. A top-level `BASIS_WARNING` appears when coverage is too low for those to mean anything. Do NOT read beats_buy_hold off a 12-hour run -- half a day of return is half a day of whatever XLM happened to do, not evidence about your logic.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -71,12 +71,16 @@
             "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"
           },
           "days": {
-            "type": "integer",
-            "description": "How many days of history to replay (default 30, max useful ~30)"
+            "type": "number",
+            "description": "How many days of history to replay (default 30, max useful ~30 at interval=60). Fractional values are allowed and are how you reach a short high-resolution window: days=0.5 with interval=1 is a 12-hour, 1-minute replay."
           },
           "ticks_per_candle": {
             "type": "integer",
             "description": "Decision points per candle. 1 (default) evaluates once per hour; pass 120 to approximate the live loop's 30-second polling cadence, which matters for strategies that fire repeatedly while a threshold is standing."
+          },
+          "interval": {
+            "type": "integer",
+            "description": "Candle size in minutes: 1, 5, 15, 60 (default), 240 or 1440. Use 1 (with days=0.5) to replay basis logic, which mean-reverts far faster than an hourly candle can show. Upstream caps a 1-minute request at ~720 candles, so 12 hours is the ceiling there."
           }
         },
         "required": [

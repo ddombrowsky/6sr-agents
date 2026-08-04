@@ -82,6 +82,146 @@ def _fill(side, price, half):
     return price * (1.0 + half) if side == 'buy' else price * (1.0 - half)
 
 
+# How much evidence the basis metrics need before they are allowed to claim anything.
+# Below either threshold `beats_basis_null` reports None rather than False: an unmeasured
+# claim and a refuted one are different, and conflating them is how a strategy gets
+# reverted for a signal nobody actually looked at.
+MIN_EDGE_SAMPLES = 10
+MIN_BASIS_COVERAGE = 0.5
+
+
+def _basis_series(hours):
+    """Recorded (ts, basis_bp, tradeable_bp) rows for XLM, oldest first. [] on failure.
+
+    Fails OPEN, exactly like _friction_half above and for the same reason: a missing
+    tools module must leave the backtest reporting an honest zero-coverage result rather
+    than refusing to run. Zero coverage is visible in the payload; a hard failure here
+    would take out every revision's fitness check at once.
+    """
+    try:
+        import market_recorder
+        rows = market_recorder.read_history(hours=hours, spec='XLM')
+    except Exception:
+        return []
+    out = []
+    for row in rows:
+        try:
+            if row.get('ts') and row.get('basis_bp') is not None:
+                out.append((float(row['ts']), float(row['basis_bp']),
+                            row.get('tradeable_bp')))
+        except Exception:
+            continue
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def _basis_join(candles, series, bucket_s):
+    """One recorded basis row (or None) per candle, aligned to each candle's CLOSE.
+
+    A candle's `ts` is its bucket START on both Kraken and Coinbase, so the moment a
+    strategy would have acted on `close` is ts + bucket_s. The rule is therefore the
+    LAST row at or before that instant, within a tolerance -- never the nearest row in
+    absolute time. Nearest-match would happily pick a reading from after the close and
+    feed the replay information the live strategy could not have had; on a 1-minute grid
+    that is up to 30 seconds of look-ahead, which is an eternity for a mean-reverting
+    signal and would make a useless strategy backtest beautifully.
+
+    Tolerance is max(bucket_s, 300): a 1-minute grid against 1-minute rows must not be
+    thrown off by a few seconds of recorder drift, and no grid should reuse a reading
+    older than five minutes.
+    """
+    if not series:
+        return [None] * len(candles)
+    tolerance = max(bucket_s, 300)
+    out = []
+    i = 0
+    n = len(series)
+    for candle in candles:
+        close_ts = float(candle.get('ts', 0)) + bucket_s
+        while i < n and series[i][0] <= close_ts:
+            i += 1
+        # series[i-1] is now the last row at or before close_ts, if there is one.
+        if i == 0:
+            out.append(None)
+            continue
+        ts, basis_bp, tradeable_bp = series[i - 1]
+        out.append((basis_bp, tradeable_bp, ts) if close_ts - ts <= tolerance else None)
+    return out
+
+
+def basis_edge_stats(edges, buys, sells, population_basis, coverage=1.0):
+    """The criterion-3 metric: did these fills happen at better venue moments than luck?
+
+    `beats_buy_hold` cannot answer that -- it is directional, and the basis claim is not
+    a claim about direction. The claim is "my entries are timed against the DEX/CEX
+    dislocation", and the honest null for it is the same statistic computed over every
+    moment in the window rather than the moments this strategy chose.
+
+    A basis-blind strategy's fill times are uncorrelated with the basis, so its expected
+    advantage is -mean(basis) per buy and +mean(basis) per sell; weighting those by the
+    strategy's OWN realized buy/sell mix is what makes the two numbers comparable. The
+    null is not assumed to be zero, and must not be: it is ~0 over a long window but
+    emphatically not over the 12h one a 1-minute replay can reach, where a drifting
+    basis would otherwise be credited to whichever side traded more.
+
+    This lives here, and basis_report.py imports it, so the replayed metric and the
+    live-log metric cannot drift into being two different statistics with one name.
+    """
+    n = len(edges)
+    out = {
+        'basis_edge_n': n,
+        'basis_edge_bp': None,
+        'basis_edge_null_bp': None,
+        'basis_edge_excess_bp': None,
+        'basis_edge_t': None,
+        'beats_basis_null': None,
+    }
+    if not n or population_basis is None:
+        return out
+
+    mean_edge = sum(edges) / n
+    null = population_basis * (sells - buys) / float(buys + sells) if (buys + sells) else 0.0
+    excess = mean_edge - null
+    out['basis_edge_bp'] = round(mean_edge, 3)
+    out['basis_edge_null_bp'] = round(null, 3)
+    out['basis_edge_excess_bp'] = round(excess, 3)
+
+    if n > 1:
+        try:
+            import statistics
+            stdev = statistics.stdev(edges)
+            if stdev > 0:
+                out['basis_edge_t'] = round(excess / (stdev / (n ** 0.5)), 2)
+        except Exception:
+            pass
+
+    # None, not False, below either threshold -- see MIN_EDGE_SAMPLES.
+    if n >= MIN_EDGE_SAMPLES and coverage >= MIN_BASIS_COVERAGE:
+        out['beats_basis_null'] = excess > 0
+    return out
+
+
+def _apply_basis(state, row):
+    """Put a joined basis row into `state`, or take the previous one back out.
+
+    The pop matters as much as the set. state persists across candles here exactly as
+    state.json persists across ticks live, so leaving a stale reading in place would let
+    a gap in the recorded history read as a confident basis that happens to be old --
+    the one failure mode neither the live loop nor the replay can detect from inside
+    decide(). Absent means unknown, and every caller is written to treat unknown as
+    neutral.
+    """
+    if row is None:
+        state.pop('basis_bp', None)
+        state.pop('basis_tradeable_bp', None)
+        state.pop('basis_ts', None)
+        return
+    basis_bp, tradeable_bp, ts = row
+    state['basis_bp'] = basis_bp
+    state['basis_tradeable_bp'] = tradeable_bp
+    state['basis_ts'] = ts
+
+
 def _decide_from_config(config):
     """Fallback decide step: template_repo/main.py's threshold rule."""
     buy_below = config.get('buy_below')
@@ -425,9 +565,15 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
         except Exception as e:
             print(f'[backtest] could not read {config_path}: {e}')
 
-    candles = get_candles(hours=days * 24, interval=interval)
+    candles = get_candles(hours=float(days) * 24, interval=interval)
     if len(candles) < 2:
         return {'error': 'not enough candle history to backtest'}
+
+    # The recorded DEX/CEX basis, joined to the candle grid. Asks for a slightly wider
+    # window than the replay so the first candle can find a row at or before its close.
+    bucket_s = max(1, int(interval)) * 60
+    basis_rows = _basis_join(candles, _basis_series(float(days) * 24 + 1), bucket_s)
+    basis_matched = sum(1 for r in basis_rows if r is not None)
 
     decide, source = _load_decide(strategy_dir, config)
 
@@ -451,9 +597,18 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
     half = _friction_half('XLM')
     friction_usd = 0.0
 
-    for candle in candles:
+    # Per-fill venue advantage, in bp, plus the buy/sell mix it came from -- the null
+    # baseline has to be weighted by that mix. See the basis_edge_* keys in the result.
+    basis_edges = []
+    basis_buys = basis_sells = 0
+
+    for candle, basis_row in zip(candles, basis_rows):
         price = candle['close']
         history.append(price)
+        # Before the tick loop, exactly where template_repo/main.py sets it before
+        # calling decide(): the basis is an input to the decision, not a consequence.
+        _apply_basis(state, basis_row)
+        basis_bp = basis_row[0] if basis_row else None
         for _ in range(max(1, int(ticks_per_candle))):
             try:
                 decision = _normalize(decide(price, history, state, config))
@@ -487,6 +642,11 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
                 cost_basis += actual_usd
                 friction_usd += actual_usd * half
                 trades += 1
+                # A negative basis means the DEX is cheap against the CEX, which is
+                # good for a buyer -- hence the sign flip. Sells take it unflipped.
+                if basis_bp is not None:
+                    basis_edges.append(-basis_bp)
+                    basis_buys += 1
             elif side == 'sell':
                 actual_xlm = min(requested_usd / fill, state['balance_xlm'])
                 if actual_xlm <= 0:
@@ -507,6 +667,9 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
                 friction_usd += actual_xlm * fill * half
                 trades += 1
                 sells += 1
+                if basis_bp is not None:
+                    basis_edges.append(basis_bp)
+                    basis_sells += 1
             else:
                 break
 
@@ -547,10 +710,46 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
         # is not a strategy, it is a fee generator.
         'friction_bp': round(half * 10000, 2),
         'total_friction_usd': round(friction_usd, 4),
+        # How much of this replay actually had a recorded basis behind it. Read this
+        # BEFORE reading anything else basis-related: the recorder only started keeping
+        # a per-minute series recently, so a 30-day run is mostly uncovered and a
+        # confident-looking basis_edge_excess_bp there rests on a handful of candles.
+        # The field exists because decide_source spent weeks in the payload unread.
+        'basis_coverage': round(basis_matched / len(candles), 4) if candles else 0.0,
+        'basis_candles': basis_matched,
     }
+    result.update(basis_edge_stats(
+        basis_edges, basis_buys, basis_sells,
+        population_basis=(sum(r[0] for r in basis_rows if r) / basis_matched
+                          if basis_matched else None),
+        coverage=result['basis_coverage'],
+    ))
 
     if legs:
         result['legs'] = _backtest_legs(strategy_dir, config, days)
+    return result
+
+
+def backtest_basis(strategy_dir, hours=12, ticks_per_candle=2):
+    """Replay `strategy_dir` on a 1-minute grid, to see its basis logic actually fire.
+
+    The default 30-day hourly replay cannot evaluate a basis strategy at all: the signal
+    mean-reverts on a scale of minutes, and one reading per hour flattens it into noise.
+    This runs the same code over 1-minute candles instead.
+
+    Read `basis_edge_excess_bp` and `beats_basis_null` from this run, NOT
+    `beats_buy_hold`. Twelve hours of return is twelve hours of beta -- it says what XLM
+    did this morning, not what the strategy is worth, and treating it as a fitness
+    verdict would be a worse mistake than not running this at all.
+
+    Twelve hours is a ceiling, not a default to raise: ohlc_history's sources cap at 720
+    (Kraken) and 300 (Coinbase) candles per request, so a 1-minute grid runs out of
+    upstream history there regardless of how much basis we have recorded.
+    """
+    result = backtest(strategy_dir, days=float(hours) / 24.0,
+                      ticks_per_candle=ticks_per_candle, interval=1, legs=False)
+    if isinstance(result, dict):
+        result['window_hours'] = hours
     return result
 
 
@@ -574,7 +773,15 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print(__doc__.strip().splitlines()[-1])
         sys.exit(1)
-    path = sys.argv[1]
-    days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-    ticks = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    print(json.dumps(backtest(path, days=days, ticks_per_candle=ticks, legs=True), indent=2))
+    argv = sys.argv[1:]
+    interval = 60
+    if '--interval' in argv:
+        i = argv.index('--interval')
+        interval = int(argv[i + 1])
+        del argv[i:i + 2]
+    path = argv[0]
+    # float, so `--interval 1 0.5` (a half-day 1-minute replay) is expressible.
+    days = float(argv[1]) if len(argv) > 1 else 30
+    ticks = int(argv[2]) if len(argv) > 2 else 1
+    print(json.dumps(backtest(path, days=days, ticks_per_candle=ticks,
+                              interval=interval, legs=True), indent=2))
