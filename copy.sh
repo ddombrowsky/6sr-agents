@@ -12,4 +12,5 @@ else
     cp -v ./v/master_agent/* ./master_agent/ 2>/dev/null
     cp -v ./v/tools/* ./tools/ 2>/dev/null
     cp -v ./v/template_repo/* ./template_repo/ 2>/dev/null
+    cp -v ./v/*.sh ./scripts/ 2>/dev/null
 fi
