@@ -22,11 +22,40 @@
 #
 # Pass --once to run a single cycle and exit instead of looping forever.
 #
+# If /opt/emperor.sh.UNMANAGED exists at startup, this script does nothing but
+# poll for its removal every 60s -- so a container can be brought up with
+# emperor.sh as its entrypoint and left inert until deliberately enabled.
+#
 # Runs inside the agenttest container (paths below assume /opt is the mount
 # point per ../create.sh). Override the run window for smoke-testing, e.g.:
 #   EMPEROR_RUN_HOURS=2m ./emperor.sh --once
 
 set -e
+
+# Startup kill switch. While this file exists the script does nothing at all --
+# no interpreter probe, no env.sh, no monitor.py -- it just polls for the file's
+# removal, then carries on as normal. That makes it safe to wire emperor.sh in as
+# a new container's startup command while still refining things by hand: create
+# the file first, and enable the system later with a plain `rm` (no restart, no
+# change to the container's command).
+#
+# Deliberately checked once, at startup, and not re-checked per cycle: stopping
+# an emperor that is already running is what the cooperative-stop path
+# ($MONITOR_EXIT_FILE, below) is for, and re-checking mid-loop would add a second
+# way to halt with none of that path's guarantees about what is in flight.
+#
+# Kept out of /opt/master_agent on purpose: that is a git repo whose cleanliness
+# monitor.py's check_boundary_integrity() watches, and verify_and_commit_repo()
+# below would `git add -A` the sentinel straight into the history.
+UNMANAGED_FILE="${EMPEROR_UNMANAGED_FILE:-/opt/emperor.sh.UNMANAGED}"
+if [ -e "$UNMANAGED_FILE" ]; then
+    echo "[emperor] $UNMANAGED_FILE exists -- UNMANAGED. Doing nothing;" \
+         "polling every 60s. Remove that file to start."
+    while [ -e "$UNMANAGED_FILE" ]; do
+        sleep 60
+    done
+    echo "[emperor] $UNMANAGED_FILE removed -- starting."
+fi
 
 # Which python runs monitor.py and agent-bootstrap.py. This used to be a bare `python3`,
 # and that single word disabled the entire LLM layer of this system for an unknown number
