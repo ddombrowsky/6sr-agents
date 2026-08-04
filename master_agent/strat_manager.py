@@ -63,6 +63,43 @@ def save_state(state):
     with STATE_FILE.open('w') as f:
         json.dump(state, f, indent=2)
 
+def _commit_clone_name(target, name):
+    """Commit the config.json name rewrite, so a fresh clone starts git-clean.
+
+    monitor.revision_changed_anything() decides whether the revision model actually
+    did anything by asking whether the clone is dirty or its HEAD moved since the
+    clone. The rewrite below dirtied config.json before revise-strategy was even
+    invoked, so that check answered True for every clone unconditionally: a model
+    that replied in prose and never called a tool (clone_a006e0460235, 2026-08-04 --
+    it printed a main.py diff in its final message and wrote nothing) was recorded as
+    a successful "(llm)" revision, the apply_random_tweak fallback was skipped
+    because `revised` stayed True, and a byte-identical copy of the parent was
+    started. The gate's own docstring names that exact scenario as what it prevents.
+
+    The rewrite belongs to the clone, not to the revision, so commit it here and let
+    the dirty check mean what it says. Also puts the name in the committed history
+    rather than only the working tree, which is what the next generation's `git
+    clone` copies. Non-fatal on failure: the clone is still usable, it just costs
+    that signal for this one strategy.
+    """
+    def git(*args):
+        return subprocess.run(['git', '-C', str(target), *args],
+                              capture_output=True, text=True)
+
+    if git('diff', '--quiet', '--', 'config.json').returncode == 0:
+        return  # untracked, or the name already matched
+    commit_args = ['commit', '-m', f'clone: set config name to {name}',
+                   '--', 'config.json']
+    if not git('config', 'user.email').stdout.strip():
+        # Fresh container: git has no identity configured and commit would abort.
+        commit_args = ['-c', 'user.email=monitor@localhost',
+                       '-c', 'user.name=strat_manager.py'] + commit_args
+    r = git(*commit_args)
+    if r.returncode != 0:
+        print(f"Warning: could not commit config.json name for '{name}': "
+              f"{r.stderr.strip() or r.stdout.strip()}")
+
+
 def clone_strategy(name, repo_url):
     target = STRATEGIES_DIR / name
     if target.exists():
@@ -83,6 +120,8 @@ def clone_strategy(name, repo_url):
             json.dump(cfg, cfg_path.open('w'), indent=2)
         except Exception as e:
             print(f"Warning: could not update config.json name for '{name}': {e}")
+        else:
+            _commit_clone_name(target, name)
     state = load_state()
     state[name] = {'path': str(target), 'pid': None, 'status': 'stopped'}
     save_state(state)
