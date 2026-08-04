@@ -301,6 +301,33 @@ REVISION_SYSTEM_PROMPT = (
     '`history` is the list of '
     'recent close prices, oldest first, so indicators work unchanged in both live and '
     'backtest paths.\n\n'
+    # Added 2026-08-03. /opt/tools/news_feed.py had existed unused for a long time:
+    # 0 of 138 strategies imported it, and nothing told the model it was there. The
+    # backtest caveat below is the important half -- a model that wires in news and
+    # then trusts beats_buy_hold is measuring a signal the replay pinned at neutral.
+    'NON-PRICE SIGNALS. `/opt/tools/news_feed.py` gives you crypto headlines and a '
+    'keyword sentiment score in [-1, 1] (negative is bearish). The `get_news_sentiment` '
+    'tool shows you what it reads right now, so you can size a threshold against real '
+    'output instead of guessing. Two hard rules about how to wire it in:\n'
+    '  * NEVER call the news feed (or any network fetch) from inside `decide()`. '
+    'backtest.py calls decide() once per tick -- about 86,000 times for a 30-day replay '
+    '-- so a fetch in there means 86,000 HTTP requests, a fitness check that takes hours '
+    'instead of a second, and every historical tick answered with today\'s headlines. '
+    "Instead have the trading loop in `main()` fetch it once per tick and store it "
+    "(`state['news_sentiment'] = ...`), and have decide() read it back with "
+    "`state.get('news_sentiment', 0.0)`. template_repo/main.py shows the pattern.\n"
+    '  * BE AWARE IT IS UNBACKTESTABLE. There is no headline archive, so that key is '
+    'absent on every backtest tick and reads as 0.0 -- your news logic is invisible to '
+    '`beats_buy_hold`, which is judging the price rule alone. Do not read a good '
+    'backtest as evidence the news part works. What does judge it is score.py, i.e. '
+    'real paper net worth over the hours the strategy actually runs.\n'
+    '  * Because of that, prefer sentiment as a VETO on trades your price logic already '
+    'wants, not as a trigger that fires trades on its own. A veto degrades safely: if '
+    'the feed is down the score is 0.0 and you are left with the price rule you already '
+    'backtested. A trigger built on an unbacktestable signal is untested code placing '
+    'real orders. `news_veto_below` in config.json is the template\'s knob for this. And '
+    'do not veto SELLS -- blocking an exit on a news reading can strand a position, '
+    'which is much worse than missing an entry.\n\n'
     'ASSETS. The strategy trades XLM plus UP TO 2 additional Stellar assets, listed in '
     "config.json's `assets` array (XLM is never listed there -- it is the permanent base "
     'leg, carried by the top-level buy_below/sell_above/trade_amount_usd). Each entry is '

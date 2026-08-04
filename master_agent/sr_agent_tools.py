@@ -149,6 +149,26 @@ def get_price_history(hours: int = 720, interval: int = 60) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def get_news_sentiment(asset: str = 'XLM', limit: int = 10) -> str:
+    """Current headlines and their keyword sentiment score, as JSON."""
+    try:
+        import news_feed
+        headlines = news_feed.get_headlines(asset=asset, limit=int(limit))
+        return json.dumps({
+            'asset': asset,
+            'sentiment': news_feed.sentiment_score(headlines, asset=asset),
+            'headline_count': len(headlines),
+            'titles': [h.get('title', '') for h in headlines],
+            'note': ('This is a live reading, not history. There is no headline '
+                     'archive, so backtest_strategy always replays sentiment as 0.0 '
+                     '(neutral) -- a news rule cannot be measured by beats_buy_hold, '
+                     'only by live paper score. Read it in decide() from '
+                     "state.get('news_sentiment', 0.0); never call the feed there."),
+        }, indent=2)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 def list_candidate_assets(limit: int = 15) -> str:
     """Ranked Stellar assets that could be added to a strategy, as JSON.
 
@@ -253,6 +273,7 @@ TOOLS = {
     'get_dex_cex_basis': get_dex_cex_basis,
     'get_friction': get_friction,
     'get_market_history': get_market_history,
+    'get_news_sentiment': get_news_sentiment,
     'list_candidate_assets': list_candidate_assets,
     'verify_asset': verify_asset,
     'get_asset_price': get_asset_price,

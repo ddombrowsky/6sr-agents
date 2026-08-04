@@ -28,6 +28,23 @@ length >= 3 and would silently drop a fourth element.
 
 Execution -- balance mutation, overdraft/oversell clamping, trade logging, and live
 submission -- belongs to `trade_logger.execute_trade`. Do not reimplement any of it here.
+
+## Non-price signals go through `state`, never through a call inside decide()
+
+`decide()` must stay pure and fast: backtest.py calls it once per tick, ~86,000 times
+for a 30-day replay. A network call in there (news, an oracle, an API) would fire
+86,000 requests and turn a one-second fitness check into hours -- and would answer
+every historical tick with *today's* data, which is not a backtest of anything.
+
+So the loop in `main()` fetches such signals once per tick and puts them in `state`;
+`decide()` reads them with a neutral default. `state['news_sentiment']` is the worked
+example. In a backtest the key is simply absent, `.get(..., 0.0)` yields neutral, and
+the rest of the rule replays unchanged.
+
+Which is also the honest limitation: there is no historical headline archive here, so
+a news component is invisible to `beats_buy_hold` -- the backtest always judges it at
+neutral. What *does* see it is score.py, which ranks real paper net worth. A news edge
+has to prove itself in live paper trading over hours, not in the backtest.
 """
 import json
 import sys
@@ -37,6 +54,7 @@ from pathlib import Path
 # Plain assignment, deliberately. See the module docstring.
 sys.path = sys.path + ['/opt/tools']
 
+import news_feed
 import portfolio
 from dex_price import get_mark
 from price_feed import get_price
@@ -68,17 +86,47 @@ def save_state(state):
         json.dump(state, f)
 
 
+def current_sentiment(asset='XLM'):
+    """This tick's news sentiment in [-1, 1], or 0.0 (neutral) if unavailable.
+
+    Called once per tick from main(), never from decide(). news_feed caches for
+    ~15 minutes, so the per-tick cost is a dict lookup and the real fetch happens
+    a couple of times an hour. Never raises: a news outage must not kill a trading
+    loop that strat_manager only ever starts once.
+    """
+    try:
+        return float(news_feed.sentiment_score(asset=asset))
+    except Exception as e:
+        print(f'news sentiment unavailable ({e}); treating as neutral')
+        return 0.0
+
+
 def decide(price, history, state, config):
     """XLM leg. Returns (side, action, requested_usd) or None.
 
     This exact signature is what backtest.py replays and what `beats_buy_hold` is
     measured on, so keep it even if the body changes completely.
+
+    Sentiment is used as a veto on buys, not as a trigger: it only ever skips a trade
+    the price rule already wanted. That is the cheap direction -- a skipped marginal
+    buy keeps the round-trip friction it would have paid -- and it degrades to the
+    plain threshold rule when the feed is down or the key is missing.
+
+    Sells are deliberately never vetoed. Blocking an exit on a news reading can strand
+    a position indefinitely, which is a far worse failure than a missed entry.
     """
     buy_below = config.get('buy_below')
     sell_above = config.get('sell_above')
     size = config.get('trade_amount_usd', 10)
 
+    # Supplied by main()'s tick loop. Absent on every backtest tick -> 0.0 -> the
+    # veto below never fires and this is exactly the threshold rule it always was.
+    sentiment = state.get('news_sentiment', 0.0)
+    veto_below = config.get('news_veto_below', -0.5)
+
     if buy_below and price <= buy_below:
+        if veto_below is not None and sentiment <= veto_below:
+            return None
         return ('buy', 'buy', size)
     if sell_above and price >= sell_above:
         return ('sell', 'sell', size)
@@ -133,6 +181,10 @@ def main():
 
         history.append(price)
         del history[:-MAX_HISTORY]
+
+        # Fetched here, once per tick, and handed to decide() through state -- never
+        # fetched inside decide() itself. See the module docstring for why.
+        state['news_sentiment'] = current_sentiment()
 
         decision = decide(price, history, state, config)
         if decision:

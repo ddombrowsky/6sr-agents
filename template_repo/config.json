@@ -4,5 +4,6 @@
   "buy_below": 0.0,
   "sell_above": 0.0,
   "trade_amount_usd": 10.0,
+  "news_veto_below": -0.5,
   "assets": []
 }

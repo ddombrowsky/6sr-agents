@@ -260,6 +260,27 @@
   {
     "type": "function",
     "function": {
+      "name": "get_news_sentiment",
+      "description": "Current crypto news headlines for an asset plus a keyword-based sentiment score in [-1, 1], where negative is bearish. Use it to decide whether a news filter is worth wiring into a strategy and to sanity-check a veto threshold against what the feed actually reads right now. IMPORTANT: this is a live reading with no history behind it -- there is no headline archive, so backtest_strategy always replays news sentiment as 0.0 (neutral). A news rule therefore cannot be measured by beats_buy_hold; it is judged only by live paper score. In main.py, read it inside decide() as state.get('news_sentiment', 0.0) and let the trading loop fetch it once per tick -- never call the news feed from decide() itself.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "asset": {
+            "type": "string",
+            "description": "Asset code to fetch news for; defaults to XLM."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many headlines to read (default 10)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "list_candidate_assets",
       "description": "List Stellar assets that a strategy could add as one of its up to 2 extra trading legs, ranked by liquidity and reputation. Returns code, issuer, rating, trustline count and 7d volume for each. Use this to FIND candidate assets rather than recalling asset issuers from memory -- an asset code alone is not unique and impostors exist on-chain. Presence in this list is a proposal, not approval: every asset is still re-verified by monitor.py before the strategy starts.",
       "parameters": {
