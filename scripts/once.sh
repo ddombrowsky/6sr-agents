@@ -20,5 +20,3 @@ touch /opt/.monitor.py.exit
 echo Logging to $LOG
 echo waiting for exit...
 wait
-
-rm -v /opt/.monitor.py.exit
