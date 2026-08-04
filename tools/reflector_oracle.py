@@ -29,6 +29,10 @@ _IDENTITY = "reflector-reader"  # local-only key, deliberately never funded: inv
 
 _XLM_SAC = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"  # native XLM, pubnet
 
+# The oracle's own quote asset, i.e. what `base` returns (verified live, same way as the
+# constants above): USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN.
+_BASE_SAC = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+
 _TIMEOUT = 20
 
 
@@ -78,6 +82,16 @@ def get_price(asset_contract=_XLM_SAC):
     Defaults to native XLM. Returns None (after printing a diagnostic) if the CLI is
     missing, the network is unreachable, or the oracle has no price for this asset.
     """
+    # The oracle quotes everything *in* _BASE_SAC, so it publishes no entry for the base
+    # itself: `lastprice` on it returns null, forever, by construction. That is not a
+    # missing price worth a diagnostic -- it is a question the oracle cannot be asked, and
+    # printing it made every leaderboard.py run emit the same line (a strategy holds USDC,
+    # and dex_price tries Reflector before the book). Returning None keeps the contract
+    # callers rely on: dex_price.get_mark falls through to the real USDC/XLM book, and a
+    # genuinely unpriceable asset is still reported as absent rather than assumed at par.
+    # Skipping the invoke also saves a 1-3s CLI round-trip that could only ever fail.
+    if asset_contract == _BASE_SAC:
+        return None
     try:
         raw = _invoke("lastprice", "--asset", json.dumps({"Stellar": asset_contract}))
         data = json.loads(raw)
