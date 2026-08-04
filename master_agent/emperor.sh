@@ -156,7 +156,7 @@ while true; do
     # cooperative stop below is ignored we can kill its whole process group,
     # not just monitor.py itself. monitor.py's revise-strategy calls are
     # synchronous, non-detached subprocess.run()s that can take up to
-    # REVISION_TIMEOUT (6000s) each, times two clones per cycle -- a single
+    # REVISION_TIMEOUT (60000s) each, times REVISIONS_PER_CYCLE (3) -- a single
     # monitor.py cycle can legitimately take longer than this window's default
     # (2.5h), so a plain `timeout monitor.py` would only kill monitor.py itself
     # and orphan any in-flight revise-strategy subprocess, leaving it running

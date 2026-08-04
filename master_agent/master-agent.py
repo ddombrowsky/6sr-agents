@@ -1,3 +1,5 @@
+import ast
+import hashlib
 import json
 import os
 import re
@@ -63,8 +65,31 @@ TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
 
 STRATEGIES_DIR = Path('/opt/strategies')
 TRADES_DIR = Path('/opt/trades')
+STRATEGY_STATE_FILE = Path('/opt/strategy_state.json')
 REVISION_HISTORY_FILENAME = '.strategy-revision-history.json'
 REVISION_HISTORY_MAX_MESSAGES = 5
+
+# The two jobs a newcomer can be handed, passed by monitor.py as the 6th argv of
+# `revise-strategy`. `refine` is a clone of a leader: improve on a parent with a real
+# record. `explore` is a fresh template spawn with no meaningful parent, asked for
+# something structurally different from what the population already runs.
+# Duplicated in monitor.py -- this file's name has a hyphen so it cannot be imported,
+# and this module does not import monitor.py. Keep the two pairs in sync.
+ROLE_REFINE = 'refine'
+ROLE_EXPLORE = 'explore'
+
+# How many distinct main.py variants _population_census describes to an explore spawn.
+CENSUS_CLUSTERS = 6
+
+# The /opt/tools modules a strategy would import for *signal*, as opposed to the
+# infrastructure every strategy already uses (trade_logger, price_feed, portfolio,
+# dex_price, assets). The census reports which of these nobody imports, which is the
+# concrete list of directions the population has not tried.
+SIGNAL_MODULES = (
+    'basis', 'ema_sma', 'ema_sma_complete', 'friction', 'market_recorder',
+    'moving_averages', 'news_feed', 'ohlc_history', 'orderbook_depth',
+    'price_history_fetcher', 'reflector_oracle', 'rsi',
+)
 
 _API_KEY = os.environ.get('OLLAMA_API_KEY')
 if not _API_KEY:
@@ -286,11 +311,15 @@ def _handle_model_command(user_input: str) -> bool:
 
 REVISION_SYSTEM_PROMPT = (
     'You are the strategy-revision agent for an evolutionary XLM paper-trading system. '
-    'Each cycle, monitor.py clones the best-performing strategies and hands you the fresh '
-    "clone to improve before it starts trading. You have full read/write/exec access to "
-    "the clone's directory and may change anything about it: config.json thresholds, "
-    "main.py's trading logic, or add new files entirely. Use what you know about how this "
-    'strategy and its ancestors have performed to decide what to change and why.\n\n'
+    'Each cycle monitor.py creates a small batch of new strategies -- clones of the best '
+    'current performers, plus one pulled fresh from the template -- and hands each of '
+    'them to you before it starts trading. The user message tells you which job you have '
+    'for this one: `refine` (improve on a parent with a real track record) or `explore` '
+    '(a fresh template strategy with no meaningful parent, where the job is to try '
+    'something the population is not already doing). Everything below applies to both. '
+    "You have full read/write/exec access to "
+    "the strategy's directory and may change anything about it: config.json thresholds, "
+    "main.py's trading logic, or add new files entirely.\n\n"
     "main.py's trading logic has two parts: a decide step (price threshold checks, or "
     "whatever signal logic you wire in, producing a trade decision -- side, a label, "
     "and how much USD to request) and execution, handled by "
@@ -528,6 +557,107 @@ def _tail_lines(path, n=20) -> str:
         return '(no trade log yet)'
 
 
+def _main_py_shape(source: str):
+    """(sorted imported module names, top-level def names) for one main.py, via AST.
+
+    Module names are taken to their first component ('tools.rsi' -> 'rsi') because that
+    is how a strategy names them after the sys.path append, and it is what SIGNAL_MODULES
+    is written in terms of.
+    """
+    tree = ast.parse(source)
+    imports, defs = set(), []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                imports.add(a.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split('.')[0])
+    # Drop the stdlib: json/sys/time/pathlib are in every strategy and say nothing about
+    # what it trades on. What is left is the /opt/tools surface it actually reaches for,
+    # which is the whole point of showing this.
+    imports -= sys.stdlib_module_names
+    for node in tree.body:               # top level only -- what the backtester can see
+        if isinstance(node, ast.FunctionDef):
+            defs.append(node.name)
+    return sorted(imports), defs
+
+
+def _population_census(limit: int = CENSUS_CLUSTERS) -> str:
+    """What logic the tracked population already runs, rendered as prompt text.
+
+    The explore role's whole job is to be structurally different from the incumbents, and
+    nothing in the prompt ever told the model what the incumbents were. Measured on the
+    live tree before this existed: 141 main.py files but only ~10 distinct hashes, the
+    top three covering 113 of them, and of the signal modules the system prompt
+    advertises most had no importers at all.
+
+    Scoped to /opt/strategy_state.json -- the tracked, scored, competing population,
+    which is the same set the leaderboard elsewhere in this prompt covers, so the two
+    cross-reference by name. The other ~120 directories under /opt/strategies are
+    retired, never-traded corpses. Cost is a few tens of ms either way; the scoping is
+    about relevance, not speed.
+
+    Never raises. A census that fails degrades to a note -- it must not cost the cycle
+    its revision.
+    """
+    try:
+        names = list(_read_json(STRATEGY_STATE_FILE, {}) or {})
+        if not names:
+            return '(no tracked population yet -- you are among the first strategies.)'
+
+        clusters = {}                    # content hash -> [count, example name, source]
+        for name in names:
+            try:
+                source = (STRATEGIES_DIR / name / 'main.py').read_text()
+            except Exception:
+                continue                 # untracked-but-listed, or mid-clone; just skip
+            key = hashlib.md5(source.encode()).hexdigest()
+            if key in clusters:
+                clusters[key][0] += 1
+            else:
+                clusters[key] = [1, name, source]
+        if not clusters:
+            return '(no readable main.py in the tracked population.)'
+
+        read = sum(c[0] for c in clusters.values())
+        lines = [f'WHAT THE POPULATION ALREADY RUNS ({read} tracked strategies, '
+                 f'{len(clusters)} distinct main.py variants):']
+        # Every cluster is parsed, but only the `limit` largest are described. The
+        # unused-module list below has to be true of the whole population, not just the
+        # part that fit in the prompt, or it would name a direction someone already took.
+        all_imports, blind, shown = set(), 0, 0
+        for count, example, source in sorted(clusters.values(), key=lambda c: -c[0]):
+            try:
+                imports, defs = _main_py_shape(source)
+            except SyntaxError:
+                if shown < limit:
+                    lines.append(f'  * {count} strategies, e.g. {example}: does not parse')
+                    shown += 1
+                continue
+            all_imports |= set(imports)
+            if 'decide' not in defs:
+                blind += count
+            if shown < limit:
+                who = f'{example}' if count == 1 else f'{count} strategies, e.g. {example}'
+                lines.append(f'  * {who} ({len(source)} bytes)')
+                lines.append(f'      imports: {", ".join(imports) or "(none)"}')
+                lines.append(f'      top-level defs: {", ".join(defs) or "(none)"}')
+                shown += 1
+        if len(clusters) > shown:
+            lines.append(f'  ... and {len(clusters) - shown} smaller variants.')
+        if blind:
+            # Same property MAIN_PY_IMPORTABILITY gates on: no top-level decide() means
+            # backtest_strategy replays config thresholds instead of the real logic.
+            lines.append(f'  ({blind} of these have no top-level decide(), so their own '
+                         f'backtest never sees their logic -- do not copy that.)')
+        unused = [m for m in SIGNAL_MODULES if m not in all_imports]
+        lines.append('Signal modules in /opt/tools that NO tracked strategy imports: '
+                     + (', '.join(unused) if unused else '(none -- all are in use)'))
+        return '\n'.join(lines)
+    except Exception as e:
+        return f'(population census unavailable: {e})'
+
+
 def _load_revision_history(strategy_path: Path) -> list:
     history_file = strategy_path / REVISION_HISTORY_FILENAME
     if history_file.exists():
@@ -548,34 +678,20 @@ def _save_revision_history(strategy_path: Path, messages: list) -> None:
         json.dump(trimmed, f)
 
 
-def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
-                     leaderboard_json: str = '{}', current_price: str = '') -> None:
-    """One-shot entry point invoked by monitor.py's tweak stage.
+def _refine_prompt(strategy_name, parent_name, strategy_path, parent_score,
+                   leaderboard, price_line) -> str:
+    """The clone case: a parent with a real track record to improve on.
 
-    Hands a freshly-cloned, not-yet-started strategy directory to the LLM with full
-    tool access so it can rewrite config/code and commit the revision itself, instead
-    of monitor.py applying a fixed random tweak.
+    Kept character-for-character as it was before the roles were split, deliberately.
+    This is the control arm -- if the explore prompt turns out to help or hurt, that is
+    only attributable while this one has not moved at the same time.
     """
-    strategy_path = STRATEGIES_DIR / strategy_name
     parent_path = STRATEGIES_DIR / parent_name
     parent_config = _read_json(parent_path / 'config.json', {})
     parent_state = _read_json(parent_path / 'state.json', {})
     trade_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
     clone_main_py = _read_text(strategy_path / 'main.py')
-    try:
-        leaderboard = json.loads(leaderboard_json)
-    except Exception:
-        leaderboard = {}
-
-    price_line = (
-        f'Current XLM/USD price (fetched from CoinGecko by monitor.py moments ago, '
-        f'this is ground truth -- not a historical or typical price): ${current_price}\n'
-        if current_price else
-        'Current XLM/USD price: NOT PROVIDED for this cycle -- fetch it yourself '
-        '(exec curl, or /opt/tools/price_feed.py) before setting any thresholds.\n'
-    )
-
-    prompt = (
+    return (
         f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
         f'`{strategy_path}` (a git checkout of the strategy code). It has not started '
         f'trading yet.\n\n'
@@ -593,6 +709,101 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
         f'Any buy_below/sell_above you set must be anchored to the current price above, '
         f'not to an assumed or remembered price level.'
     )
+
+
+def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> str:
+    """The template-spawn case: no parent, so the job is to differ from the incumbents.
+
+    Everything the refine prompt says about a parent is either absent or meaningless
+    here -- a template spawn's `parent` is itself, its state.json is empty and its trade
+    log does not exist. Before this prompt existed, the refine text was used anyway and
+    the model was told "A new clone `seed_x` of `seed_x` was just created", then handed
+    an empty state and a config whose buy_below == sell_above == 0.0.
+    """
+    own_config = _read_json(strategy_path / 'config.json', {})
+    own_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
+        f'unmodified checkout of /opt/template_repo -- NOT a clone of any existing '
+        f'strategy. It has no parent, no trade history and no track record, so there is '
+        f'nothing here to improve on. Your job this time is EXPLORATION: give the '
+        f'population a strategy that is structurally different from what it already '
+        f'runs.\n\n'
+        f'{price_line}'
+        f'Its config.json right now: {json.dumps(own_config)}\n'
+        f'Note the template ships buy_below and sell_above at 0.0, which never trades. '
+        f'monitor.py checks the config you leave behind: both thresholds must be '
+        f'present, positive, buy_below < sell_above, and within 50% of the current price '
+        f'above. Even if your logic does not use plain thresholds at all, you must still '
+        f'leave a sane band anchored to that price -- otherwise monitor discards your '
+        f'config and rebuilds it from scratch at price*0.98 / price*1.02.\n\n'
+        f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
+        f'proven code, so you are free to restructure it):\n'
+        f'```python\n{own_main_py}\n```\n\n'
+        f'{_population_census()}\n\n'
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running): {json.dumps(leaderboard)}\n\n'
+        f'Write something the census above shows the population is NOT already doing. A '
+        f'threshold nudge is a wasted slot here -- every template spawn that is not '
+        f'revised already gets one for free. The unused signal modules named above are '
+        f'the concrete open directions. Whatever you write, a top-level `decide()` must '
+        f'remain importable (backtest_strategy must report decide_source '
+        f'"main.py:decide", not "config-thresholds") and beats_buy_hold must come back '
+        f'true -- for a strategy with no track record that is the entire acceptance '
+        f'test, so run backtest_strategy and iterate until it passes.\n\n'
+        f'On assets: if you leave `assets` empty, monitor may hand this strategy up to '
+        f'two verified discovered assets on a coin flip after you finish. If you declare '
+        f'your own, it will not. So declare assets only if they are part of your thesis, '
+        f'and never write an issuer address from memory -- verify it first.\n\n'
+        f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
+    )
+
+
+def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
+                     leaderboard_json: str = '{}', current_price: str = '',
+                     role: str = ROLE_REFINE) -> None:
+    """One-shot entry point invoked by monitor.py's provisioning stage.
+
+    Hands a freshly-created, not-yet-started strategy directory to the LLM with full
+    tool access so it can rewrite config/code and commit the revision itself, instead
+    of monitor.py applying a fixed random tweak.
+
+    `role` picks the user prompt: `refine` for a clone of a leader (parent config, state,
+    trade tail and score -- improve on it), `explore` for a fresh template spawn (a
+    census of what the population already runs, and an instruction to differ). It is a
+    trailing positional rather than a flag because __main__ below is a bare
+    `revise_strategy(*sys.argv[2:])` splat, so a defaulted positional keeps a hand-typed
+    five-argument invocation working with no change there.
+    """
+    strategy_path = STRATEGIES_DIR / strategy_name
+    if role not in (ROLE_REFINE, ROLE_EXPLORE):
+        role = ROLE_REFINE
+    if parent_name == strategy_name:
+        # Structural, and deliberately independent of what monitor passed: a strategy
+        # that is its own parent is exactly the template-spawn case, and it is the one
+        # the refine prompt degenerates on. This holds even if a future caller forgets
+        # the role argument entirely.
+        role = ROLE_EXPLORE
+    print(f'[revise-strategy] {strategy_name} role={role}')
+
+    try:
+        leaderboard = json.loads(leaderboard_json)
+    except Exception:
+        leaderboard = {}
+
+    price_line = (
+        f'Current XLM/USD price (fetched from CoinGecko by monitor.py moments ago, '
+        f'this is ground truth -- not a historical or typical price): ${current_price}\n'
+        if current_price else
+        'Current XLM/USD price: NOT PROVIDED for this cycle -- fetch it yourself '
+        '(exec curl, or /opt/tools/price_feed.py) before setting any thresholds.\n'
+    )
+
+    if role == ROLE_EXPLORE:
+        prompt = _explore_prompt(strategy_name, strategy_path, leaderboard, price_line)
+    else:
+        prompt = _refine_prompt(strategy_name, parent_name, strategy_path, parent_score,
+                                leaderboard, price_line)
 
     messages = _load_revision_history(strategy_path)
     messages.append({'role': 'user', 'content': prompt})

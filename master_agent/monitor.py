@@ -6,8 +6,10 @@ stops anything ranked below KEEP_TOP_N, and adds three newcomers: CLONES_PER_CYC
 clones of the best distinct performers plus TEMPLATE_SPAWNS_PER_CYCLE pulled fresh
 from template_repo, all with slightly tweaked/revised thresholds. It then makes sure
 those plus the rest of the top N are running -- so the rank-based cull stops three per
-cycle simply because three are added. At most REVISIONS_PER_CYCLE of the newcomers is
-handed to the LLM (and only on REVISION_CHANCE of cycles); see _revision_budget.
+cycle simply because three are added. Up to REVISIONS_PER_CYCLE of the newcomers are
+handed to the LLM (and only on REVISION_CHANCE of cycles) -- currently all of them --
+each with a prompt matching its role, ROLE_REFINE for a clone or ROLE_EXPLORE for a
+template spawn; see _revision_budget and the ROLE_* constants.
 If the population is below KEEP_TOP_N (e.g. after strategies were removed via
 `strat_manager.py rm`), it backfills the shortfall from template_repo before scoring.
 
@@ -96,16 +98,35 @@ REFLECTOR_INJECT_COUNT = 2
 CLONES_PER_CYCLE = 2
 TEMPLATE_SPAWNS_PER_CYCLE = 1
 
-# Cap on revise-strategy subprocess calls per cycle, and the odds a cycle spends its one
-# call at all. Two revisions used to run back to back every cycle: at the default
-# REVISION_TIMEOUT (60000s, ~16.7h) that is legally an order of magnitude longer than
-# CYCLE_SLEEP and can outlast a whole emperor.sh window, and the cost was paid whether or
-# not the model was even responsive. One call, taken 75% of the time, is the budget; which
-# of the cycle's newcomers gets it is drawn at random. The ~25% of cycles that revise
-# nothing are not a failure mode -- every newcomer still gets apply_random_tweak or
-# apply_seed_thresholds, which is the same exploration the fallback path has always done.
-REVISIONS_PER_CYCLE = 1
+# Cap on revise-strategy subprocess calls per cycle, and the odds a cycle spends them at
+# all. Every newcomer this cycle gets a revision. At 1 -- with the target drawn by a
+# uniform random.choice over a batch that is two clones to one template spawn -- the
+# fresh spawn, which is the only channel that can introduce logic the population does not
+# already run, won the draw on 0.75 * 1/3 = 1/4 of cycles; every other newcomer inherited
+# a parent's main.py verbatim, since apply_random_tweak only scales thresholds. Measured
+# result: 141 main.py files across the population, ~10 distinct hashes, the top three
+# covering 113 of them.
+#
+# Note this is deliberately NOT paired with a lower REVISION_TIMEOUT (still 60000s,
+# ~16.7h): three sequential revisions may legally run far past CYCLE_SLEEP and outlast an
+# emperor.sh window, which is the risk the cap of 1 originally existed to avoid. That is
+# an accepted trade, and it only binds if the model hangs -- REVISION_TIMEOUT reads from
+# the environment, so it can be lowered without a code edit if cycles run long.
+#
+# The ~25% of cycles that revise nothing are not a failure mode -- every newcomer still
+# gets apply_random_tweak or apply_seed_thresholds, the same exploration the fallback
+# path has always done.
+REVISIONS_PER_CYCLE = 3
 REVISION_CHANCE = 0.75
+
+# The two jobs a newcomer can be handed. `refine` is a clone of a leader: improve on a
+# parent with a real record. `explore` is a fresh template spawn with no meaningful
+# parent, asked for something structurally different from the incumbents. The role picks
+# which user prompt master-agent.py builds, and is passed to it as the 6th argv of
+# `revise-strategy`. Duplicated there (its filename has a hyphen, so it cannot be
+# imported); keep the two pairs in sync.
+ROLE_REFINE = 'refine'
+ROLE_EXPLORE = 'explore'
 
 PRICE_FETCH_ATTEMPTS = 3
 PRICE_RETRY_DELAY = 60      # seconds between price-fetch attempts
@@ -1152,8 +1173,12 @@ def _revision_budget():
 
     Rolled once per cycle, deliberately -- not once per candidate. The budget is shared by
     every path that can create a strategy (the clone loop and bootstrap_initial_strategies
-    alike), so "at most one revision per cycle" holds even on a backfill cycle that seeds
+    alike), so the REVISIONS_PER_CYCLE ceiling holds even on a backfill cycle that seeds
     eight strategies at once. That used to be eight back-to-back REVISION_TIMEOUT waits.
+
+    All-or-nothing, not a per-candidate coin flip: the ~25% of cycles that return 0 are
+    the control arm, a whole batch built by apply_random_tweak / apply_seed_thresholds
+    alone, which is what the revised batches are compared against.
     """
     return REVISIONS_PER_CYCLE if random.random() < REVISION_CHANCE else 0
 
@@ -1198,13 +1223,17 @@ def _check_revision_interpreter():
     return ok
 
 
-def _run_revision(name, parent_name, score, leaderboard, price):
+def _run_revision(name, parent_name, score, leaderboard, price, role=ROLE_REFINE):
     """Hand one strategy to `master-agent.py revise-strategy`. True only on a clean exit.
 
     The single call site for the revision subprocess. master-agent.py already turns a
     model error into a non-zero exit (a reply starting with '[error:'), so a False here
     means the caller must fall back to a mechanical tweak rather than start a clone that
     is byte-identical to its parent.
+
+    `role` selects which user prompt master-agent.py builds -- see ROLE_REFINE /
+    ROLE_EXPLORE. Passed as a trailing positional because that end of master-agent.py is
+    a bare `revise_strategy(*sys.argv[2:])` splat with defaults.
     """
     if not MASTER_AGENT_SCRIPT.exists():
         return False
@@ -1215,41 +1244,51 @@ def _run_revision(name, parent_name, score, leaderboard, price):
             # revision subprocess must run under the same interpreter monitor does, or it
             # silently loses access to every dependency monitor was started with.
             [sys.executable, str(MASTER_AGENT_SCRIPT), 'revise-strategy',
-             name, parent_name, str(score), leaderboard, str(price)],
+             name, parent_name, str(score), leaderboard, str(price), role],
             capture_output=True, text=True, timeout=REVISION_TIMEOUT,
         )
         if result.returncode == 0:
-            print(f'Master agent revised {name}:\n{result.stdout.strip()}')
+            # Names the role: emperor_logs are the primary input to the next emperor
+            # pass, and "did explore ever produce a top-8 strategy" is otherwise
+            # unanswerable from the log alone.
+            print(f'Master agent revised {name} ({role}):\n{result.stdout.strip()}')
             return True
-        print(f'Master agent revision failed for {name}: {result.stderr.strip()}')
+        print(f'Master agent revision failed for {name} ({role}): {result.stderr.strip()}')
     except Exception as e:
-        print(f'Master agent revision errored for {name}: {e}')
+        print(f'Master agent revision errored for {name} ({role}): {e}')
     return False
 
 def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, leaderboard,
-                       price, marks, revise, inject, seed_fallback):
+                       price, marks, revise, inject, seed_fallback, role=None):
     """Create one strategy: clone -> optional revision -> gates -> fallback -> commit.
 
     The one path every new strategy takes, whether it is a clone of a winner or a fresh
-    pull from template_repo. Only three things differ between those two cases, and they
+    pull from template_repo. Only four things differ between those two cases, and they
     are the keyword arguments: `inject` (offer it Reflector assets), `seed_fallback`
-    (rebuild config.json from the current price instead of nudging a parent's), and
-    `revise` (spend the cycle's one revision slot on this one).
+    (rebuild config.json from the current price instead of nudging a parent's), `role`
+    (which prompt the revision model is given), and `revise` (spend one of the cycle's
+    revision slots on this one).
 
     Deliberately does not start the strategy -- callers do, because the clone loop starts
     its whole batch only after every clone has been gated and committed.
     """
+    # Defaulted rather than required so a caller that forgets it still gets the right
+    # prompt: parent_name == name is exactly the template-spawn case, and it is the one
+    # the refine prompt degenerates on ("a new clone `seed_x` of `seed_x`", over an empty
+    # state.json and a config whose buy_below == sell_above == 0.0).
+    if role not in (ROLE_REFINE, ROLE_EXPLORE):
+        role = ROLE_EXPLORE if parent_name == name else ROLE_REFINE
     # Names the parent explicitly: emperor_logs are the primary input to the next emperor
     # pass, and a clone's lineage is otherwise unrecoverable from the log alone.
     lineage = 'template' if parent_name == name else f'parent {parent_name}'
-    print(f'Provisioning {name} from {lineage} ({source_repo}), '
+    print(f'Provisioning {name} from {lineage} ({source_repo}), role {role}, '
           f'{"revising" if revise else "no revision"}')
     subprocess.run(['/opt/strat_manager.py', 'clone', name, source_repo])
     strategy_dir = STRATEGIES_DIR / name
     cfg_path = strategy_dir / 'config.json'
     before_head = _git_head(strategy_dir)
 
-    revised = _run_revision(name, parent_name, score, leaderboard, price) if revise else False
+    revised = _run_revision(name, parent_name, score, leaderboard, price, role) if revise else False
 
     touched = revision_changed_anything(strategy_dir, before_head)
     if revised and not touched:
@@ -1313,21 +1352,25 @@ def bootstrap_initial_strategies(price, count=2, marks=None, budget=0):
     # stop or clone-from in the normal cycle) or a backfill after the population dropped
     # below KEEP_TOP_N. Seed `count` strategies straight from the template so there's
     # something for later cycles to evolve.
-    # Returns the revision budget left over, so a backfill that spent the cycle's one slot
-    # can't have the clone loop spend it again in the same cycle.
+    # Returns the revision budget left over, so a backfill that spent the cycle's slots
+    # can't have the clone loop spend them again in the same cycle.
     print(f'Bootstrapping {count} strategies from the template.')
-    # At most one of them gets the cycle's revision slot, if the cycle has one to spend.
-    revise_index = random.randrange(count) if (budget and count) else None
+    # Spends up to `budget` of them, not exactly one: a backfill can seed KEEP_TOP_N at
+    # once and there is no reason to leave slots unused on the cycle the population
+    # collapsed. Every spawn here is template-derived, so every one of them is
+    # ROLE_EXPLORE.
+    revise_count = min(budget, count)
+    revise_idx = set(random.sample(range(count), revise_count)) if revise_count else set()
     for i in range(count):
         name = f'seed_{uuid.uuid4().hex[:12]}'
         provision_strategy(
             name, TEMPLATE_REPO,
             parent_name=name, parent_cfg=None, score=1000.0, leaderboard='{}',
-            price=price, marks=marks,
-            revise=(i == revise_index), inject=True, seed_fallback=True,
+            price=price, marks=marks, role=ROLE_EXPLORE,
+            revise=(i in revise_idx), inject=True, seed_fallback=True,
         )
         subprocess.run(['/opt/strat_manager.py', 'start', name])
-    return budget - 1 if revise_index is not None else budget
+    return budget - revise_count
 
 def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     # Fallback used when the master agent is unavailable or fails: copy the parent's
@@ -1887,8 +1930,8 @@ def run():
 
         # This cycle's newcomers: CLONES_PER_CYCLE clones of the best distinct performers,
         # plus TEMPLATE_SPAWNS_PER_CYCLE pulled fresh from the template. Built as specs up
-        # front rather than provisioned as we go, because the revision target is drawn from
-        # the whole batch and has to be known before the first one is created.
+        # front rather than provisioned as we go, because how the revision budget is spread
+        # depends on the whole batch and has to be known before the first one is created.
         leaderboard = json.dumps({n: score for n, score in performances})
         specs = []
         for name, score in select_parents(performances, state, CLONES_PER_CYCLE):
@@ -1899,26 +1942,30 @@ def run():
                 # git clone itself still pulls the winning strategy's own repo.
                 name=f'clone_{uuid.uuid4().hex[:12]}', source_repo=parent_repo,
                 parent_name=name, parent_cfg=Path(parent_repo) / 'config.json',
-                score=score, inject=False, seed_fallback=False,
+                score=score, inject=False, seed_fallback=False, role=ROLE_REFINE,
             ))
         for _ in range(TEMPLATE_SPAWNS_PER_CYCLE):
             fresh = f'seed_{uuid.uuid4().hex[:12]}'
             specs.append(dict(
                 name=fresh, source_repo=TEMPLATE_REPO,
                 parent_name=fresh, parent_cfg=None,
-                score=1000.0, inject=True, seed_fallback=True,
+                score=1000.0, inject=True, seed_fallback=True, role=ROLE_EXPLORE,
             ))
 
-        # One revision at most, and which newcomer gets it is a fair draw: a fresh template
-        # strategy is as worth revising as a clone of the current leader. Everything not
-        # drawn falls back to apply_random_tweak / apply_seed_thresholds, same as it always
-        # has when the model was unavailable.
-        target = random.choice(specs)['name'] if (budget and specs) else None
-        print(f'Revising {target or "nothing"} this cycle '
-              f'({len(specs)} new strategies: {", ".join(s["name"] for s in specs)})')
+        # Every newcomer gets revised now, so there is no target draw. When the budget is
+        # short of the batch (a backfill cycle already spent some of it, or
+        # REVISIONS_PER_CYCLE was lowered), explore goes first: it is the scarce role and
+        # the only one that can introduce logic the population does not already run.
+        # Everything not revised falls back to apply_random_tweak / apply_seed_thresholds,
+        # exactly as it always has when the model was unavailable.
+        ordered = sorted(specs, key=lambda s: s['role'] != ROLE_EXPLORE)
+        revising = {s['name'] for s in ordered[:budget]}
+        print(f'Revision budget {budget}/{len(specs)}; revising '
+              f'{", ".join(sorted(revising)) or "nothing"} this cycle '
+              f'({", ".join(s["name"] + "/" + s["role"] for s in specs)})')
         for spec in specs:
             provision_strategy(**spec, leaderboard=leaderboard, price=price, marks=marks,
-                               revise=(spec['name'] == target))
+                               revise=(spec['name'] in revising))
 
         # Start the newcomers, plus any top-N strategy that's currently stopped
         # (reload state first since strat_manager.py clone/stop wrote to disk)
