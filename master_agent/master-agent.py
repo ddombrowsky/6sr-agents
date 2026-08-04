@@ -51,6 +51,7 @@ MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
+    'granite': 'granite4.1:8b',
 }
 # Pick the model with the MASTER_AGENT_MODEL env var (a nickname above) rather than
 # editing this literal: successive emperor passes kept flipping it between 'gpt' and
@@ -156,6 +157,27 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
 SERVER_ERROR_MAX_RETRIES = 10
 SERVER_ERROR_RETRY_DELAY = 10  # seconds
 
+# Ceilings on the tool calls one run_turn may make. A run that hits either is
+# degenerating, not working: revising clone_be878323c208 on 2026-08-03 took 36 minutes
+# and 32 tool calls, rewriting main.py 7 times into progressively less coherent Python
+# (`float('nan')[:period-1]`, `decide` defined twice, a reference to `pricas`) and
+# writing config.json 21 times -- the last 9 byte-identical to each other. Nothing
+# looked at that; the loop was `while True` and ended only because the model eventually
+# stopped on its own. The identical repeats are the sharper signal, hence the much
+# tighter limit: one duplicated call is a recoverable hiccup, a third in a row is a stuck
+# model. The total budget is the backstop for a model that thrashes without repeating
+# itself exactly. Replaying that transcript against these values aborts at tool call 19
+# of 32; at a repeat limit of 4 it only reaches back to 26, and at 2 it would fire on
+# call 2 of every run that ever double-writes a file.
+#
+# Hitting either returns an '[error: ...]' reply, so revise_strategy exits non-zero and
+# monitor.py applies its random-tweak fallback -- the same path quota exhaustion and
+# persistent server errors already take. Whatever the model wrote before giving up stays
+# on disk and still faces monitor's gates; this bounds the wasted wall clock, it does not
+# decide whether the work was any good.
+MAX_TOOL_CALLS = 25
+MAX_REPEATED_TOOL_CALLS = 3
+
 
 def _estimate_context_tokens(messages: list) -> int:
     """Rough token estimate (~4 chars/token) of the current message list."""
@@ -163,8 +185,36 @@ def _estimate_context_tokens(messages: list) -> int:
     return chars // 4
 
 
+def _call_signature(tool_call) -> str:
+    """Stable key for 'the model just made this exact call again'."""
+    fn = tool_call['function']
+    try:
+        return json.dumps([fn['name'], fn['arguments']], sort_keys=True, default=str)
+    except Exception:
+        return repr(fn)
+
+
+def _abandon_turn(messages: list, tool_calls: list, reason: str) -> str:
+    """Refuse the rest of this batch of tool calls and end the turn with an error.
+
+    Every refused call still gets a tool message. The model's reply carrying those
+    calls is already in `messages`, and a tool_call with no matching result would leave
+    the saved revision history malformed for whatever loads it next.
+    """
+    for call in tool_calls:
+        messages.append({'role': 'tool', 'name': call['function']['name'],
+                         'content': f'error: refused, {reason}'})
+    reply = f'[error: {reason}; abandoning this turn]'
+    print(f'[warning] {reply}')
+    messages.append({'role': 'assistant', 'content': reply})
+    return reply
+
+
 def run_turn(messages: list) -> str:
     server_error_retries = 0
+    tool_calls_made = 0
+    last_signature = None
+    repeats = 0
     while True:
         print('...')
         print(f'[info] estimated context size: ~{_estimate_context_tokens(messages)} tokens')
@@ -201,7 +251,17 @@ def run_turn(messages: list) -> str:
         if not tool_calls:
             return message['content']
 
-        for call in tool_calls:
+        for i, call in enumerate(tool_calls):
+            signature = _call_signature(call)
+            repeats = repeats + 1 if signature == last_signature else 1
+            last_signature = signature
+            tool_calls_made += 1
+            if repeats >= MAX_REPEATED_TOOL_CALLS:
+                return _abandon_turn(messages, tool_calls[i:],
+                                     f'the same tool call was made {repeats} times in a row')
+            if tool_calls_made > MAX_TOOL_CALLS:
+                return _abandon_turn(messages, tool_calls[i:],
+                                     f'the {MAX_TOOL_CALLS}-tool-call budget for one turn is exhausted')
             messages.append(dispatch(call))
 
 
