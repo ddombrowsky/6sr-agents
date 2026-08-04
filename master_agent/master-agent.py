@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 from ollama import Client, ResponseError
 
 import score
@@ -266,6 +267,31 @@ def run_turn(messages: list) -> str:
                 time.sleep(SERVER_ERROR_RETRY_DELAY)
                 continue
             raise
+        except httpx.TransportError as e:
+            # The connection itself failed -- no HTTP status, so ResponseError above never
+            # sees it and this used to escape as a raw traceback. Ollama drops the
+            # connection while cold-loading a local model (observed 2026-08-04: a
+            # granite4.1:8b load takes ~59s and the first request died at 3.4s with
+            # RemoteProtocolError; the identical request succeeded once the model was
+            # warm), and monitor.py's revision subprocess is exactly where that lands.
+            #
+            # Transient and worth the same retry budget as a 5xx: the failure mode is a
+            # backend that is not ready yet, not a request that will never work. Sharing
+            # the counter is deliberate -- a backend flapping between 500s and dropped
+            # connections should still give up after SERVER_ERROR_MAX_RETRIES rather than
+            # alternating between two budgets forever.
+            error_text = f'{type(e).__name__}: {e}'
+            server_error_retries += 1
+            if server_error_retries > SERVER_ERROR_MAX_RETRIES:
+                print(f'[warning] transport error persisted after {SERVER_ERROR_MAX_RETRIES} retries, giving up on this turn: {error_text}')
+                # An '[error: ...]' reply is the contract monitor.py's fallback depends
+                # on: revise_strategy exits non-zero and the clone gets a random tweak.
+                # A traceback here exits non-zero too, but by crashing, which reads as a
+                # bug in the agent rather than an unreachable model.
+                return f'[error: could not reach the model ({error_text}) after {SERVER_ERROR_MAX_RETRIES} retries]'
+            print(f'[warning] transport error ({error_text}); retrying in {SERVER_ERROR_RETRY_DELAY}s ({server_error_retries}/{SERVER_ERROR_MAX_RETRIES})...')
+            time.sleep(SERVER_ERROR_RETRY_DELAY)
+            continue
         server_error_retries = 0
         message = response['message']
         if hasattr(message, 'model_dump'):
