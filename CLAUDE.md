@@ -31,8 +31,7 @@ python agent-bootstrap.py
   until the model responds without a tool call (`run_turn`). Also points at
   `127.0.0.1:11434`.
 
-`create.sh` starts a detached `ubuntu` container (`docker run -d --name agenttest
---volume ./v:/opt ubuntu sleep infinity`) with the `v/` directory bind-mounted to
+`create.sh` starts a detached `ubuntu` container with the `v/` directory bind-mounted to
 `/opt`. `v/` is gitignored; `v/agents/` holds a working copy of the agent scripts for
 execution/testing inside that container. `v/` has since grown well beyond a script mirror
 into a separate multi-repo trading-agent system (`master_agent/`, `template_repo/`,
