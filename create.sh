@@ -1,5 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 #
+
+set -e
 
 # this relies on this file being in the image:
 #
@@ -20,6 +22,12 @@
 # killasgroup=true
 
 # -n flag = nodaemon, required to exist as init proc
+
+CONTAINERNAME=.containername
+if [ -e $CONTAINERNAME ] ; then
+    echo ERROR: $CONTAINERNAME already exists for this worktree >&2
+    exit 1
+fi
 
 # find the first unused container name ssr_agentNN, starting at NN=00
 existing=$(docker ps -a --format '{{.Names}}')
@@ -45,3 +53,5 @@ docker run -d --name "$name" \
     --volume ./v:/opt \
     agenttest:latest \
     supervisord -c /etc/supervisor/supervisord.conf -n
+
+echo $name > $CONTAINERNAME

@@ -4,9 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small sandbox for experimenting with tool-calling agents against a local Ollama
+A sandbox for experimenting with tool-calling agents against a local Ollama
 server, using the `gpt-oss:120b-cloud` cloud-backed model. There is no build system,
-test suite, or linter — it's a handful of standalone scripts.
+test suite, or linter.
+
+## Docker
+
+The main system is designed to run in a docker container created by `create.sh`.
+There should be only one container running against any given `v/` directory.
+The name of the container assigned to the current worktree is stored in
+`.containername`.
 
 ## Setup and running
 

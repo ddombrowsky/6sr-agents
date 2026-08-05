@@ -3,3 +3,4 @@ venv
 v
 __pycache__
 emperor-claude.txt
+.containername
