@@ -11,45 +11,21 @@ from pathlib import Path
 import httpx
 from ollama import Client, ResponseError
 
-import score
+import domain
 import sr_agent_tools
 
-def _friction_facts():
-    """(xlm_round_trip_bp, nonbase_floor_bp) for the revision prompt, or a safe default.
-
-    Interpolated rather than written as literals, for exactly the reason
-    score.UNREALIZED_HAIRCUT is: the prompt claimed 0.999 for weeks while score.py
-    enforced 0.899, so the model was optimizing an objective it was not ranked on. A
-    cost the prompt states and the code does not charge is the same bug.
-    """
-    try:
-        sys.path.append('/opt/tools')
-        import friction
-        return friction.round_trip_bp('XLM'), round(friction.NONBASE_FLOOR * 2 * 10000, 1)
-    except Exception:
-        return 12.0, 100.0
-
-
-_XLM_RT_BP, _NONBASE_RT_BP = _friction_facts()
-
-
-def _live_caps():
-    """(max_trade_usd, max_trade_usd_nonbase) from stellar_trader, for the prompt.
-
-    Interpolated for the same reason the friction facts are: these two numbers decide how
-    much of a strategy's configured trade size can actually reach the network, they are
-    edited by hand in stellar_trader.py, and a prompt that restates them goes stale
-    silently. The fallbacks are only so a revision still runs if /opt/tools is unreadable.
-    """
-    try:
-        sys.path.append('/opt/tools')
-        import stellar_trader
-        return stellar_trader.MAX_TRADE_USD, stellar_trader.MAX_TRADE_USD_NONBASE
-    except Exception:
-        return 4.0, 0.50
-
-
-_MAX_TRADE_USD, _MAX_TRADE_USD_NONBASE = _live_caps()
+# Which game this process is revising strategies for, and every number about it that the
+# prompt below states. Read live out of the modules that enforce them (score.py's haircut,
+# friction.py's round-trip cost, stellar_trader.py's caps) rather than written here as
+# literals: the prompt claimed the haircut was 0.999 for weeks while score.py enforced
+# 0.899, so the model was optimizing an objective it was not ranked on, and a cost the
+# prompt states while the code charges something else is the same bug. See
+# domain_sdex.prompt_facts, which keeps the same per-source fallbacks this file used to
+# carry inline so a /opt/tools outage degrades the prompt instead of killing the process.
+#
+# Resolved at import, once, so REVISION_SYSTEM_PROMPT is still a module-level string.
+_DOMAIN = domain.get()
+_FACTS = _DOMAIN.prompt_facts()
 
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
@@ -101,10 +77,15 @@ REQUIREMENTS_PATH = os.environ.get('REQUIREMENTS_PATH', '/opt/agents/requirement
 # `revise-strategy`. `refine` is a clone of a leader: improve on a parent with a real
 # record. `explore` is a fresh template spawn with no meaningful parent, asked for
 # something structurally different from what the population already runs.
-# Duplicated in monitor.py -- this file's name has a hyphen so it cannot be imported,
-# and this module does not import monitor.py. Keep the two pairs in sync.
-ROLE_REFINE = 'refine'
-ROLE_EXPLORE = 'explore'
+#
+# These used to be hand-duplicated here and in monitor.py, with a comment asking whoever
+# read it to keep the two pairs in sync -- because this file's name has a hyphen and
+# cannot be imported, so there was nowhere shared to put them. domain.py can be imported
+# by both, so there is now exactly one definition. Keeping two copies of a constant in
+# sync by comment is how the prompt's haircut ended up two orders of magnitude away from
+# the one score.py enforced.
+ROLE_REFINE = domain.ROLE_REFINE
+ROLE_EXPLORE = domain.ROLE_EXPLORE
 
 # How many distinct main.py variants _population_census describes to an explore spawn.
 CENSUS_CLUSTERS = 6
@@ -399,8 +380,8 @@ REVISION_SYSTEM_PROMPT = (
     # time while score.py actually enforced 0.899, so the model was optimizing a
     # different objective than the one it was ranked on.
     f'You are scored on net worth: `balance_usd + balance_xlm * price * '
-    f'{score.UNREALIZED_HAIRCUT}` (see /opt/master_agent/score.py). The '
-    f'{(1 - score.UNREALIZED_HAIRCUT) * 100:.1f}% haircut on the XLM leg is only a '
+    f'{_FACTS["unrealized_haircut"]}` (see /opt/master_agent/score.py). The '
+    f'{(1 - _FACTS["unrealized_haircut"]) * 100:.1f}% haircut on the XLM leg is only a '
     'tie-break nudge toward realizing gains -- it is not worth distorting the strategy for. '
     'Growing net worth is the entire objective; sitting in cash and never trading '
     'scores exactly the starting balance and gets you nowhere.\n\n'
@@ -410,8 +391,9 @@ REVISION_SYSTEM_PROMPT = (
     # trading cost anything, because it did not.
     'TRADING COSTS MONEY. Every fill crosses the order book: a buy lifts the ask, a '
     f'sell hits the bid. Right now a full buy-then-sell round trip in XLM costs about '
-    f'{_XLM_RT_BP} basis points, and in a discovered non-XLM asset it is far worse -- '
-    f'assume at least {_NONBASE_RT_BP} bp and check, because measured books on AQUA and '
+    f'{_FACTS["xlm_round_trip_bp"]} basis points, and in a discovered non-XLM asset it is '
+    f'far worse -- assume at least {_FACTS["nonbase_round_trip_bp"]} bp and check, because '
+    'measured books on AQUA and '
     'ARS were 151 and 186 bp. This is charged for real: trade_logger.execute_trade fills '
     'you at the adjusted price and backtest_strategy replays it the same way, so it is '
     'already inside every number you are judged on. The consequences you must design '
@@ -555,7 +537,8 @@ REVISION_SYSTEM_PROMPT = (
     'monitor has opened a trustline for that asset at promotion, and only while the asset '
     'stays admitted. Any of those missing and the leg is paper-only, which is the normal '
     f'case: only one strategy is live at a time. Real non-XLM orders are clamped to '
-    f'${_MAX_TRADE_USD_NONBASE:.2f} per trade against ${_MAX_TRADE_USD:.2f} for XLM, so '
+    f'${_FACTS["max_trade_usd_nonbase"]:.2f} per trade against '
+    f'${_FACTS["max_trade_usd"]:.2f} for XLM, so '
     'an extra leg\'s real size is a small fraction of what config.json asks for however '
     'you size it. Design for the paper book, and never build a strategy whose thesis '
     'depends on any single real fill landing.\n\n'
@@ -1100,7 +1083,7 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
 
 
 def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
-                     leaderboard_json: str = '{}', current_price: str = '',
+                     leaderboard_json: str = '{}', observation: str = '',
                      role: str = ROLE_REFINE) -> None:
     """One-shot entry point invoked by monitor.py's provisioning stage.
 
@@ -1114,6 +1097,13 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     trailing positional rather than a flag because __main__ below is a bare
     `revise_strategy(*sys.argv[2:])` splat, so a defaulted positional keeps a hand-typed
     five-argument invocation working with no change there.
+
+    `observation` is whatever the domain knew at the top of the cycle, encoded as one argv
+    token by monitor.py (see domain.py). For sdex that is still literally `str(price)`, so
+    a hand-typed `... <score> <leaderboard> 0.1666` keeps working exactly as before; an
+    empty string means monitor could not observe anything this cycle, which the prompt has
+    a branch for. Decoding is the domain's job so a domain with a structured observation
+    needs no change to this argv contract.
     """
     strategy_path = STRATEGIES_DIR / strategy_name
     if role not in (ROLE_REFINE, ROLE_EXPLORE):
@@ -1131,13 +1121,10 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     except Exception:
         leaderboard = {}
 
-    price_line = (
-        f'Current XLM/USD price (fetched from CoinGecko by monitor.py moments ago, '
-        f'this is ground truth -- not a historical or typical price): ${current_price}\n'
-        if current_price else
-        'Current XLM/USD price: NOT PROVIDED for this cycle -- fetch it yourself '
-        '(exec curl, or /opt/tools/price_feed.py) before setting any thresholds.\n'
-    )
+    # How the observation is stated to the model is the domain's wording: for sdex it is
+    # the "this is ground truth, not a historical price" framing that stops the model
+    # anchoring on a price out of its training data.
+    price_line = _DOMAIN.observation_line(_DOMAIN.decode_observation(observation))
 
     if role == ROLE_EXPLORE:
         prompt = _explore_prompt(strategy_name, strategy_path, leaderboard, price_line)
