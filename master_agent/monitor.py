@@ -50,6 +50,27 @@ KEEP_TOP_N = 8 # strategies ranked below this by net worth get stopped each cycl
 RETIRE_BELOW_RANK = KEEP_TOP_N * 3 # stopped, never-traded strategies below this get untracked
 LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json') # which single strategy trades real money
 
+# How long a strategy may run without ever logging a trade before it stops being ranked
+# on its score and is sorted below everything that has actually traded.
+#
+# This is the third time the loop has ended up cloning strategies that do nothing, and
+# the first time the cause was not the scoring formula. A strategy that never trades
+# holds exactly its $1000 starting balance forever, so its score is a constant. When XLM
+# is falling -- it was down 15.8% over the 30 days to 2026-08-05, and 18.2% off the
+# window high -- every strategy that put capital to work marks below $1000 and every
+# strategy whose band missed the market sits exactly at it. Measured that morning: 9 of
+# 32 tracked strategies had never logged a trade, several after 30+ hours, and they held
+# 9 of the top 10 leaderboard slots. select_parents cloned them, the cull protected them,
+# and RETIRE_BELOW_RANK could never reach them because retirement only looks below rank
+# 24. The population was converging on strategies whose configured bands do not intersect
+# the market at all (buy_below 0.164077 against a 0.16618 spot, and so on).
+#
+# Ranking them last is deliberately not the same as deleting them: they keep their score,
+# they are still listed, and the existing cull + RETIRE_BELOW_RANK path is what actually
+# reaps them a cycle later. A strategy is only demoted once it has had IDLE_GRACE_S of
+# real market to act in, so a fresh clone is never punished for being new.
+IDLE_GRACE_S = int(os.environ.get('IDLE_GRACE_S', 3 * 3600))
+
 # Repos whose contents decide how real money moves. Watched every cycle by
 # check_boundary_integrity(); see that function for why.
 INTEGRITY_REPOS = [Path('/opt/tools'), Path('/opt/master_agent')]
@@ -273,6 +294,38 @@ def trade_stats(name):
         print(f'Could not read trade log for {name}: {e}')
     return count, first, last
 
+def strategy_age_s(state_entry):
+    """Seconds since this strategy's directory was created, or None.
+
+    The directory is created by `git clone` in strat_manager and never recreated, so its
+    ctime is the strategy's birth. config.json's mtime would not do -- a revision rewrites
+    it -- and state.json's is refreshed every 30s by the running loop.
+
+    Overstates opportunity slightly for a strategy that spent part of its life stopped by
+    the cull. That is the right direction for the only thing this is used for: deciding
+    when a strategy has had enough market to prove it can act at all.
+    """
+    try:
+        return max(0.0, time.time() - os.stat(state_entry['path']).st_ctime)
+    except Exception:
+        return None
+
+
+def is_idle(name, trades, state_entry):
+    """True if this strategy has had IDLE_GRACE_S to trade and has not traded.
+
+    Split out from the ranking so the meaning stays in one place: "idle" here is
+    specifically *never logged a single trade in its whole life*, not "is currently
+    flat" and not "has stopped trading recently". A strategy that traded once and then
+    went quiet still ranks on its score -- it demonstrated its logic can fire, and
+    whether being flat is the right call is exactly what the score is for.
+    """
+    if trades:
+        return False
+    age = strategy_age_s(state_entry)
+    return age is not None and age >= IDLE_GRACE_S
+
+
 def turnover_stats(name):
     """(trades, turnover_usd, friction_usd) from this strategy's trade log.
 
@@ -352,6 +405,68 @@ def print_turnover_report(performances, limit=KEEP_TOP_N):
               f'{gain:+.2f} gain, {edge}, ${friction_usd:.2f} paid{verdict}')
 
 
+def print_idle_report(performances, state, trade_counts, price):
+    """Who in this population can still act, and who has painted itself into a corner.
+
+    Two distinct dead ends, both invisible to score.py, both measured on 2026-08-05:
+
+      * IDLE -- never traded. 9 of 32, some 30+ hours old, holding $1000 in cash because
+        their configured band does not intersect the market. Their score is a constant at
+        exactly the starting balance, which in a falling market is the top of the
+        leaderboard. See IDLE_GRACE_S.
+      * ALL-IN -- balance_usd is 0.00 and sell_above is above the market, so there is no
+        buy it can afford and no sell it can reach. 25 of 32 were in this state, holding
+        ~5,960 XLM each. They are not strategies at that point, they are one leveraged
+        opinion on XLM, which is why the whole population's scores move together.
+
+    Reported rather than acted on, except through the ranking demotion idle strategies
+    already get. An all-in strategy is a legitimate (if unlucky) position and monitor has
+    no business overriding it -- but the count belongs in the cycle log, because "the
+    entire population is long and cannot sell" is the kind of thing that is obvious in
+    one number and invisible in thirty scores.
+    """
+    idle, allin = [], []
+    for name, _score in performances:
+        entry = state.get(name)
+        if not entry:
+            continue
+        trades = trade_counts.get(name, 0)
+        if is_idle(name, trades, entry):
+            age = strategy_age_s(entry) or 0
+            idle.append(f'{name} ({age / 3600:.0f}h)')
+            continue
+        try:
+            st = json.load(open(Path(entry['path']) / 'state.json'))
+            cfg = json.load(open(Path(entry['path']) / 'config.json'))
+        except Exception:
+            continue
+        # 1 cent rather than exactly 0: trade_logger leaves rounding dust behind, and a
+        # strategy with $0.004 of cash is just as unable to buy as one with none.
+        if float(st.get('balance_usd', 0.0)) < 0.01:
+            try:
+                sell_above = float(cfg['sell_above'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price and sell_above > price:
+                allin.append(f'{name} (needs {sell_above:g}, spot {price:g})')
+    if idle:
+        print(f'Idle: {len(idle)} of {len(performances)} strategies have never traded after '
+              f'{IDLE_GRACE_S / 3600:.0f}h (ranked below every strategy that has): '
+              f'{_first_few(idle)}')
+    if allin:
+        print(f'All-in: {len(allin)} of {len(performances)} strategies hold no USD and sit '
+              f'below their sell_above, so they can neither buy nor sell: '
+              f'{_first_few(allin)}')
+
+
+def _first_few(items, limit=6):
+    """`limit` names and a count of the rest -- these lists run to 20+ entries."""
+    items = sorted(items)
+    if len(items) <= limit:
+        return ', '.join(items)
+    return ', '.join(items[:limit]) + f', and {len(items) - limit} more'
+
+
 def _tools():
     """Lazy handle on the /opt/tools modules, or None if unavailable.
 
@@ -428,6 +543,41 @@ def _importability_check(source_or_path):
                     else 'backtest cannot import a top-level decide() from main.py')
     except Exception as e:
         print(f'importability check unavailable ({e}); not gating on it')
+        return None
+
+
+BACKTEST_GATE_DAYS = 30
+
+
+def _backtest_trade_count(strategy_dir):
+    """How many trades this strategy would have made over BACKTEST_GATE_DAYS, or None.
+
+    None means "could not be measured" and every caller fails open on it, for the same
+    reason _importability_check does: this guards a fitness signal, not money, and a
+    /opt/tools that is missing or mid-rewrite must not start reverting every revision in
+    the population.
+
+    Why a gate at all: on 2026-08-05 the revision model shipped configs whose band did
+    not intersect the market, then justified them from a backtest that reported
+    `trades: 0` alongside `beats_buy_hold: true` -- which is not a contradiction, because
+    XLM was falling and doing nothing beat holding it. The log has the model saying so in
+    as many words ("Trades executed 0 times, which is expected ... however, the
+    beats_buy_hold flag returned true"). `beats_buy_hold` on its own therefore accepts a
+    strategy that will never place an order; the trade count is the missing half of that
+    test.
+
+    Costs about a second per newcomer against SMOKE_TEST_SECONDS (120) already spent, and
+    only runs for newcomers, so at most three times a cycle.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import backtest
+        result = backtest.backtest(str(strategy_dir), days=BACKTEST_GATE_DAYS,
+                                   interval=60, legs=False)
+        return int(result.get('trades', 0))
+    except Exception as e:
+        print(f'  backtest trade count unavailable ({e}); not gating on it')
         return None
 
 
@@ -1112,12 +1262,67 @@ def _thresholds_are_sane(cfg, price):
     return True
 
 
+BASIS_GATE_MAX_PERCENTILE = 0.95
+
+
+def _basis_gate_is_sane(cfg):
+    """Reject a `basis_min_bp` the recorded basis essentially never reaches.
+
+    `basis_ok()` blocks a buy whenever `tradeable_bp < basis_min_bp`, so the threshold is
+    only a filter if the distribution actually crosses it. _inject_basis_gate derives its
+    own from the 25th percentile for exactly this reason, and its docstring spells out the
+    failure -- "a positive literal would produce a strategy that never buys, holds cash
+    forever, scores a flat 1000.00, and is indistinguishable on the leaderboard from a
+    broken one".
+
+    On 2026-08-05 the revision model wrote one anyway: seed_c67e7ebdf3ec got
+    `basis_min_bp: 20`, described in its own summary as "a modest 20 bp to be
+    conservative". Measured over the 704 recorded readings at that moment, tradeable_bp
+    had a median of -1.41, a 95th percentile of 5.02, and cleared 20 bp on **one** of
+    them -- 0.14% of the time. The strategy could not buy, and it went straight to the top
+    of the leaderboard on its untouched $1000.
+
+    The ceiling is the 95th percentile: a veto that passes less than one reading in twenty
+    is not a filter on a strategy, it is a strategy that does not trade. Fails OPEN on
+    every uncertainty (no knob, no history, unreadable recorder) -- the arm has to be able
+    to exist before there is data to size it against.
+    """
+    threshold = cfg.get('basis_min_bp')
+    if threshold is None:
+        return True
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        print(f'  basis_min_bp is not a number ({threshold!r})')
+        return False
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import market_recorder
+        values = sorted(v for v in market_recorder.series('tradeable_bp', hours=72,
+                                                          spec='XLM') if v is not None)
+        if len(values) < 30:
+            return True
+    except Exception:
+        return True
+    ceiling = values[min(len(values) - 1, int(len(values) * BASIS_GATE_MAX_PERCENTILE))]
+    if threshold > ceiling:
+        share = sum(1 for v in values if v >= threshold) / len(values)
+        print(f'  basis_min_bp {threshold} is above the p'
+              f'{int(BASIS_GATE_MAX_PERCENTILE * 100)} of the recorded tradeable_bp '
+              f'({ceiling}); it would pass {share * 100:.1f}% of {len(values)} readings, '
+              f'so this strategy would effectively never buy')
+        return False
+    return True
+
+
 def _config_is_sane(cfg, price, marks=None, name=None):
-    # Split into three so the smoke-test prep in main_py_is_sane can ask the narrower
+    # Split into four so the smoke-test prep in main_py_is_sane can ask the narrower
     # question it actually means (are the thresholds usable?) without a missing
     # schema_version causing it to overwrite thresholds the model deliberately chose.
     return (_required_keys_are_sane(cfg, name)
             and _thresholds_are_sane(cfg, price)
+            and _basis_gate_is_sane(cfg)
             and _assets_are_sane(cfg, marks))
 
 def main_py_is_sane(strategy_dir, name, price, marks=None, *, baseline_source=None):
@@ -1398,11 +1603,64 @@ def commit_revision(path, name, message):
           f'{_git(path, "branch", "--show-current").stdout.strip()}')
     return True
 
+SEED_BAND_FALLBACK_HALF_BP = 200.0   # the old hardcoded price*0.98 / price*1.02
+
+
+def _seed_band_half_bp(price):
+    """Half-width in bp for a seeded band, chosen from candles that actually moved.
+
+    This used to be a flat +/-2%, and that number is where a large share of the
+    population's sterility came from. Replayed against the 30 days to 2026-08-05, a band
+    2% either side of spot fired **zero** times: XLM's whole range over that month was
+    0.1654-0.2037 and it ended at 0.1666, so "2% below spot" was a price the market never
+    reached. Every seeded fallback config was therefore born unable to trade, and since
+    the fallback is what every unrevised template spawn gets, that was the majority of
+    them.
+
+    regime.suggest_bands replays a grid of widths over the real candles and reports how
+    many round trips each completed and what each cleared after friction. Pick at random
+    among the widths that did more than one round trip at a positive net edge -- at
+    random, not the best, on purpose: the top row of an in-sample fit is the most overfit
+    point in it, and these seeds are also the control arm the revised batches are compared
+    against, so they need to stay spread out rather than converging on one band.
+
+    Falls back to the old constant if /opt/tools cannot be consulted or nothing in the
+    grid qualifies. A quiet degradation to the previous behaviour is right here: this is a
+    fallback path, and it must never raise or block a cycle.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import regime
+        grid = regime.suggest_bands(price=price)
+        cost = grid.get('friction_round_trip_bp') or 0.0
+        # Two round trips minimum, and a net edge per round trip at least as large as the
+        # toll again -- i.e. the band is at least twice the round-trip cost gross. Barely
+        # clearing the spread is the trap the revision prompt already warns about ("a
+        # threshold band narrower than the round-trip cost CANNOT be profitable"), and a
+        # fallback config has no model behind it to notice it got the margin wrong.
+        usable = [b for b in grid.get('bands', [])
+                  if b.get('round_trips', 0) >= 2
+                  and (b.get('net_bp_per_round_trip') or 0) >= cost]
+        if usable:
+            chosen = random.choice(usable)
+            print(f'  seeded band +/-{chosen["half_width_bp"]} bp '
+                  f'({chosen["round_trips"]} round trips over the last '
+                  f'{chosen["hours"]:.0f}h, {chosen["net_bp_per_round_trip"]} bp net each)')
+            return float(chosen['half_width_bp'])
+        print('  no band in the grid completed 2+ profitable round trips; '
+              f'seeding +/-{SEED_BAND_FALLBACK_HALF_BP:.0f} bp')
+    except Exception as e:
+        print(f'  band sizing unavailable ({e}); seeding '
+              f'+/-{SEED_BAND_FALLBACK_HALF_BP:.0f} bp')
+    return SEED_BAND_FALLBACK_HALF_BP
+
+
 def apply_seed_thresholds(cfg_path, name, price):
     # Used only for bootstrapping: the template's config.json ships with
     # buy_below=sell_above=0.0, which never trades and can't be nudged by
     # apply_random_tweak (0.0 * anything is still 0.0). Seed a real range
-    # around the current price instead.
+    # around the current price instead -- see _seed_band_half_bp for how wide.
     existing = {}
     if cfg_path.exists():
         try:
@@ -1417,12 +1675,13 @@ def apply_seed_thresholds(cfg_path, name, price):
     # same change in apply_random_tweak for why. A template spawn reaching this fallback
     # has usually had a revision fail a gate, and any config knob that revision invented
     # is still in the file; there is no reason for the threshold repair to take it out.
+    half_bp = _seed_band_half_bp(price)
     new_cfg_data = dict(existing)
     new_cfg_data.update({
         'name': name,
         'schema_version': existing.get('schema_version', 2),
-        'buy_below': round(price * 0.98, 6),
-        'sell_above': round(price * 1.02, 6),
+        'buy_below': round(price * (1 - half_bp / 10000.0), 6),
+        'sell_above': round(price * (1 + half_bp / 10000.0), 6),
         'trade_amount_usd': trade_amount_usd,
         # Carried across explicitly rather than left to the dict copy above, because it
         # used to hard-write [] -- which was fine while seeds were always XLM-only, but
@@ -1625,6 +1884,19 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
             print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
             revised = False
 
+    # Would this thing ever place an order? Last of the gates, because it is the only one
+    # that needs the finished article: config, main.py and assets all settled. A revision
+    # that replays zero trades over a month of real candles has not written a strategy,
+    # and the model has repeatedly shipped exactly that while quoting `beats_buy_hold:
+    # true` as its justification -- see _backtest_trade_count. Demoting it to "unrevised"
+    # routes it through the fallback below, which rebuilds a band that does fire.
+    if revised:
+        fired = _backtest_trade_count(strategy_dir)
+        if fired == 0:
+            print(f'Revised {name} replays 0 trades over {BACKTEST_GATE_DAYS}d of real '
+                  f'candles; treating as unrevised')
+            revised = False
+
     fallback = None
     if not revised and cfg_path.exists():
         if seed_fallback:
@@ -1645,6 +1917,16 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
                 fallback = 'seeded thresholds (unreadable parent config)'
                 print(f'Parent config for {name} is unusable; seeding thresholds instead')
                 apply_seed_thresholds(cfg_path, name, price)
+
+    # One line per newcomer saying whether the thing about to be started can fire at all.
+    # After the fallback, so it describes the config that will actually run. A 0 here is
+    # not fatal -- a fallback config is monitor's own work and reverting it has nothing to
+    # revert to -- but it is the earliest possible warning that this strategy will spend
+    # its life at exactly 1000.00, and it belongs in the log the next emperor pass reads.
+    fired = _backtest_trade_count(strategy_dir)
+    if fired is not None:
+        note = '  <-- will never trade; it is starting sterile' if fired == 0 else ''
+        print(f'Backtest for {name}: {fired} trades over {BACKTEST_GATE_DAYS}d{note}')
 
     origin = f'seed {name}' if seed_fallback else f'revise {name} from {parent_name}'
     commit_revision(strategy_dir, name,
@@ -2191,19 +2473,32 @@ def run():
 
         performances = []
         trade_counts = {}
+        idle_names = set()
         for name, info in state.items():
             score = compute_strategy_score(name, info, price, marks)
             trade_counts[name] = trade_stats(name)[0]
+            if is_idle(name, trade_counts[name], info):
+                idle_names.add(name)
             performances.append((name, score))
-        # Tie-break on trade count. Strategies that have never traded all sit at exactly
-        # their starting balance, so without this the ordering of a 45-way tie is just
-        # the insertion order of strategy_state.json -- the same names won and lost every
-        # cycle, and the "best" strategy handed to the revision agent was arbitrary.
-        # Among equals, prefer the one that has actually demonstrated something.
-        performances.sort(key=lambda x: (x[1], trade_counts.get(x[0], 0)), reverse=True)
+        # Sort key, outermost first:
+        #
+        # 1. Has it ever traded (given IDLE_GRACE_S to do so)? A strategy that has not is
+        #    ranked below every strategy that has, whatever its score. Its score is not a
+        #    result -- it is the starting balance, unchanged, and in a falling market that
+        #    beats every strategy holding the asset. See IDLE_GRACE_S for the measurement.
+        #    This is what stops the loop cloning its own dead ends.
+        # 2. Score, as always.
+        # 3. Trade count, to break exact ties. Strategies inside the grace period all sit
+        #    at exactly their starting balance, so without this the ordering of a 45-way
+        #    tie is just the insertion order of strategy_state.json -- the same names won
+        #    and lost every cycle, and the "best" strategy handed to the revision agent
+        #    was arbitrary. Among equals, prefer the one that has demonstrated something.
+        performances.sort(key=lambda x: (x[0] not in idle_names, x[1],
+                                         trade_counts.get(x[0], 0)), reverse=True)
         print('Strategy performances (score):')
         for name, score in performances:
-            print(f'  {name}: {score:.2f} ({trade_counts.get(name, 0)} trades)')
+            tag = '  [idle: never traded]' if name in idle_names else ''
+            print(f'  {name}: {score:.2f} ({trade_counts.get(name, 0)} trades){tag}')
 
         # Fully swallowed, like the live/paper report below: a reporting bug must never
         # cost a monitoring cycle.
@@ -2211,6 +2506,25 @@ def run():
             print_turnover_report(performances)
         except Exception as e:
             print(f'turnover report unavailable ({e})')
+
+        # Who can still act. Swallowed for the same reason as every other reporter here.
+        try:
+            print_idle_report(performances, state, trade_counts, price)
+        except Exception as e:
+            print(f'idle report unavailable ({e})')
+
+        # What market the whole population is trading in. One line, from real candles:
+        # trend, volatility against the round-trip cost, and where spot sits in its
+        # 30-day range. Every strategy here is long-only, so "XLM fell 15.8% this window"
+        # is most of the explanation for any cycle where everything scores below 1000,
+        # and it was previously nowhere in the log.
+        try:
+            if '/opt/tools' not in sys.path:
+                sys.path.append('/opt/tools')
+            import regime
+            print(regime.summary())
+        except Exception as e:
+            print(f'regime summary unavailable ({e})')
 
         # One row a minute into /opt/trades/.market_history.jsonl: the DEX book, its
         # width and depth, the CEX/DEX basis and news sentiment. Nothing recorded any of

@@ -298,7 +298,37 @@ def get_market_history(hours: int = 168) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def get_market_regime(hours: int = 720, buy_below: float = 0, sell_above: float = 0) -> str:
+    """What market this is, and whether a specific threshold band would ever fire in it.
+
+    Answers the question the revision model was previously guessing at. Pass your
+    candidate buy_below/sell_above and `band_check` comes back with how many buys, sells
+    and completed round trips they would have made over the real candles, plus a plain
+    verdict -- STERILE (never bought), ONE-WAY (bought and never sold), or a round-trip
+    count. Omit them and you get the regime read plus the ranked grid of widths.
+
+    The band replay assumes the template's fixed-threshold rule, so for a strategy whose
+    decide() does something cleverer it bounds the opportunity rather than predicting the
+    result; backtest_strategy is what judges real logic. And suggest_bands is an in-sample
+    fit -- see the `note` it returns.
+    """
+    try:
+        import regime
+        out = {'regime': regime.regime(hours=int(hours))}
+        try:
+            buy_below, sell_above = float(buy_below or 0), float(sell_above or 0)
+        except (TypeError, ValueError):
+            buy_below = sell_above = 0.0
+        if buy_below > 0 and sell_above > 0:
+            out['band_check'] = regime.band_stats(buy_below, sell_above, hours=int(hours))
+        out['suggest_bands'] = regime.suggest_bands(hours=int(hours))
+        return json.dumps(out, indent=2)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 TOOLS = {
+    'get_market_regime': get_market_regime,
     'get_dex_cex_basis': get_dex_cex_basis,
     'get_friction': get_friction,
     'get_market_history': get_market_history,

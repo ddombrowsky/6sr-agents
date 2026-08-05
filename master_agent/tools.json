@@ -2,6 +2,31 @@
   {
     "type": "function",
     "function": {
+      "name": "get_market_regime",
+      "description": "What kind of market this is right now, and -- the important half -- whether a specific buy_below/sell_above band would ever actually fire in it. Pass your candidate thresholds and `band_check` replays them over 30 days of real hourly candles and returns how many buys, sells and completed round trips they would have made, the edge per round trip net of the measured round-trip cost, and a plain verdict: STERILE (buy_below sits below every low in the window, so the strategy would hold cash forever and score exactly its starting balance), ONE-WAY (it buys and can never reach sell_above, so it is buy-and-hold with extra steps), or a round-trip count. CALL THIS BEFORE YOU COMMIT ANY THRESHOLD: on 2026-08-05, 8 of 34 strategies in this population had never placed a single trade -- some after 33 hours -- purely because their band did not intersect the market, and monitor.py now rejects a revision whose backtest replays zero trades. `regime` gives the context (trend, ATR per bar against the round-trip cost, where spot sits in its 30-day range, drawdown from the high) and `suggest_bands` ranks a grid of widths by total net basis points -- read its `note`, it is an in-sample fit and is for ruling widths OUT, not for copying the top row.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "hours": {
+            "type": "integer",
+            "description": "How much candle history to read. Default 720 (30 days)."
+          },
+          "buy_below": {
+            "type": "number",
+            "description": "Candidate buy threshold to replay. Omit to skip band_check."
+          },
+          "sell_above": {
+            "type": "number",
+            "description": "Candidate sell threshold to replay. Omit to skip band_check."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "get_dex_cex_basis",
       "description": "Current dislocation between where an asset is quoted on centralized exchanges and where it actually trades on the Stellar DEX order book. Every strategy here decides on price_feed's CEX aggregate but executes against the DEX, so this is the gap between the price you reason about and the price you get. Returns cex_mid, dex_bid/ask/mid, spread_bp, basis_bp (how far the DEX is from the CEX; positive means the DEX is rich, i.e. a good place to sell and a bad place to buy) and tradeable_bp (that gap MINUS the cost of crossing to capture it). Act on tradeable_bp, never on basis_bp alone -- capturing a 3 bp dislocation by crossing a 12 bp book loses money. tradeable_bp is negative most of the time, which is itself the signal: it says when not to trade.",
       "parameters": {

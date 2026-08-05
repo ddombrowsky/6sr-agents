@@ -406,6 +406,39 @@ REVISION_SYSTEM_PROMPT = (
     '  * Being selective is now a real strategy. A filter that skips marginal trades '
     'keeps the cost you would have paid on them, which is why an indicator or a regime '
     'gate can beat a bare threshold bot even when it is wrong as often.\n\n'
+    # Added 2026-08-05. The population had converged on strategies that cannot act at
+    # all: 8 of 34 had never placed a single trade (one of them 33 hours old), and they
+    # held the top of the leaderboard, because a strategy that never trades holds exactly
+    # its $1000 starting balance while XLM was down 15.7% over the window. The model was
+    # not being perverse -- it was optimizing what it was told to, and "beat buy-and-hold"
+    # is trivially satisfied by doing nothing in a falling market. One revision said so in
+    # its own summary: "Trades executed 0 times, which is expected ... however, the
+    # beats_buy_hold flag returned true".
+    'YOUR STRATEGY MUST BE ABLE TO ACT. Not trading is not a safe default here -- it is '
+    'the most common way a revision fails, and it fails silently, because a strategy '
+    'that never places an order holds its starting balance forever and looks fine. Two '
+    'dead ends, both measured in this population on 2026-08-05:\n'
+    '  * STERILE -- the band never intersects the market. buy_below 0.164077 against a '
+    '0.16618 spot, when the lowest price in the last 30 days was 0.16545. It buys '
+    'nothing, ever. 8 of 34 strategies were in this state.\n'
+    '  * ONE-WAY -- it buys until balance_usd hits 0.00 and then waits for a sell_above '
+    'the price never reaches. 20 of 34 strategies were in this state, each holding ~5,960 '
+    'XLM and no cash. That is not a strategy, it is a leveraged opinion about XLM, and '
+    'the whole population had the same one.\n'
+    'So: **`trades: 0` from backtest_strategy is a FAILED revision, whatever '
+    '`beats_buy_hold` says.** In a falling market doing nothing beats holding, so those '
+    'two fields can both look good on a strategy that will never place an order. '
+    'monitor.py now rejects a revision that replays zero trades over 30 days and falls '
+    'back to a mechanically-generated config instead, so shipping one wastes the slot '
+    'entirely.\n'
+    'The tool that answers this directly is `get_market_regime`. Pass your candidate '
+    'buy_below and sell_above and it replays them over the real candles and tells you how '
+    'many buys, sells and completed round trips they would have made, with a verdict of '
+    'STERILE / ONE-WAY / a round-trip count. It also reports the regime (trend, ATR per '
+    'bar against the round-trip cost, where spot sits in its 30-day range) and a ranked '
+    'grid of band widths. Check your thresholds with it before you commit them, and think '
+    'about what your strategy does once it is fully invested -- if the only way back to '
+    'cash is a price 3% above spot in a downtrend, there is no way back.\n\n'
     'You can and should test a revision before committing it. '
     '`backtest_strategy(strategy_path)` replays the strategy over 30 days of real '
     'hourly candles and returns return_pct, buy_hold_pct, beats_buy_hold, trades, '
@@ -427,6 +460,10 @@ REVISION_SYSTEM_PROMPT = (
     '  * Once `decide_source` is \'main.py:decide\', treat `beats_buy_hold: false` as a '
     'failed revision and try something else: a strategy that loses to simply holding '
     'XLM is not worth starting.\n'
+    '  * Read `trades` in the same breath as `beats_buy_hold`, and read it FIRST. A '
+    'strategy that made 0 trades "beats buy-and-hold" in any falling market by simply '
+    'not participating, and monitor.py rejects it -- see "YOUR STRATEGY MUST BE ABLE TO '
+    'ACT" above.\n'
     '`history` is the list of '
     'recent close prices, oldest first, so indicators work unchanged in both live and '
     'backtest paths.\n\n'
@@ -540,7 +577,16 @@ REVISION_SYSTEM_PROMPT = (
     'tick and sets `state["basis_bp"]` and `state["basis_tradeable_bp"]`; decide() reads '
     'them with a neutral `.get` default and treats absent as "unknown, do not block". '
     'template_repo/main.py\'s `current_basis()` and `basis_ok()` are the worked example, '
-    'and `config.json`\'s optional `basis_min_bp` is the knob that arms them. Do NOT '
+    'and `config.json`\'s optional `basis_min_bp` is the knob that arms them. SIZE THAT '
+    'KNOB FROM THE RECORDED DISTRIBUTION, never from a round number that sounds prudent: '
+    '`basis_ok` blocks a buy whenever tradeable_bp is below it, and tradeable_bp is '
+    'negative most of the time. Over the 704 readings recorded to 2026-08-05 the median '
+    'was -1.4 and the 95th percentile was 5.0, so the `basis_min_bp: 20` one revision '
+    'chose as "a modest 20 bp to be conservative" cleared on one reading in seven hundred '
+    '-- a strategy that never buys. Call `get_market_history` and pick a percentile of '
+    'the real series (monitor seeds this arm at the 25th, i.e. "skip the buy when the '
+    'venue is unusually bad"); monitor rejects any config whose basis_min_bp is above the '
+    '95th. Do NOT '
     'call `basis.get_basis()`, `dex_is_cheap()` or `dex_is_rich()` from decide() or from '
     'any per-tick code: each does live Horizon order-book requests, the book is not '
     'cached, and under backtest they would fire once per replayed tick while answering '
@@ -558,7 +604,22 @@ REVISION_SYSTEM_PROMPT = (
     'read_history(), if you read it from a tick loop), '
     'friction.py (`round_trip_bp(spec)` -- what a round trip in an asset costs, if you '
     'want to size a threshold band against it programmatically rather than hardcoding a '
-    "number), and orderbook_depth.py (`get_orderbook_metrics()` -- live XLM/USDC order "
+    'number), '
+    # New 2026-08-05, alongside the get_market_regime tool that wraps it. Named in the
+    # importable-module list as well as the tool list because a strategy can call
+    # regime.regime() once per tick from main() and read the trend out of state -- the
+    # same pattern as news and basis -- which is the only way a long-only bot gets any
+    # ability to stand aside in a downtrend.
+    'regime.py (`regime()` -- trend, ATR per bar, realized vol, drawdown from the 30-day '
+    'high, and where spot sits in its 30-day range, all from the cached candles with no '
+    'network of its own; plus `band_stats(buy_below, sell_above)`, which replays a '
+    'threshold band over those candles and says whether it fires at all. The '
+    'get_market_regime tool is this module. The same functions are importable from a '
+    'strategy: call `regime.regime()` once per tick in main() and read the trend from '
+    '`state` inside decide(), exactly like news sentiment -- never from decide() itself. '
+    'Every strategy in this population is long-only, so a regime read is the only way one '
+    'can decline to be long), '
+    "and orderbook_depth.py (`get_orderbook_metrics()` -- live XLM/USDC order "
     'book from the Stellar DEX: best bid/ask, spread, and USD depth/imbalance on each '
     'side, a liquidity signal distinct from price or sentiment; a wide spread means '
     'higher slippage risk right now, a lopsided imbalance means resting supply/demand '
