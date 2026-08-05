@@ -5,16 +5,18 @@
 # The difference between this and the `emperor.sh --once` call
 # is that this doesn't do any of the emperor revision stuff.
 
+. env.sh
+
 DSTR=`date +%s`
 LOG=/opt/emperor_logs/monitor-once-$DSTR.log
 
 echo starting market recorder...
-python monitor.py --ensure-recorder
+python3 monitor.py --ensure-recorder
 
 # comment this out to use ollama if you have any credits left
 export MASTER_AGENT_MODEL=granite
 
-python -u monitor.py > $LOG 2>&1 &
+python3 -u monitor.py > $LOG 2>&1 &
 
 sleep 5
 

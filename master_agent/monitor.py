@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import datetime
 import random
 import uuid
@@ -1602,9 +1603,25 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
             revert_main_py(strategy_dir, before_head, name)
             revised = False
 
+    # Unparseable is a sanity failure, not a crash. _normalize_config and
+    # _sanitize_assets both already swallow a bad parse and return early on the stated
+    # assumption that "_config_is_sane will fail it and the fallback rebuilds the file
+    # from scratch" -- but this load was bare, so a revision that wrote invalid JSON
+    # took the whole monitor process down here instead, killing the cycle and every
+    # strategy's evolution until the next emperor window. Also rejects a parseable
+    # non-object: _required_keys_are_sane calls cfg.get and would raise on a list.
     if revised and cfg_path.exists():
-        cfg = json.load(open(cfg_path))
-        if not _config_is_sane(cfg, price, marks, name=name):
+        cfg = None
+        try:
+            cfg = json.load(open(cfg_path))
+        except Exception as e:
+            print(f'Revised config for {name} is unreadable ({e}); treating as unrevised')
+            revised = False
+        if revised and not isinstance(cfg, dict):
+            print(f'Revised config for {name} is a {type(cfg).__name__}, not an object; '
+                  f'treating as unrevised')
+            revised = False
+        if revised and not _config_is_sane(cfg, price, marks, name=name):
             print(f'Revised config for {name} failed sanity check ({cfg}); treating as unrevised')
             revised = False
 
@@ -1619,7 +1636,15 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
         elif parent_cfg and Path(parent_cfg).exists():
             fallback = 'random tweak'
             print(f'Falling back to random tweak for {name}')
-            apply_random_tweak(parent_cfg, cfg_path, name)
+            # A tweak can only nudge a config it can read, and a parent's config.json is
+            # not guaranteed readable -- it is whatever that lineage last committed. On
+            # failure fall through to seeded thresholds rather than leaving the clone's
+            # own (possibly unparseable) config.json to be committed and started: every
+            # not-revised path has to end with a config monitor built itself.
+            if not apply_random_tweak(parent_cfg, cfg_path, name):
+                fallback = 'seeded thresholds (unreadable parent config)'
+                print(f'Parent config for {name} is unusable; seeding thresholds instead')
+                apply_seed_thresholds(cfg_path, name, price)
 
     origin = f'seed {name}' if seed_fallback else f'revise {name} from {parent_name}'
     commit_revision(strategy_dir, name,
@@ -1641,20 +1666,47 @@ def bootstrap_initial_strategies(price, count=2, marks=None, budget=0):
     revise_idx = set(random.sample(range(count), revise_count)) if revise_count else set()
     for i in range(count):
         name = f'seed_{uuid.uuid4().hex[:12]}'
-        provision_strategy(
-            name, TEMPLATE_REPO,
-            parent_name=name, parent_cfg=None, score=1000.0, leaderboard='{}',
-            price=price, marks=marks, role=ROLE_EXPLORE,
-            revise=(i in revise_idx), inject=True, seed_fallback=True,
-        )
+        # Same reasoning as the clone loop in run(): one failed seed skips itself rather
+        # than taking down the backfill, which is running precisely because the
+        # population is already below KEEP_TOP_N.
+        try:
+            provision_strategy(
+                name, TEMPLATE_REPO,
+                parent_name=name, parent_cfg=None, score=1000.0, leaderboard='{}',
+                price=price, marks=marks, role=ROLE_EXPLORE,
+                revise=(i in revise_idx), inject=True, seed_fallback=True,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            print(f'Bootstrapping {name} failed ({e}); skipping it')
+            continue
         subprocess.run(['/opt/strat_manager.py', 'start', name])
     return budget - revise_count
 
 def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     # Fallback used when the master agent is unavailable or fails: copy the parent's
     # config with thresholds nudged by a small random factor (e.g. 0.95 - 1.05).
-    parent = json.load(open(parent_cfg_path))
+    #
+    # Returns True if it wrote a config, False if the parent's is unusable -- unreadable,
+    # not an object, or without a pair of numeric thresholds to scale. This is the path
+    # every failed revision lands on, so it must not raise: the parent's config.json is
+    # only ever as good as whatever that lineage last committed, and a bare load here
+    # turned one bad ancestor into a dead monitor process for the whole population.
+    try:
+        parent = json.load(open(parent_cfg_path))
+    except Exception as e:
+        print(f'  could not read parent config {parent_cfg_path}: {e}')
+        return False
+    if not isinstance(parent, dict):
+        print(f'  parent config {parent_cfg_path} is a {type(parent).__name__}, not an object')
+        return False
     tweak = random.uniform(0.95, 1.05)
+    try:
+        buy_below = round(float(parent['buy_below']) * tweak, 6)
+        sell_above = round(float(parent['sell_above']) * tweak, 6)
+    except (KeyError, TypeError, ValueError) as e:
+        print(f'  parent config {parent_cfg_path} has no usable thresholds: {e}')
+        return False
     # Start from the parent's whole config rather than a fresh literal. This used to
     # rebuild the file from a fixed key set, so every key outside it was silently
     # deleted the moment a clone fell through to this fallback -- the template's own
@@ -1669,8 +1721,8 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
     new_cfg_data.update({
         'name': new_name,
         'schema_version': parent.get('schema_version', 2),
-        'buy_below': round(parent['buy_below'] * tweak, 6),
-        'sell_above': round(parent['sell_above'] * tweak, 6),
+        'buy_below': buy_below,
+        'sell_above': sell_above,
         'trade_amount_usd': parent.get('trade_amount_usd', 10.0)
     })
 
@@ -1699,6 +1751,7 @@ def apply_random_tweak(parent_cfg_path, new_cfg_path, new_name):
         new_cfg_data.pop('assets', None)
 
     json.dump(new_cfg_data, open(new_cfg_path, 'w'), indent=2)
+    return True
 
 def _config_signature(state_entry):
     """The parameters that actually define a strategy's behaviour, for dedup."""
@@ -2273,13 +2326,27 @@ def run():
         print(f'Revision budget {budget}/{len(specs)}; revising '
               f'{", ".join(sorted(revising)) or "nothing"} this cycle '
               f'({", ".join(s["name"] + "/" + s["role"] for s in specs)})')
+        # One newcomer must not be able to end the cycle. Provisioning runs a revision
+        # model, git, and a smoke test over LLM-written code and LLM-written config, and
+        # an uncaught exception anywhere in there used to propagate out of run() and kill
+        # monitor outright -- emperor.sh then sits out the rest of its window with nothing
+        # scoring, culling or spawning. A failed newcomer is skipped instead: it is not
+        # started, so it stays a checked-out-but-never-started clone and the next cycle's
+        # `strat_manager.py prune` drops it.
+        provisioned = []
         for spec in specs:
-            provision_strategy(**spec, leaderboard=leaderboard, price=price, marks=marks,
-                               revise=(spec['name'] in revising))
+            try:
+                provision_strategy(**spec, leaderboard=leaderboard, price=price, marks=marks,
+                                   revise=(spec['name'] in revising))
+            except Exception as e:
+                traceback.print_exc()
+                print(f'Provisioning {spec["name"]} failed ({e}); skipping it this cycle')
+                continue
+            provisioned.append(spec)
 
         # Start the newcomers, plus any top-N strategy that's currently stopped
         # (reload state first since strat_manager.py clone/stop wrote to disk)
-        for spec in specs:
+        for spec in provisioned:
             subprocess.run(['/opt/strat_manager.py', 'start', spec['name']])
 
         fresh_state = load_state()
