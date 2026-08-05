@@ -1011,6 +1011,121 @@ def _next_reflector_assets(count=2):
     return picks
 
 
+def _tradeable_bp_values(hours=72):
+    """The recorded XLM tradeable_bp series, sorted ascending, or None if unreadable.
+
+    One reader for the three places that size a decision against this distribution:
+    _inject_basis_gate picks a threshold out of it, _basis_gate_is_sane rejects one above
+    it, and _repair_config clamps one back into it. They have to agree -- a gate rejected
+    at a percentile computed over a different window than the one it was injected from
+    would eventually reject monitor's own injected value.
+
+    spec='XLM' explicitly: the gate is on the XLM leg, and the recorder can be pointed at
+    another spec, at which point an unfiltered series would mix two assets' dislocations
+    into one percentile. Returns None rather than raising -- every caller is on a path
+    that must not take the cycle down, and each decides for itself what missing history
+    means (inject refuses, the other two fail open).
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import market_recorder
+        return sorted(v for v in market_recorder.series('tradeable_bp', hours=hours,
+                                                        spec='XLM') if v is not None)
+    except Exception:
+        return None
+
+
+def _repair_config(cfg_path, price, name):
+    """Fix the config defects monitor knows the right value for. Returns what it changed.
+
+    _config_is_sane is all-or-nothing: one bad key and the whole revision is demoted to
+    "unrevised", which throws away every other thing the model wrote. Worse, the demotion
+    does not even remove the offending key -- both fallbacks deliberately start from
+    `dict(existing)` so a revision's invented knobs survive an unrevised generation, so a
+    config rejected for its basis gate is rebuilt with that same basis gate still in it.
+
+    That is not hypothetical. On 2026-08-05 seed_1a46f019c609 was rejected with
+    "basis_min_bp 20.0 is above the p95 of the recorded tradeable_bp (5.11); it would pass
+    0.1% of 860 readings, so this strategy would effectively never buy" -- and was then
+    started anyway, with basis_min_bp 20 intact, because apply_seed_thresholds only
+    rebuilds the price band. The gate diagnosed the strategy correctly and changed nothing
+    about it.
+
+    Repairs are limited to values monitor can derive itself, and each is independent of
+    everything else in the file:
+
+      * `basis_min_bp` that is not a number, or is above the p95 the gate rejects. Clamped
+        to BASIS_INJECT_PERCENTILE of the same recorded series -- exactly the value
+        _inject_basis_gate would have chosen for a spawn -- so the arm keeps existing
+        instead of being deleted. Dropped outright only when it is not a number at all.
+      * The XLM band, when it is missing, non-numeric, non-positive, inverted, or anchored
+        so far from the fetched price that it can never fire. Rebuilt from
+        _seed_band_half_bp around the real price, which is the same band the seed fallback
+        would have produced, while every other key in the file stays put.
+
+    It deliberately does NOT repair `name`. _normalize_config's docstring makes that
+    argument and it still holds: a config naming another strategy means the model copied
+    someone else's file wholesale, most likely the parent's, which the refine prompt hands
+    it verbatim -- and then everything else in it is suspect too. That is a revision to
+    reject, not to patch, and patching it here would make the name check dead code.
+
+    Runs on every clone, revised or not, for the same reason _sanitize_assets does:
+    config.json is committed, so `git clone` carries a bad knob down the entire lineage
+    and apply_random_tweak copies it forward verbatim.
+    """
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        return []           # unparseable; the existing path rebuilds it from scratch
+    if not isinstance(cfg, dict):
+        return []
+
+    repairs = []
+
+    if 'basis_min_bp' in cfg and cfg['basis_min_bp'] is not None:
+        threshold = None
+        try:
+            threshold = float(cfg['basis_min_bp'])
+        except (TypeError, ValueError):
+            repairs.append(f'dropped non-numeric basis_min_bp ({cfg["basis_min_bp"]!r})')
+            del cfg['basis_min_bp']
+        if threshold is not None:
+            values = _tradeable_bp_values()
+            if values is not None and len(values) >= 30:
+                ceiling = values[min(len(values) - 1,
+                                     int(len(values) * BASIS_GATE_MAX_PERCENTILE))]
+                if threshold > ceiling:
+                    repaired = round(values[int(len(values) * BASIS_INJECT_PERCENTILE)], 2)
+                    cfg['basis_min_bp'] = repaired
+                    repairs.append(
+                        f'basis_min_bp {threshold} -> {repaired} (was above the p'
+                        f'{int(BASIS_GATE_MAX_PERCENTILE * 100)} of {len(values)} recorded '
+                        f'readings, {ceiling}; clamped to the p'
+                        f'{int(BASIS_INJECT_PERCENTILE * 100)} monitor seeds this arm at)')
+
+    # Only with a real price to anchor to. Without one there is nothing to rebuild the
+    # band from, and _thresholds_are_sane skips its own anchor check for the same reason.
+    if price and not _thresholds_are_sane(cfg, price):
+        half_bp = _seed_band_half_bp(price)
+        old = (cfg.get('buy_below'), cfg.get('sell_above'))
+        cfg['buy_below'] = round(price * (1 - half_bp / 10000.0), 6)
+        cfg['sell_above'] = round(price * (1 + half_bp / 10000.0), 6)
+        repairs.append(f'band {old[0]}/{old[1]} -> {cfg["buy_below"]}/{cfg["sell_above"]} '
+                       f'(+/-{half_bp} bp around {price}; the old one could not fire)')
+
+    if not repairs:
+        return []
+    try:
+        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+    except Exception as e:
+        print(f'  could not write repaired config for {name}: {e}')
+        return []
+    for line in repairs:
+        print(f'  repaired config for {name}: {line}')
+    return repairs
+
+
 def _inject_basis_gate(cfg_path):
     """Give a template spawn a coin flip at trading on the DEX/CEX basis.
 
@@ -1051,21 +1166,19 @@ def _inject_basis_gate(cfg_path):
             sys.path.append('/opt/tools')
         import market_recorder
         span = market_recorder.span()
-        if span['hours'] < BASIS_MIN_RECORDED_HOURS:
-            print(f"  no basis gate: only {span['hours']}h of recorded history "
-                  f"(need {BASIS_MIN_RECORDED_HOURS}h)")
-            return False
-        # spec='XLM' explicitly: the gate is on the XLM leg, and the recorder can be
-        # pointed at another spec, at which point an unfiltered series would mix two
-        # assets' dislocations into one percentile.
-        values = sorted(v for v in market_recorder.series('tradeable_bp', hours=72,
-                                                          spec='XLM')
-                        if v is not None)
-        if len(values) < 30:
-            print(f'  no basis gate: only {len(values)} tradeable_bp readings')
-            return False
     except Exception as e:
         print(f'  no basis gate: recorded history unavailable ({e})')
+        return False
+    if span['hours'] < BASIS_MIN_RECORDED_HOURS:
+        print(f"  no basis gate: only {span['hours']}h of recorded history "
+              f"(need {BASIS_MIN_RECORDED_HOURS}h)")
+        return False
+    values = _tradeable_bp_values()
+    if values is None:
+        print('  no basis gate: recorded history unavailable')
+        return False
+    if len(values) < 30:
+        print(f'  no basis gate: only {len(values)} tradeable_bp readings')
         return False
 
     threshold = round(values[int(len(values) * BASIS_INJECT_PERCENTILE)], 2)
@@ -1295,15 +1408,8 @@ def _basis_gate_is_sane(cfg):
     except (TypeError, ValueError):
         print(f'  basis_min_bp is not a number ({threshold!r})')
         return False
-    try:
-        if '/opt/tools' not in sys.path:
-            sys.path.append('/opt/tools')
-        import market_recorder
-        values = sorted(v for v in market_recorder.series('tradeable_bp', hours=72,
-                                                          spec='XLM') if v is not None)
-        if len(values) < 30:
-            return True
-    except Exception:
+    values = _tradeable_bp_values()
+    if values is None or len(values) < 30:
         return True
     ceiling = values[min(len(values) - 1, int(len(values) * BASIS_GATE_MAX_PERCENTILE))]
     if threshold > ceiling:
@@ -1847,6 +1953,15 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     # smoke test, so the smoke run exercises the asset list the strategy will start with.
     if cfg_path.exists():
         _sanitize_assets(cfg_path, marks)
+
+    # Repair what monitor can derive itself, before the gate decides whether to throw the
+    # whole revision away. Here and not inside the `revised` branch below, and for the
+    # same reason _sanitize_assets is unconditional: a bad knob is committed to git and
+    # inherited by the whole lineage, and both fallbacks copy the existing config forward
+    # rather than rebuilding it, so a value the gate rejects otherwise survives the
+    # rejection. See _repair_config for the case that proved it.
+    if cfg_path.exists():
+        _repair_config(cfg_path, price, name)
 
     # Runs whenever the model touched the repo, even if `revised` is already False: both
     # fallbacks only rewrite config.json, so a gutted main.py would otherwise survive a

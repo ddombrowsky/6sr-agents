@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -69,6 +70,26 @@ TRADES_DIR = Path('/opt/trades')
 STRATEGY_STATE_FILE = Path('/opt/strategy_state.json')
 REVISION_HISTORY_FILENAME = '.strategy-revision-history.json'
 REVISION_HISTORY_MAX_MESSAGES = 5
+
+# How many times revise_strategy will send the model back into the same conversation when
+# its reply did not correspond to any actual change on disk. 3 means the first answer plus
+# two corrections.
+#
+# This exists because "the model analysed the strategy and then wrote nothing" is the
+# single most common way a revision slot is wasted. Over the four emperor cycles logged to
+# 2026-08-05 there were 17 revisions and 9 write_file calls: 8 revisions ended with a prose
+# summary quoting a config.json block, a main.py diff and a `git commit` command, none of
+# which had been executed -- one closing with "the revision is now ready for deployment"
+# over a byte-identical clone. monitor.py already detects that (revision_changed_anything),
+# but its only response is to discard the attempt and apply a random threshold tweak, so
+# the model is never told it failed and the cycle's analysis is thrown away.
+#
+# Retrying here rather than re-invoking from monitor is deliberate: the model still has its
+# whole tool-calling context -- the regime read, the backtest, the candidate thresholds --
+# so a correction costs one completion instead of a fresh 10K-token prompt and another
+# round of read-only tool calls. Env-overridable because each extra attempt is another
+# model turn inside REVISION_TIMEOUT.
+REVISION_MAX_ATTEMPTS = int(os.environ.get('REVISION_MAX_ATTEMPTS', '3'))
 
 # The third-party package manifest, named in REVISION_SYSTEM_PROMPT so the revision model
 # can read the current list instead of trusting a list hardcoded in a prompt that goes
@@ -666,11 +687,31 @@ REVISION_SYSTEM_PROMPT = (
     '(e.g. to look at recent history or trend, not just the single spot value you were '
     "given), you have `exec` (curl, or run /opt/tools/price_feed.py) and `fetch_url` -- "
     'use them rather than guessing.\n\n'
-    'When you are done, you MUST commit your changes on a new git branch inside the '
-    "strategy's own directory (e.g. `git checkout -b auto/<timestamp>` then `git add -A "
-    '&& git commit -m ...`) so the revision is tracked -- an unmodified or uncommitted '
-    "clone will just keep trading with its parent's exact settings.\n\n"
-    'Finish by replying with a short summary of what you changed and why.'
+    'When you are done, commit your changes on a new git branch inside the '
+    "strategy's own directory (`git checkout -b auto/<timestamp>` then `git add -A "
+    '&& git commit -m ...`) so the revision is tracked.\n\n'
+    # The last block in the prompt, deliberately. Everything above is ~10K tokens about
+    # WHAT to change; this is about the fact that changing anything requires a tool call.
+    # Across the four emperor cycles logged to 2026-08-05 the model made 9 write_file
+    # calls in 17 revisions and answered the other 8 with a prose summary quoting the
+    # config.json, the main.py diff and the `git commit` it had never run -- one closing
+    # "the revision is now ready for deployment" over a byte-identical clone. Recency is
+    # the whole reason it sits here rather than next to the tool descriptions above; the
+    # retry loop in revise_strategy is the backstop for when it does not land.
+    'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
+    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
+    'nothing: pasting the new config.json into your answer does not write it, quoting a '
+    'main.py diff does not apply it, and a `git commit` line inside a code fence does not '
+    'run -- that last one in particular has been written many times by revisions that '
+    'committed nothing. monitor.py reads the directory, never your summary, and a '
+    'revision that left the files untouched is discarded and replaced with a mechanical '
+    'threshold nudge: the slot is spent and your analysis is lost. So before you write '
+    'your final reply, `read_file` every path you claim to have changed and confirm the '
+    'new content is really on disk. And check the order you did things in -- a '
+    '`backtest_strategy` result from before you wrote the file describes the old code, '
+    'not your revision, so re-run it rather than quoting it.\n\n'
+    'Finish by replying with a short summary of the changes you have already written to '
+    'disk, and why.'
 )
 
 
@@ -825,6 +866,103 @@ def _population_census(limit: int = CENSUS_CLUSTERS) -> str:
         return '\n'.join(lines)
     except Exception as e:
         return f'(population census unavailable: {e})'
+
+
+def _repo_fingerprint(strategy_path: Path):
+    """(HEAD, porcelain status) for a strategy repo, or None if git cannot answer.
+
+    Deliberately the same two questions monitor.revision_changed_anything asks, in the
+    same order and with the same tools, so the retry loop below and monitor's own
+    "did anything happen" gate can never disagree. If they diverged, this would either
+    keep re-prompting a model whose work monitor was about to accept, or accept a
+    revision monitor then discards as a no-op -- both worse than the bug being fixed.
+
+    Returns None on any git failure rather than a sentinel value, and the caller treats
+    None as "cannot tell, do not retry". Failing open matters: an unreadable repo is not
+    evidence the model did nothing, and a retry loop that fires on it would burn every
+    attempt and still hand monitor the same clone.
+
+    Read BEFORE _save_revision_history writes .strategy-revision-history.json. The
+    template gitignores that file, but lineages older than 2026-07-31 predate that
+    .gitignore, and there it is untracked -- so on those, saving history first would make
+    the tree dirty and every revision look successful.
+    """
+    def git(*args):
+        try:
+            r = subprocess.run(['git', '-C', str(strategy_path), *args],
+                               capture_output=True, text=True)
+        except Exception:
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    head = git('rev-parse', 'HEAD')
+    status = git('status', '--porcelain')
+    if head is None or status is None:
+        return None
+    return (head.strip(), status.strip())
+
+
+def _no_op_correction(strategy_path: Path) -> str:
+    """Sent when a reply described edits that were never written to disk."""
+    return (
+        f'STOP -- you did not change anything.\n\n'
+        f'`{strategy_path}` is byte-for-byte identical to what it was before your last '
+        f'reply. No file was written, nothing was staged, and no commit exists. Your '
+        f'answer described edits, possibly quoting the new config.json or a main.py diff '
+        f'in full, but describing an edit is not making one: text in your reply does not '
+        f'reach the filesystem, and a `git commit` line inside a code fence does not run. '
+        f'Only an actual `write_file` or `exec` tool call changes this directory.\n\n'
+        f'monitor.py reads the directory, never your summary. As things stand your '
+        f'revision is discarded, this strategy starts as an unmodified copy with a random '
+        f'threshold nudge, and the entire cycle slot is wasted.\n\n'
+        f'Do it now, as tool calls:\n'
+        f'  1. `write_file` the changes you just described -- config.json, and main.py too '
+        f'if what you described was a change to the trading logic.\n'
+        f'  2. `read_file` each path back and confirm the content you intended is really '
+        f'there.\n'
+        f'  3. Re-run `backtest_strategy` on the strategy directory. Any number you '
+        f'already quoted was measured on the unmodified code and does not describe your '
+        f'revision.\n\n'
+        f'Then reply, briefly, with what is now on disk.'
+    )
+
+
+def _main_py_digest(strategy_path: Path):
+    """sha256 of the clone's main.py, or None if it cannot be read.
+
+    Hashed from the working tree rather than asked of git, deliberately: the question is
+    whether the file the strategy will actually run is the one it was cloned with, and a
+    model that writes main.py and commits it moves HEAD without leaving the tree dirty.
+    None means "cannot tell", and every caller treats that as "assume it changed".
+    """
+    try:
+        return hashlib.sha256((strategy_path / 'main.py').read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _config_only_correction(strategy_path: Path) -> str:
+    """Sent to an explore spawn whose revision touched config.json and nothing else."""
+    return (
+        f'You changed config.json and nothing else -- main.py at `{strategy_path}` is '
+        f'still the unmodified template.\n\n'
+        f'This is an EXPLORE slot, and a threshold change is the one thing it is not for. '
+        f'Every template spawn that is not revised already gets a mechanically-seeded band '
+        f'from monitor.py for free, so a config-only revision here has produced nothing '
+        f'the population would not have had anyway, and the census above already shows a '
+        f'population clustered on a handful of near-identical main.py files. The unused '
+        f'/opt/tools signal modules listed there are the open directions, and wiring one '
+        f'in is a change that can only be made in main.py.\n\n'
+        f'So: rewrite main.py. Import a signal module, compute it once per tick in '
+        f"main()'s loop, store it in `state`, and read it back inside `decide()` to gate "
+        f'or size the trade -- never fetch from inside decide() itself. Put whatever '
+        f'number it needs in config.json under a name that says what it means. Then re-run '
+        f'`backtest_strategy`, confirm `decide_source` is "main.py:decide" and that '
+        f'`trades` is above zero, and write the file with `write_file` before you reply.\n\n'
+        f'If you have looked again and are genuinely convinced the config-only change is '
+        f'the better strategy here, say so explicitly and stop -- but do not just repeat '
+        f'the summary you already gave.'
+    )
 
 
 def _load_revision_history(strategy_path: Path) -> list:
@@ -1009,9 +1147,62 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
 
     messages = _load_revision_history(strategy_path)
     messages.append({'role': 'user', 'content': prompt})
-    reply = run_turn(messages)
+
+    # The retry loop. `before` is captured once, outside: the question at every attempt is
+    # "has anything changed since the clone was handed to me", not "since the last turn",
+    # so a model that writes a file on attempt 2 and nothing on attempt 3 still counts as
+    # having revised.
+    before = _repo_fingerprint(strategy_path)
+    main_py_before = _main_py_digest(strategy_path)
+    nudged_for_config_only = False
+    reply = ''
+    for attempt in range(1, REVISION_MAX_ATTEMPTS + 1):
+        reply = run_turn(messages)
+        print(reply)
+        if reply.startswith('[error:'):
+            break       # the model is unreachable; another attempt buys nothing
+
+        after = _repo_fingerprint(strategy_path)
+        wrote_nothing = (before is not None and after is not None and after == before)
+        # An explore spawn that only moved numbers has spent the one slot the population
+        # has for structural novelty on something the unrevised fallback produces for
+        # free. Across the emperor cycles logged to 2026-08-05, all 9 write_file calls in
+        # 17 revisions went to config.json and not one revision ever edited main.py --
+        # which is what a population of 141 main.py files with ~10 distinct hashes,
+        # 113 of them covered by the top three, is made of.
+        #
+        # Explore only. For a refine slot a config-only change is a legitimate answer:
+        # improving on a parent's thresholds is exactly what that role was asked for.
+        config_only = (role == ROLE_EXPLORE
+                       and not wrote_nothing
+                       and main_py_before is not None
+                       and _main_py_digest(strategy_path) == main_py_before)
+
+        if not wrote_nothing and not config_only:
+            break       # it wrote something structural, or git cannot tell us -- done
+        if attempt == REVISION_MAX_ATTEMPTS:
+            if wrote_nothing:
+                print(f'[revise-strategy] {strategy_name} still modified nothing after '
+                      f'{REVISION_MAX_ATTEMPTS} attempts; leaving it to monitor.py')
+            break
+        if wrote_nothing:
+            print(f'[revise-strategy] {strategy_name} modified no files on attempt '
+                  f'{attempt}; sending it back to actually write the changes it described')
+            messages.append({'role': 'user', 'content': _no_op_correction(strategy_path)})
+            continue
+        # Nudged at most once, and never escalated into a rejection. Unlike a no-op, a
+        # config-only revision is a real answer -- it is just the weak one, and the model
+        # is explicitly offered the option of standing by it. Pressing harder than this
+        # would buy main.py churn for its own sake, which is not what the slot is for
+        # either.
+        if nudged_for_config_only:
+            break
+        nudged_for_config_only = True
+        print(f'[revise-strategy] {strategy_name} ({role}) changed config.json only on '
+              f'attempt {attempt}; asking once for a main.py change instead')
+        messages.append({'role': 'user', 'content': _config_only_correction(strategy_path)})
+
     _save_revision_history(strategy_path, messages)
-    print(reply)
     if reply.startswith('[error:'):
         # run_turn gave up (quota exhausted, or server errors past the retry budget)
         # rather than actually revising anything. Exit non-zero so monitor.py's caller
