@@ -2173,6 +2173,16 @@ def run():
         # it is one noisy sample an hour -- while realized venue edge is one observation
         # per fill. Swallowed like every other reporter here.
         try:
+            # basis_report is NOT among the modules symlinked into /opt beside
+            # monitor.py (score, strat_manager, leaderboard, live_report), which looks
+            # like it should break a symlink-launched monitor and does not: CPython
+            # resolves the symlink when it sets sys.path[0], so /opt/master_agent is
+            # already there. This append is belt and braces, not a repair -- it keeps
+            # the import working if monitor is copied rather than symlinked, or run
+            # under an interpreter that leaves sys.path[0] unresolved.
+            _ma = os.path.dirname(os.path.realpath(__file__))
+            if _ma not in sys.path:
+                sys.path.append(_ma)
             import basis_report
             print(basis_report.summary_line(24))
         except Exception as e:
@@ -2282,5 +2292,32 @@ def run():
         # Wait an hour before next cycle (or exit here if asked to stop)
         sleep_or_exit(CYCLE_SLEEP)
 
+USAGE = """usage: monitor.py [--ensure-recorder]
+
+  (no arguments)      run the evolutionary loop forever, one cycle per hour
+  --ensure-recorder   start the market recorder daemon if it is not already
+                      running, print the market-history report, and exit.
+                      Exits 1 if the recorder could not be confirmed running.
+"""
+
 if __name__ == '__main__':
-    run()
+    args = sys.argv[1:]
+    # Argument handling exists mostly so a typo cannot start the loop. Anything
+    # unrecognised (including --help, which used to fall through here and begin a
+    # full cycle) prints usage instead of trading.
+    if not args:
+        run()
+    elif args == ['--ensure-recorder']:
+        # Standalone supervision, for once.sh / cron / a hand check. The daemon is
+        # setsid'd, so it outlives this process exiting seconds later exactly as it
+        # outlives a monitor cycle.
+        try:
+            ensure_market_recorder()
+        except Exception as e:
+            print(f'market recorder unavailable ({e})')
+        alive = _recorder_alive()
+        print(f'recorder running: {alive}')
+        sys.exit(0 if alive else 1)
+    else:
+        print(USAGE, end='')
+        sys.exit(0 if args in (['-h'], ['--help']) else 2)

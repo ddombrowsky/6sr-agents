@@ -8,6 +8,9 @@
 DSTR=`date +%s`
 LOG=/opt/emperor_logs/monitor-once-$DSTR.log
 
+echo starting market recorder...
+python monitor.py --ensure-recorder
+
 # comment this out to use ollama if you have any credits left
 export MASTER_AGENT_MODEL=granite
 
