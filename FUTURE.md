@@ -150,7 +150,7 @@ failure mode `TEMPLATE_SPAWNS_PER_CYCLE` exists to prevent within a single domai
 
 1. [DONE] **Basis (#1) first.** Half the code exists, it fixes the noise problem, and it stays
    inside the venue we understand.
-2. [IMPLEMENTED 2026-08-05, NOT YET DEPLOYED — branch `domain-plugin`] Factor out the
+2. [DONE 2026-08-05] Factor out the
    "domain" logic.  Analyze what is in the "What a domain needs"
    section, and implement it such that the current Stellar SDEX code functions
    as it does now.
@@ -160,21 +160,6 @@ failure mode `TEMPLATE_SPAWNS_PER_CYCLE` exists to prevent within a single domai
    reference domain, `selftest_domain.py` is a differential test against the pre-refactor
    `monitor.py` in git — 414 checks, all passing. monitor.py went 2819 → 1313 lines.
 
-   Two corrections to this document fell out of doing it. First, `domain.execute(...)`
-   from the section below **should not exist**: the loop never executes a trade (execution
-   happens inside the strategy's own main.py, the only thing that reads `live.flag`), so
-   it would be a seam with no caller. What the loop actually touches at the money boundary
-   is `caps()`, `can_execute_live()`, `promotion_sizing()`, `prepare_live()`,
-   `retire_live()`. Second, criteria 1–5 are missing a category: the loop also *writes*
-   strategies, and "synthesize a valid genome for this domain and reject an invalid one"
-   is the single largest block of domain code there was. Call it criterion 6.
-
-   Still to do before this is real: deploy it. `./copy.sh --to`, commit
-   `/opt/master_agent`, then **delete `/opt/.integrity_baseline.json`** — adding files
-   makes that repo dirty, which halts live trading until the baseline is re-adopted. Take
-   the live strategy out of real money by hand first; the integrity halt clears
-   `live.flag` but deliberately leaves any open position for a human. Nothing under
-   `tools/` changed, so `/opt/tools`' HEAD does not move at all.
 3. Create a new benchmark domain domain with free, fast, unambiguous scoring
    and no money at all - a forecasting benchmark, say - for a day. Ensure that
    the population improves.  This will be done in a fresh new container.
