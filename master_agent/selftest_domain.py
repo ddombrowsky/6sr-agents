@@ -229,11 +229,29 @@ def _load_master_agent(baseline=None):
         label = commit[:12]
     spec = importlib.util.spec_from_file_location(f'ma_{label.replace("-", "_")}', path)
     mod = importlib.util.module_from_spec(spec)
+    # Section 4 ("the revision prompt, differentially") validates master-agent.py's
+    # SDEX-flavored prompt/facts against the pre-refactor baseline -- that check's
+    # validity has nothing to do with which domain this container currently has selected
+    # for live running. But domain.get()'s no-argument fallback reads domain.DOMAIN_NAME,
+    # a module constant fixed once at domain.py's own import time from the DOMAIN env var
+    # -- so on a container whose /opt/env.sh sets DOMAIN=forecast (this one, since
+    # FUTURE.md item 3), loading master-agent.py here resolves _DOMAIN to domain_forecast
+    # and CUR_MA._FACTS has no 'unrealized_haircut' key at all, which is exactly the
+    # KeyError that broke this on 2026-08-06 -- not from selftest.sh itself (which never
+    # sources env.sh) but from any invocation that did source it first, e.g. one modeled
+    # on once.sh's own ". env.sh" pattern. Force sdex for the load, regardless of the
+    # live environment, then restore -- this is a differential against a fixed baseline,
+    # not a check of whatever is currently selected.
+    import domain as _domain_module
+    _prior_domain_name = _domain_module.DOMAIN_NAME
+    _domain_module.DOMAIN_NAME = 'sdex'
     try:
         spec.loader.exec_module(mod)
     except Exception as e:
         skip(f'loading master-agent.py ({label})', f'{type(e).__name__}: {e}')
         return None
+    finally:
+        _domain_module.DOMAIN_NAME = _prior_domain_name
     return mod
 
 
