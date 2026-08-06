@@ -117,6 +117,29 @@
   {
     "type": "function",
     "function": {
+      "name": "backtest_forecast_strategy",
+      "description": "Replay a forecasting strategy over a fixed set of resolved questions and return trades, decide_source, mean_brier, mean_base_brier, beats_null and null_pct. Use it as your fitness check instead of guessing -- lower mean_brier is better, and beats_null is true only when your mean_brier is below mean_base_brier (0.25, the score of always guessing 0.5). Always check decide_source first: 'main.py:decide' means your code was replayed; anything else means the backtester could not import decide() from main.py and replayed the mechanical confidence_gain-only fallback instead -- in that case a top-level WARNING key is present and every number describes the fallback, not your code, so fix main.py's structure and re-run before trusting beats_null.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {
+            "type": "string",
+            "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"
+          },
+          "n": {
+            "type": "integer",
+            "description": "How many fixed historical questions to replay (default 2000). This set is unrelated to the live game's questions, so results are always comparable across runs."
+          }
+        },
+        "required": [
+          "strategy_path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "get_price_history",
       "description": "Return recent XLM/USD closing prices as a JSON list, oldest first, from real exchange candles (Kraken with a Coinbase fallback, cached and shared). Use when you want to look at the actual recent trend, volatility, or price range before choosing thresholds or indicator periods -- not the single spot price. Defaults to 720 hourly closes (~30 days).",
       "parameters": {

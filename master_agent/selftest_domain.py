@@ -31,9 +31,12 @@ docstrings and was never in question.
 
 Two assertions are not differential and are the most important ones anyway:
 
-  * the contract check over BOTH shipped domains, including domain_null, which has no
-    prices, no assets, no order book and no money. That is the only evidence available
-    today that the boundary can carry FUTURE.md's item 3 before item 3 is written.
+  * the contract check over every shipped domain -- sdex, null, and now forecast
+    (FUTURE.md item 3's real benchmark). domain_null has no prices, no assets, no order
+    book and no money; domain_forecast has all of that too, but is a REAL game (an
+    independently-judged Brier score against resolved questions) rather than null's
+    admittedly fake "trust a number the strategy wrote down" placeholder. This is the
+    evidence that the boundary generalizes, not just that it can be typed to.
   * driving monitor's real smoke-test harness with DOMAIN=null. Reading the loop is not
     enough to show that no sdex assumption leaked into it; running it is.
 
@@ -327,8 +330,9 @@ def _scratch(cfg):
 
 SDEX = domain.get('sdex')
 NULL = domain.get('null')
+FORECAST = domain.get('forecast')
 
-for mod in (SDEX, NULL):
+for mod in (SDEX, NULL, FORECAST):
     problems = domain.check(mod)
     check(f'{mod.NAME} satisfies the contract', not problems, '; '.join(problems))
 
@@ -341,8 +345,9 @@ check('the registry is cached', domain.get('sdex') is SDEX)
 # file would be testing one domain twice.
 _sdex_obs = SDEX.Observation(price=_PRICE, marks={'XLM': _PRICE})
 _null_obs = NULL.Observation(tick=0)
-check('the two domains have unrelated observation types',
-      type(_sdex_obs) is not type(_null_obs))
+_forecast_obs = FORECAST.Observation(tick=0)
+check('the three domains have pairwise-unrelated observation types',
+      len({type(_sdex_obs), type(_null_obs), type(_forecast_obs)}) == 3)
 
 # ============================================== 2. observation encode/decode round trip
 #
@@ -351,7 +356,8 @@ check('the two domains have unrelated observation types',
 # tweak -- which reads in the log as an ordinary cycle. That is the exact shape of the bug
 # that hid the dead revision layer for weeks.
 
-for label, mod, obs in (('sdex', SDEX, _sdex_obs), ('null', NULL, _null_obs)):
+for label, mod, obs in (('sdex', SDEX, _sdex_obs), ('null', NULL, _null_obs),
+                        ('forecast', FORECAST, _forecast_obs)):
     encoded = mod.encode_observation(obs)
     # A str is the whole requirement: monitor passes argv as a list, so no shell sees it
     # and spaces are harmless. What is NOT allowed is returning a dict or a tuple, which
