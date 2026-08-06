@@ -10,6 +10,7 @@ if [ "$1" = "--to" ] ; then
     cp -v ./master_agent/* ./v/master_agent/
     cp -v ./tools/* ./v/tools/
     cp -v ./template_repo/* ./v/template_repo/
+    rm -f ./scripts/env.sh
     cp -v ./scripts/*.sh ./v/
 else
     cp -v ./v/agents/* ./ 2>/dev/null

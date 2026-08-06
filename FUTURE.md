@@ -160,10 +160,10 @@ failure mode `TEMPLATE_SPAWNS_PER_CYCLE` exists to prevent within a single domai
    reference domain, `selftest_domain.py` is a differential test against the pre-refactor
    `monitor.py` in git — 414 checks, all passing. monitor.py went 2819 → 1313 lines.
 
-3. Create a new benchmark domain domain with free, fast, unambiguous scoring
+3. [DONE] Create a new benchmark domain domain with free, fast, unambiguous scoring
    and no money at all - a forecasting benchmark, say - for a day. Ensure that
    the population improves.  This will be done in a fresh new container.
 4. **Prediction markets as a new, second domain**, doing the plugin refactor with a second real
    example in hand.
-5. Market making (#2 above) whenever the queue-position backtest looks tractable.
+5. Market making (#2 "Stop Being A Taker" above) whenever the queue-position backtest looks tractable.
 
