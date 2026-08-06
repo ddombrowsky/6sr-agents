@@ -16,7 +16,8 @@ python3 monitor.py --ensure-recorder
 # comment this out to use ollama if you have any credits left
 export MASTER_AGENT_MODEL=granite
 
-python3 -u monitor.py > $LOG 2>&1 &
+date > $LOG
+python3 -u monitor.py >> $LOG 2>&1 &
 
 sleep 5
 
@@ -25,3 +26,6 @@ touch /opt/.monitor.py.exit
 echo Logging to $LOG
 echo waiting for exit...
 wait
+
+echo === Monitor Exited === >> $LOG
+date >> $LOG
