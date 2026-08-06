@@ -53,7 +53,7 @@ The reusable criterion. SDEX satisfies 1–4; almost nothing satisfies 5 today.
 
 ## Ranked ideas
 
-### 1. Mine the basis — cheapest, biggest signal-to-noise win
+### 1. [DONE] Mine the basis — cheapest, biggest signal-to-noise win
 
 `tools/basis.py` was written on 2026-08-03 and **nothing calls it**. Strategies decide on
 a CEX aggregate price (`price_feed.get_price()`) and execute on the Stellar DEX. That gap
@@ -163,7 +163,9 @@ failure mode `TEMPLATE_SPAWNS_PER_CYCLE` exists to prevent within a single domai
 3. [DONE] Create a new benchmark domain domain with free, fast, unambiguous scoring
    and no money at all - a forecasting benchmark, say - for a day. Ensure that
    the population improves.  This will be done in a fresh new container.
-4. **Prediction markets as a new, second domain**, doing the plugin refactor with a second real
-   example in hand.
+
+4. **Prediction markets as a new domain**.  Use the kalshi public API to get
+   real prediction markets.  See "#3. Prediction markets (Kalshi or Polymarket)" above.
+
 5. Market making (#2 "Stop Being A Taker" above) whenever the queue-position backtest looks tractable.
 
