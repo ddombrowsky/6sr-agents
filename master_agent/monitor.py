@@ -380,7 +380,11 @@ def main_py_is_sane(strategy_dir, name, obs, *, baseline_source=None):
 
         # DOMAIN.SMOKE_ENV makes the no-live-trading guarantee structural rather than
         # relying on having remembered to drop live.flag from the copy.
-        env = dict(os.environ, **DOMAIN.SMOKE_ENV)
+        env = dict(
+            os.environ,
+            **DOMAIN.SMOKE_ENV,
+            PYTHONPATH=os.pathsep.join(filter(None, ['/opt/tools', os.environ.get('PYTHONPATH')]))
+        )
         # Not 'python3' -- the same bug as _check_revision_interpreter. This must be the
         # interpreter strat_manager will really start this main.py under, which is why it
         # calls that resolution rather than reimplementing it or just using sys.executable:
@@ -438,6 +442,7 @@ def revert_main_py(strategy_dir, before_head, name):
     Reverts to the commit the clone started at rather than HEAD, since the model may
     have already committed the broken main.py onto its own branch.
     """
+    _git(strategy_dir, 'stash', 'push', '--', 'main.py')
     r = _git(strategy_dir, 'checkout', before_head, '--', 'main.py')
     if r.returncode != 0:
         print(f'Could not restore main.py for {name}: {r.stderr.strip()}')
