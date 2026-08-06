@@ -1607,6 +1607,7 @@ def revert_main_py(strategy_dir, before_head, name):
     Reverts to the commit the clone started at rather than HEAD, since the model may
     have already committed the broken main.py onto its own branch.
     """
+    _git(strategy_dir, 'stash', 'push', '--', 'main.py')
     r = _git(strategy_dir, 'checkout', before_head, '--', 'main.py')
     if r.returncode != 0:
         print(f'Could not restore main.py for {name}: {r.stderr.strip()}')
