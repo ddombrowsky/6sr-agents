@@ -230,8 +230,12 @@ def repair_config(cfg_path, name, obs):
     except (TypeError, ValueError):
         confidence = None
     if confidence is None or not 0.5 <= confidence <= 1.0:
+        # `old` captured before the assignment, or the message reports the repaired value
+        # as though it were the defect -- which is how you get a log line reading
+        # "confidence 0.6 -> 0.6".
+        old = cfg.get('confidence')
         cfg['confidence'] = 0.6
-        repairs.append(f'confidence {cfg.get("confidence")!r} -> 0.6 (outside [0.5, 1.0])')
+        repairs.append(f'confidence {old!r} -> 0.6 (outside [0.5, 1.0])')
     if not repairs:
         return []
     json.dump(cfg, open(cfg_path, 'w'), indent=2)
