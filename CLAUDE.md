@@ -76,8 +76,17 @@ Everything that *is* about a specific way of making money sits behind one module
   promotion gates, the real-money caps.
 - `master_agent/domain_null.py` — a coin-flip forecasting game with no prices and no
   money. Selected with `DOMAIN=null`. It exists to prove the contract carries a domain
-  that has none of sdex's furniture, and is the skeleton for the benchmark domain in
-  FUTURE.md's plan.
+  that has none of sdex's furniture, and was the skeleton for the real benchmark domain
+  below.
+- `master_agent/domain_forecast.py` — the benchmark domain FUTURE.md item 3 asked for:
+  free, fast, no money, and *actually* scored (unlike `domain_null`, where a strategy
+  just writes a number into its own `state.json` and nothing checks it). Selected with
+  `DOMAIN=forecast`; the mechanics (question generation, resolution, Brier scoring) live
+  in `tools/forecast_engine.py`, with `tools/forecast_backtest.py` as its offline replay
+  and `template_repo_forecast` as its clone source. See `v/CLAUDE.md` for the detail —
+  this is a new module, not `domain_null.py` edited in place, because
+  `selftest_domain.py`'s differential tests pin `domain_null.py`'s exact behaviour as the
+  minimal contract-conformance reference.
 - `master_agent/selftest_domain.py` — run this after touching any of the above. It loads
   the pre-refactor `monitor.py` out of git and requires the new domain members to give the
   same answers, so a behaviour change cannot pass unnoticed.
