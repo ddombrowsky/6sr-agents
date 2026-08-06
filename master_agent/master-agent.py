@@ -11,45 +11,21 @@ from pathlib import Path
 import httpx
 from ollama import Client, ResponseError
 
-import score
+import domain
 import sr_agent_tools
 
-def _friction_facts():
-    """(xlm_round_trip_bp, nonbase_floor_bp) for the revision prompt, or a safe default.
-
-    Interpolated rather than written as literals, for exactly the reason
-    score.UNREALIZED_HAIRCUT is: the prompt claimed 0.999 for weeks while score.py
-    enforced 0.899, so the model was optimizing an objective it was not ranked on. A
-    cost the prompt states and the code does not charge is the same bug.
-    """
-    try:
-        sys.path.append('/opt/tools')
-        import friction
-        return friction.round_trip_bp('XLM'), round(friction.NONBASE_FLOOR * 2 * 10000, 1)
-    except Exception:
-        return 12.0, 100.0
-
-
-_XLM_RT_BP, _NONBASE_RT_BP = _friction_facts()
-
-
-def _live_caps():
-    """(max_trade_usd, max_trade_usd_nonbase) from stellar_trader, for the prompt.
-
-    Interpolated for the same reason the friction facts are: these two numbers decide how
-    much of a strategy's configured trade size can actually reach the network, they are
-    edited by hand in stellar_trader.py, and a prompt that restates them goes stale
-    silently. The fallbacks are only so a revision still runs if /opt/tools is unreadable.
-    """
-    try:
-        sys.path.append('/opt/tools')
-        import stellar_trader
-        return stellar_trader.MAX_TRADE_USD, stellar_trader.MAX_TRADE_USD_NONBASE
-    except Exception:
-        return 4.0, 0.50
-
-
-_MAX_TRADE_USD, _MAX_TRADE_USD_NONBASE = _live_caps()
+# Which game this process is revising strategies for, and every number about it that the
+# prompt below states. Read live out of the modules that enforce them (score.py's haircut,
+# friction.py's round-trip cost, stellar_trader.py's caps) rather than written here as
+# literals: the prompt claimed the haircut was 0.999 for weeks while score.py enforced
+# 0.899, so the model was optimizing an objective it was not ranked on, and a cost the
+# prompt states while the code charges something else is the same bug. See
+# domain_sdex.prompt_facts, which keeps the same per-source fallbacks this file used to
+# carry inline so a /opt/tools outage degrades the prompt instead of killing the process.
+#
+# Resolved at import, once, so REVISION_SYSTEM_PROMPT is still a module-level string.
+_DOMAIN = domain.get()
+_FACTS = _DOMAIN.prompt_facts()
 
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
@@ -101,10 +77,15 @@ REQUIREMENTS_PATH = os.environ.get('REQUIREMENTS_PATH', '/opt/agents/requirement
 # `revise-strategy`. `refine` is a clone of a leader: improve on a parent with a real
 # record. `explore` is a fresh template spawn with no meaningful parent, asked for
 # something structurally different from what the population already runs.
-# Duplicated in monitor.py -- this file's name has a hyphen so it cannot be imported,
-# and this module does not import monitor.py. Keep the two pairs in sync.
-ROLE_REFINE = 'refine'
-ROLE_EXPLORE = 'explore'
+#
+# These used to be hand-duplicated here and in monitor.py, with a comment asking whoever
+# read it to keep the two pairs in sync -- because this file's name has a hyphen and
+# cannot be imported, so there was nowhere shared to put them. domain.py can be imported
+# by both, so there is now exactly one definition. Keeping two copies of a constant in
+# sync by comment is how the prompt's haircut ended up two orders of magnitude away from
+# the one score.py enforced.
+ROLE_REFINE = domain.ROLE_REFINE
+ROLE_EXPLORE = domain.ROLE_EXPLORE
 
 # How many distinct main.py variants _population_census describes to an explore spawn.
 CENSUS_CLUSTERS = 6
@@ -370,7 +351,15 @@ def _handle_model_command(user_input: str) -> bool:
     return True
 
 
-REVISION_SYSTEM_PROMPT = (
+# A function, not a bare module-level literal, for the same reason
+# _build_forecast_revision_system_prompt() below is one: this reads _FACTS[...] keys
+# that only domain_sdex.prompt_facts() provides, and _FACTS is whatever domain is
+# ACTUALLY active. Deferred so it is only ever called for the sdex path (see the
+# if/else at the bottom of this block) -- the text itself is untouched, character for
+# character, from before this domain-conditional swap existed. That untouched string is
+# what _refine_prompt's docstring means by "the control arm".
+def _build_sdex_revision_system_prompt():
+    return (
     'You are the strategy-revision agent for an evolutionary XLM paper-trading system. '
     'Each cycle monitor.py creates a small batch of new strategies -- clones of the best '
     'current performers, plus one pulled fresh from the template -- and hands each of '
@@ -399,8 +388,8 @@ REVISION_SYSTEM_PROMPT = (
     # time while score.py actually enforced 0.899, so the model was optimizing a
     # different objective than the one it was ranked on.
     f'You are scored on net worth: `balance_usd + balance_xlm * price * '
-    f'{score.UNREALIZED_HAIRCUT}` (see /opt/master_agent/score.py). The '
-    f'{(1 - score.UNREALIZED_HAIRCUT) * 100:.1f}% haircut on the XLM leg is only a '
+    f'{_FACTS["unrealized_haircut"]}` (see /opt/master_agent/score.py). The '
+    f'{(1 - _FACTS["unrealized_haircut"]) * 100:.1f}% haircut on the XLM leg is only a '
     'tie-break nudge toward realizing gains -- it is not worth distorting the strategy for. '
     'Growing net worth is the entire objective; sitting in cash and never trading '
     'scores exactly the starting balance and gets you nowhere.\n\n'
@@ -410,8 +399,9 @@ REVISION_SYSTEM_PROMPT = (
     # trading cost anything, because it did not.
     'TRADING COSTS MONEY. Every fill crosses the order book: a buy lifts the ask, a '
     f'sell hits the bid. Right now a full buy-then-sell round trip in XLM costs about '
-    f'{_XLM_RT_BP} basis points, and in a discovered non-XLM asset it is far worse -- '
-    f'assume at least {_NONBASE_RT_BP} bp and check, because measured books on AQUA and '
+    f'{_FACTS["xlm_round_trip_bp"]} basis points, and in a discovered non-XLM asset it is '
+    f'far worse -- assume at least {_FACTS["nonbase_round_trip_bp"]} bp and check, because '
+    'measured books on AQUA and '
     'ARS were 151 and 186 bp. This is charged for real: trade_logger.execute_trade fills '
     'you at the adjusted price and backtest_strategy replays it the same way, so it is '
     'already inside every number you are judged on. The consequences you must design '
@@ -555,7 +545,8 @@ REVISION_SYSTEM_PROMPT = (
     'monitor has opened a trustline for that asset at promotion, and only while the asset '
     'stays admitted. Any of those missing and the leg is paper-only, which is the normal '
     f'case: only one strategy is live at a time. Real non-XLM orders are clamped to '
-    f'${_MAX_TRADE_USD_NONBASE:.2f} per trade against ${_MAX_TRADE_USD:.2f} for XLM, so '
+    f'${_FACTS["max_trade_usd_nonbase"]:.2f} per trade against '
+    f'${_FACTS["max_trade_usd"]:.2f} for XLM, so '
     'an extra leg\'s real size is a small fraction of what config.json asks for however '
     'you size it. Design for the paper book, and never build a strategy whose thesis '
     'depends on any single real fill landing.\n\n'
@@ -712,7 +703,142 @@ REVISION_SYSTEM_PROMPT = (
     'not your revision, so re-run it rather than quoting it.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
-)
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Domain-conditional prompt/tool swap for the forecast domain (FUTURE.md item 3).
+#
+# The system prompt above -- and 15 of the 20 tools registered further up (TOOLS/
+# TOOL_SCHEMAS) -- are hardcoded to sdex: XLM, order books, trade_logger, basis, assets.
+# None of that exists in domain_forecast.py's game, and handing the revision model those
+# tools/instructions unchanged would mean every forecast-domain revision gets sdex-
+# flavored guidance and mostly fails its smoke test, falling back to mechanical
+# tweak_config jitter -- exercising evolution but never real LLM reasoning about the new
+# domain. domain.py itself defers a general `domain.llm_tools()` seam to later (see its
+# "what is deliberately not here" section); this is the minimal, contained version of
+# that for exactly the one new domain that exists today -- a branch, not a plugin system.
+#
+# The sdex text above is untouched by this: REVISION_SYSTEM_PROMPT is only reassigned
+# below, never edited in place, so a run with DOMAIN=sdex (or unset) gets the exact same
+# prompt object it always has -- the "control arm" _refine_prompt's docstring describes.
+# --------------------------------------------------------------------------------------
+
+_GENERIC_TOOL_NAMES = frozenset((
+    'backtest_forecast_strategy', 'calculate', 'get_current_time', 'get_uptime',
+    'read_file', 'write_file', 'fetch_url', 'install_package', 'update_package_list',
+    'exec',
+))
+
+if _DOMAIN.NAME == 'forecast':
+    TOOLS = {name: fn for name, fn in TOOLS.items() if name in _GENERIC_TOOL_NAMES}
+    TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _GENERIC_TOOL_NAMES]
+
+# A function, not a module-level literal, and deliberately: _FACTS above is built from
+# whatever domain is ACTUALLY active (domain.get()'s result), so on a default/sdex run
+# _FACTS has no 'starting_score'/'score_scale'/'null_baseline' keys at all -- evaluating
+# an f-string that reads them at module-import time would raise KeyError and break
+# master-agent.py outright for the domain everything currently runs. Deferring the
+# f-string evaluation into a function called only inside the `if _DOMAIN.NAME ==
+# 'forecast':` guard below keeps this file importable (and the sdex path untouched) no
+# matter which domain is active.
+def _build_forecast_revision_system_prompt():
+    return (
+    'You are the strategy-revision agent for an evolutionary forecasting-benchmark '
+    'system (FUTURE.md item 3: a free, fast, unambiguously-scored domain with no money '
+    'at all -- a research harness for the evolutionary loop itself, not a trading '
+    'system). Each cycle monitor.py creates a small batch of new strategies -- clones of '
+    'the best current performers, plus one pulled fresh from the template -- and hands '
+    'each of them to you before it starts. The user message tells you which job you have '
+    'for this one: `refine` (improve on a parent with a real track record) or `explore` '
+    '(a fresh template strategy with no meaningful parent, where the job is to try '
+    'something the population is not already doing). Everything below applies to both. '
+    "You have full read/write/exec access to the strategy's directory and may change "
+    "anything about it: config.json, main.py's forecasting logic, or add new files "
+    "entirely.\n\n"
+    'THE GAME. Every 30 seconds the strategy is handed `questions_per_tick` questions '
+    '(a config.json knob). Each question gives you exactly one number, `feature`, in '
+    '[0, 1] -- a noisy but genuinely informative signal correlated with a hidden true '
+    'probability. Your job is to answer with `p_hat`, your own calibrated probability '
+    'estimate in [0, 1] that the question resolves True. You never see the true '
+    'probability or the outcome -- there would be nothing left to forecast if you did -- '
+    'and the answer is scored by /opt/tools/forecast_engine.py, independently of '
+    'anything this strategy claims about itself.\n\n'
+    "main.py's top-level `decide(feature, history, state, config)` is what "
+    '`backtest_forecast_strategy` replays and what `beats_null` is measured on -- keep '
+    'that exact signature even if the body changes completely. `history` is this '
+    "strategy's own past features, oldest first (not past outcomes -- it never learns "
+    'those). The template default is linear calibration: `p_hat = clip(0.5 + '
+    "confidence_gain * (feature - 0.5), 0, 1)`, with `confidence_gain` read from "
+    "config.json. Freely rewrite decide() -- that is the actual strategy. Do NOT call "
+    "forecast_engine.submit_forecast yourself or touch state.json's running tally "
+    "directly; main()'s tick loop already does both, and duplicating or bypassing it "
+    'only desyncs the tally from what actually got scored.\n\n'
+    f'You are scored on accumulated skill: '
+    f'{_FACTS["starting_score"]:.0f} + {_FACTS["score_scale"]:.0f} * sum(base_brier - '
+    f'brier) over every resolved forecast, summed rather than averaged so volume '
+    f'compounds -- more good calls ranks higher than fewer good calls at the same '
+    f'accuracy. {_FACTS["null_baseline"]} Growing that sum is the entire objective; a '
+    'strategy that ignores `feature` and always answers 0.5 scores exactly the starting '
+    'value and gets you nowhere, the same way sitting in cash forever would in a trading '
+    'domain.\n\n'
+    'You can and should test a revision before committing it. '
+    '`backtest_forecast_strategy(strategy_path)` replays the strategy over a fixed set '
+    'of already-resolved questions and returns trades, decide_source, mean_brier, '
+    'mean_base_brier, beats_null and null_pct in a fraction of a second -- use it as '
+    'your fitness check instead of guessing, and iterate until the numbers improve.\n'
+    '  * CHECK `decide_source` FIRST, before you read any other field. The backtester '
+    'only replays your logic if main.py exposes a top-level '
+    '`decide(feature, history, state, config)` returning a plain float, AND main.py\'s '
+    "top level contains nothing but imports, assignments, defs, the docstring and an "
+    "`if __name__ == '__main__'` guard (a bare `sys.path.append(...)` call, a top-level "
+    "print, an `if`/`with` or the tick loop itself all disqualify it -- write `sys.path "
+    "= sys.path + ['/opt/tools']` as an assignment instead). If it cannot, decide_source "
+    "comes back as something other than 'main.py:decide', a WARNING key is present, and "
+    'every number in the result describes the mechanical confidence_gain-only fallback '
+    "rather than your code. Fix the structure and re-run until decide_source is "
+    "'main.py:decide'; a revision that never reaches its own fitness check has not been "
+    'tested at all.\n'
+    "  * Once decide_source is 'main.py:decide', treat `beats_null: false` (mean_brier "
+    ">= mean_base_brier) as a failed revision and try something else -- a strategy that "
+    "cannot beat guessing 0.5 is not worth starting.\n"
+    '  * The fixed question set used here is unrelated to the live game\'s actual '
+    'questions (different seed, see forecast_engine.py\'s docstring), so results are '
+    'always comparable across runs and across strategies -- there is no equivalent of '
+    "sdex's \"only 12 hours of recorded basis history\" caveat to worry about here.\n\n"
+    'You are free to invent config.json knobs beyond confidence_gain -- a nonlinearity, '
+    'a confidence threshold below which you hedge toward 0.5, a per-tick ensemble of '
+    'rules, or something else entirely. ALWAYS read a key you add as '
+    '`config.get("your_key", <sensible default>)`, never `config["your_key"]`: a '
+    'main.py that raises KeyError on its first tick fails the smoke test and is '
+    'reverted. Do not rename, repurpose or drop `name`, `schema_version`, '
+    '`questions_per_tick` or `confidence_gain` -- monitor and the shared tally in '
+    'state.json read those; add alongside them.\n\n'
+    'When you are done, commit your changes on a new git branch inside the '
+    "strategy's own directory (`git checkout -b auto/<timestamp>` then `git add -A "
+    '&& git commit -m ...`) so the revision is tracked.\n\n'
+    # Same incident, same fix, same domain-agnostic reason it sits last -- see the sdex
+    # prompt above for the measured counts this addresses.
+    'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
+    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
+    'nothing: pasting the new config.json into your answer does not write it, quoting a '
+    'main.py diff does not apply it, and a `git commit` line inside a code fence does '
+    'not run. monitor.py reads the directory, never your summary, and a revision that '
+    'left the files untouched is discarded and replaced with a mechanical threshold '
+    'nudge: the slot is spent and your analysis is lost. So before you write your final '
+    'reply, `read_file` every path you claim to have changed and confirm the new content '
+    'is really on disk. And check the order you did things in -- a '
+    '`backtest_forecast_strategy` result from before you wrote the file describes the '
+    'old code, not your revision, so re-run it rather than quoting it.\n\n'
+    'Finish by replying with a short summary of the changes you have already written to '
+    'disk, and why.'
+    )
+
+
+if _DOMAIN.NAME == 'forecast':
+    REVISION_SYSTEM_PROMPT = _build_forecast_revision_system_prompt()
+else:
+    REVISION_SYSTEM_PROMPT = _build_sdex_revision_system_prompt()
 
 
 def _read_json(path, default=None):
@@ -1099,8 +1225,93 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
     )
 
 
+def _refine_prompt_forecast(strategy_name, parent_name, strategy_path, parent_score,
+                            leaderboard, tick_line) -> str:
+    """The forecast domain's clone case. Parallel to _refine_prompt, minus every
+    concept (price, trade_amount_usd, assets) that has no forecast-domain meaning."""
+    parent_path = STRATEGIES_DIR / parent_name
+    parent_config = _read_json(parent_path / 'config.json', {})
+    parent_state = _read_json(parent_path / 'state.json', {})
+    forecast_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
+    clone_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
+        f'`{strategy_path}` (a git checkout of the strategy code). It has not made a '
+        f'forecast yet.\n\n'
+        f'{tick_line}'
+        f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
+        f"Parent `{parent_name}`'s current state.json (forecasts_made/brier_sum/"
+        f"base_brier_sum -- a running tally, lower brier_sum per forecast is better): "
+        f"{json.dumps(parent_state)}\n"
+        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
+        f"Parent `{parent_name}`'s most recent resolved forecasts:\n{forecast_tail}\n\n"
+        f"The clone's main.py (identical to the parent's right now -- this is what you'd "
+        f"edit to change forecasting logic, not just config.json):\n"
+        f"```python\n{clone_main_py}\n```\n\n"
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
+        f'Revise the clone at `{strategy_path}` however you think will improve on its '
+        f'parent, then commit your changes to a new git branch inside that directory.'
+    )
+
+
+def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_line) -> str:
+    """The forecast domain's template-spawn case. Parallel to _explore_prompt.
+
+    Omits _population_census() on purpose: that census (main.py clustering, unused
+    SIGNAL_MODULES, custom config-key counts) is sdex-specific machinery built around a
+    population that has had months to accumulate variety. This domain has one real knob
+    so far (confidence_gain) -- not enough population diversity yet to make a census
+    worth the tokens. Worth adding if/when this domain accumulates its own varied
+    population, not before (see FUTURE.md's own rule about building abstractions against
+    one example).
+    """
+    own_config = _read_json(strategy_path / 'config.json', {})
+    own_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
+        f'unmodified checkout of /opt/template_repo_forecast -- NOT a clone of any '
+        f'existing strategy. It has no parent, no forecast history and no track record, '
+        f'so there is nothing here to improve on. Your job this time is EXPLORATION: '
+        f'give the population a strategy that is structurally different from what it '
+        f'already runs.\n\n'
+        f'{tick_line}'
+        f'Its config.json right now: {json.dumps(own_config)}\n'
+        f'monitor.py checks the config you leave behind: `name` must still be exactly '
+        f'"{strategy_name}", `questions_per_tick` must be a positive integer (at most '
+        f'{_FACTS["max_questions_per_tick"]}), and `confidence_gain` must be in '
+        f'[0, {_FACTS["max_confidence_gain"]}]. Even if your logic does not use '
+        f'a plain linear gain at all, you must still leave those two knobs in range -- '
+        f'otherwise monitor repairs them back to safe defaults.\n\n'
+        f'CONFIG.JSON IS YOURS TO EXTEND beyond those two required keys -- nothing here '
+        f'validates it against a schema, and the entire config dict is handed to your '
+        f'`decide(feature, history, state, config)` unchanged, in live running and '
+        f'inside backtest_forecast_strategy alike. A nonlinearity\'s shape, a confidence '
+        f'threshold below which you hedge toward 0.5, an ensemble weight -- whatever '
+        f'your logic needs belongs in config.json under a name that says what it means, '
+        f'not hardcoded in main.py. Two rules:\n'
+        f'  * ALWAYS read your own keys as `config.get("your_key", <sensible '
+        f'default>)`, never `config["your_key"]`. A main.py that raises KeyError on its '
+        f'first tick fails the smoke test and is reverted.\n'
+        f'  * Do not rename, repurpose or drop `name`, `schema_version`, '
+        f'`questions_per_tick` or `confidence_gain` -- monitor and the shared tally in '
+        f'state.json read those. Add alongside them.\n\n'
+        f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
+        f'proven code, so you are free to restructure it):\n'
+        f'```python\n{own_main_py}\n```\n\n'
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running): {json.dumps(leaderboard)}\n\n'
+        f'Whatever you write, a top-level `decide()` must remain importable '
+        f'(backtest_forecast_strategy must report decide_source "main.py:decide", not '
+        f'anything else) and beats_null must come back true -- for a strategy with no '
+        f'track record that is the entire acceptance test, so run '
+        f'backtest_forecast_strategy and iterate until it passes.\n\n'
+        f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
+    )
+
+
 def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
-                     leaderboard_json: str = '{}', current_price: str = '',
+                     leaderboard_json: str = '{}', observation: str = '',
                      role: str = ROLE_REFINE) -> None:
     """One-shot entry point invoked by monitor.py's provisioning stage.
 
@@ -1114,6 +1325,13 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     trailing positional rather than a flag because __main__ below is a bare
     `revise_strategy(*sys.argv[2:])` splat, so a defaulted positional keeps a hand-typed
     five-argument invocation working with no change there.
+
+    `observation` is whatever the domain knew at the top of the cycle, encoded as one argv
+    token by monitor.py (see domain.py). For sdex that is still literally `str(price)`, so
+    a hand-typed `... <score> <leaderboard> 0.1666` keeps working exactly as before; an
+    empty string means monitor could not observe anything this cycle, which the prompt has
+    a branch for. Decoding is the domain's job so a domain with a structured observation
+    needs no change to this argv contract.
     """
     strategy_path = STRATEGIES_DIR / strategy_name
     if role not in (ROLE_REFINE, ROLE_EXPLORE):
@@ -1131,15 +1349,19 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     except Exception:
         leaderboard = {}
 
-    price_line = (
-        f'Current XLM/USD price (fetched from CoinGecko by monitor.py moments ago, '
-        f'this is ground truth -- not a historical or typical price): ${current_price}\n'
-        if current_price else
-        'Current XLM/USD price: NOT PROVIDED for this cycle -- fetch it yourself '
-        '(exec curl, or /opt/tools/price_feed.py) before setting any thresholds.\n'
-    )
+    # How the observation is stated to the model is the domain's wording: for sdex it is
+    # the "this is ground truth, not a historical price" framing that stops the model
+    # anchoring on a price out of its training data.
+    price_line = _DOMAIN.observation_line(_DOMAIN.decode_observation(observation))
 
-    if role == ROLE_EXPLORE:
+    if _DOMAIN.NAME == 'forecast':
+        if role == ROLE_EXPLORE:
+            prompt = _explore_prompt_forecast(strategy_name, strategy_path, leaderboard,
+                                              price_line)
+        else:
+            prompt = _refine_prompt_forecast(strategy_name, parent_name, strategy_path,
+                                             parent_score, leaderboard, price_line)
+    elif role == ROLE_EXPLORE:
         prompt = _explore_prompt(strategy_name, strategy_path, leaderboard, price_line)
     else:
         prompt = _refine_prompt(strategy_name, parent_name, strategy_path, parent_score,

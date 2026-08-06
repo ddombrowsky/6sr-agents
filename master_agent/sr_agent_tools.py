@@ -168,6 +168,33 @@ def get_price_history(hours: int = 720, interval: int = 60) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def backtest_forecast_strategy(strategy_path: str, n: int = 2000) -> str:
+    """Replay a forecasting strategy over a fixed set of resolved questions.
+
+    The forecast-domain analogue of backtest_strategy: same role (a real fitness check
+    to iterate against before committing a revision), different domain -- there is no
+    price here, only a per-question `feature` and a Brier score against the outcome.
+    Imported lazily for the same reason backtest_strategy is: a broken/missing
+    /opt/tools module must never stop the agent from starting.
+    """
+    try:
+        from forecast_backtest import replay
+        result = replay(strategy_path, n=int(n))
+        if isinstance(result, dict) and result.get('decide_source') not in (None, 'main.py:decide'):
+            result['WARNING'] = (
+                f"decide_source is {result.get('decide_source')!r}: the backtester could "
+                f"NOT import decide() from main.py, so every number here describes the "
+                f"mechanical confidence_gain-only fallback, NOT this strategy's code. "
+                f"Fix the structure first: main.py's top level may contain only imports, "
+                f"assignments, defs, the docstring and an `if __name__ == '__main__'` "
+                f"guard, with the logic in a top-level "
+                f"decide(feature, history, state, config). Then re-run this tool and "
+                f"check that decide_source is 'main.py:decide' before trusting any result.")
+        return json.dumps(result)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 def get_news_sentiment(asset: str = 'XLM', limit: int = 10) -> str:
     """Current headlines and their keyword sentiment score, as JSON."""
     try:
@@ -338,6 +365,7 @@ TOOLS = {
     'get_asset_price': get_asset_price,
     'get_asset_price_history': get_asset_price_history,
     'backtest_strategy': backtest_strategy,
+    'backtest_forecast_strategy': backtest_forecast_strategy,
     'get_price_history': get_price_history,
     'calculate': calculate,
     'get_current_time': get_current_time,
