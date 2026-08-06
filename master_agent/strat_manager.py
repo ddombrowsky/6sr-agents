@@ -251,7 +251,13 @@ def start_strategy(name, command=None):
     # discarding its output would make live-trade failures permanently invisible.
     log_path = TRADES_DIR / f'{name}.run.log'
     log_file = open(log_path, 'a')
-    proc = subprocess.Popen(cmd, cwd=str(strategy_path), stdout=log_file, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+    env = dict(
+        os.environ,
+        PYTHONPATH=os.pathsep.join(filter(None, ['/opt/tools', os.environ.get('PYTHONPATH')]))
+    )
+    proc = subprocess.Popen(cmd, cwd=str(strategy_path),
+                            stdout=log_file, stderr=subprocess.STDOUT,
+                            preexec_fn=os.setsid, env=env)
     state[name]['pid'] = proc.pid
     state[name]['status'] = 'running'
     save_state(state)

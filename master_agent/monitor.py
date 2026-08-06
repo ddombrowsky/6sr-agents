@@ -1513,7 +1513,11 @@ def main_py_is_sane(strategy_dir, name, price, marks=None, *, baseline_source=No
 
         # PAPER_ONLY makes the no-live-trading guarantee structural rather than relying
         # on having remembered to drop live.flag from the copy.
-        env = dict(os.environ, PAPER_ONLY='1')
+        env = dict(
+            os.environ,
+            PAPER_ONLY='1',
+            PYTHONPATH=os.pathsep.join(filter(None, ['/opt/tools', os.environ.get('PYTHONPATH')]))
+        )
         # Not 'python3' -- the same bug as _check_revision_interpreter. This must be the
         # interpreter strat_manager will really start this main.py under, which is why it
         # calls that resolution rather than reimplementing it or just using sys.executable:
