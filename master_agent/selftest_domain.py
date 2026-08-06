@@ -2,17 +2,28 @@
 """Standalone self-test for the domain boundary. Proves the refactor was inert.
 
 There is no test runner in this repo (no pytest, no CI), so this is a plain script, the
-same shape as tools/selftest_portfolio.py:
+same shape as tools/selftest_portfolio.py.
 
-    /opt/agents/venv/bin/python /opt/master_agent/selftest_domain.py
+RUN IT IN THE CONTAINER, via the wrapper that sets the environment up correctly:
+
+    docker exec <container> /opt/selftest.sh
 
 Exits 0 and prints a pass count, or exits 1 listing every failure.
+
+Do not run it straight out of the host checkout. It will work -- nothing here needs /opt to
+import, which is why domain_sdex imports strat_manager lazily -- but without /opt/tools a
+dozen paths take their degraded branch (`_tools()` returns None, replay and importability
+cannot be consulted, the seeded band falls back to a constant instead of being picked from
+real candles), so the run is much weaker than its pass count suggests. It prints which mode
+it ran in. /opt/selftest.sh also isolates the tool caches so the run cannot dirty a repo
+that check_boundary_integrity halts live trading on, and checks the container's own health
+on the way past.
 
 WHAT MAKES THIS WORTH TRUSTING
 ==============================
 The pre-refactor implementation is still in git, and it is import-clean behind its
-`__main__` guard. So the strong assertions here are DIFFERENTIAL: load monitor.py as it
-was at BASELINE_COMMIT, run the old function and the new domain member over the same
+`__main__` guard. So the strong assertions here are DIFFERENTIAL: load the last monitor.py
+that predates the refactor, run the old function and the new domain member over the same
 inputs, and require the same answer. That is a far better oracle than expected values
 written by hand, because the thing being protected is "no decision changed", not "the
 gates are correct" -- the gates' correctness is already argued at length in their

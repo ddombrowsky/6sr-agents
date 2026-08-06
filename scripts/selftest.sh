@@ -67,7 +67,8 @@ WATCHED="$OPT/tools $MA"
 
 if [ ! -d "$MA" ]; then
     echo "$MA does not exist -- this script runs INSIDE the container." >&2
-    echo "From the host, use ./run-selftest-in-container.sh instead." >&2
+    echo "From the host: ./copy.sh --to, then" >&2
+    echo "  docker exec \$(cat .containername) /opt/selftest.sh" >&2
     exit 1
 fi
 if [ ! -f "$MA/selftest_domain.py" ]; then

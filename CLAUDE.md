@@ -82,39 +82,39 @@ Everything that *is* about a specific way of making money sits behind one module
   the pre-refactor `monitor.py` out of git and requires the new domain members to give the
   same answers, so a behaviour change cannot pass unnoticed.
 
-Three ways to run it, in increasing fidelity:
+**Run it in the container**, against the deployed code:
 
 ```
-python3 master_agent/selftest_domain.py           # host. /opt/tools is absent, so a dozen
-                                                  # paths take their degraded branch
-./run-selftest-in-container.sh                    # pre-deploy: tests THIS working tree
-                                                  # inside the container. Deploys nothing.
-docker exec $(cat .containername) /opt/selftest.sh # post-deploy: tests what is deployed,
-                                                  # and checks the container's health
+./copy.sh --to
+docker exec $(cat .containername) /opt/selftest.sh
 ```
 
-Prefer a container run before letting a cycle go — only there do the real order books, the
-recorded basis distribution, `regime.suggest_bands`' band grid and the live population get
-exercised. `scripts/selftest.sh` (deployed to `/opt/selftest.sh`) additionally checks three
-environmental faults that are invisible until they cost an emperor window: an interpreter
-that cannot `import ollama`, a watched repo that is already dirty, and — the common one on
-a fresh container — a **missing `.gitignore` in `/opt/tools` or `/opt/master_agent`**. Both
-directions of `copy.sh` use `cp dir/*`, which does not match dotfiles, so those files never
-sync; without them the first cache write or `__pycache__` leaves an untracked file and the
-next cycle prints `LIVE TRADING HALTED`. The script prints the exact fix and deliberately
-does not apply it — a self-test that edits the real-money boundary is not a self-test.
+`scripts/selftest.sh` is the deployed entry point (`copy.sh --to` puts it at
+`/opt/selftest.sh`, beside `once.sh` and `st.sh`). The container is the only place worth
+trusting the result: only there do the real order books, the recorded basis distribution,
+`regime.suggest_bands`' band grid and the live population get exercised. On a host with no
+`/opt/tools`, a dozen paths quietly take their degraded branch and the run proves much less.
 
-Both container scripts copy `/opt/tools` to a scratch path first on `PYTHONPATH` and set
-`PYTHONDONTWRITEBYTECODE`, so running the test cannot itself dirty a watched repo, and both
-diff the watched repos before against after to prove it. Logs: `selftest-logs/` on the host
-(gitignored) and `/opt/emperor_logs/selftest-<stamp>.log` in the container.
+It checks the container as well as the refactor — three environmental faults that stay
+invisible until they cost an emperor window: an interpreter that cannot `import ollama`, a
+watched repo that is already dirty, and, the common one on a fresh container, a **missing
+`.gitignore` in `/opt/tools` or `/opt/master_agent`**. Both directions of `copy.sh` use
+`cp dir/*`, which does not match dotfiles, so those files never sync; without them the first
+cache write or `__pycache__` leaves an untracked file and the next cycle prints `LIVE
+TRADING HALTED`. The script prints the exact fix and deliberately does not apply it — a
+self-test that edits the real-money boundary is not a self-test.
 
-The baseline is found by content, not configured: the self-test searches each candidate
-repo's `monitor.py` history for the last commit that still defined `_config_is_sane`,
-`fetch_marks_for_cycle` and `apply_seed_thresholds`. That is what lets one file work in
-both the outer mirror repo (`master_agent/monitor.py`, deep history) and the container's
-`/opt/master_agent` (flat layout, its own short self-revision history). Not finding one is
-a **failure**, not a skip — a green run that verified nothing is worse than a red one.
+It copies `/opt/tools` to a scratch path first on `PYTHONPATH` and sets
+`PYTHONDONTWRITEBYTECODE`, so running the test cannot itself dirty a watched repo, and it
+diffs both watched repos before against after to prove it. Log:
+`/opt/emperor_logs/selftest-<stamp>.log`, which is `v/emperor_logs/` on the host.
+
+The baseline is found by content, not configured: it searches `/opt/master_agent`'s own
+`monitor.py` history for the last commit that still defined `_config_is_sane`,
+`fetch_marks_for_cycle` and `apply_seed_thresholds`. That repo is written by `emperor.sh`'s
+self-revision passes, so the commit id differs from the mirror's and no constant could name
+both. Not finding one is a **failure**, not a skip — a green run that verified nothing is
+worse than a red one.
 
 Rule of thumb: if you are about to write `price`, an asset code, a threshold or a trade
 into `monitor.py`, it belongs in a domain module instead. The per-cycle `obs` the loop
