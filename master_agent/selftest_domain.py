@@ -57,13 +57,23 @@ os.environ.setdefault('SMOKE_TEST_SECONDS', '3')
 
 import domain
 
-# The commit monitor.py was refactored out of: the last one where every gate, fallback and
-# score still lived in monitor.py itself. Every differential check below compares against
-# this. If you deliberately change a gate's behaviour, that is when you move this forward
-# -- and the diff in the same commit is the record of what you changed.
-BASELINE_COMMIT = os.environ.get('DOMAIN_BASELINE_COMMIT', '2d8704e')
+# How a pre-refactor monitor.py is recognised: three functions that lived in it and now
+# live in domain_sdex. Used to FIND the baseline rather than trusting a hardcoded sha,
+# because this file has to work in two different git repos.
+#
+# The outer mirror repo has master_agent/monitor.py and a history going back years. The
+# container's /opt/master_agent is a SEPARATE repo, laid out flat (monitor.py at the root),
+# with its own short history written by emperor.sh's self-revision passes. The commit id of
+# "the last pre-refactor monitor.py" is therefore different in each, and in the container it
+# is whatever the operator committed the refactor on top of. Searching for the content is
+# the only thing that works in both without configuration.
+#
+# Override with DOMAIN_BASELINE_COMMIT to pin a specific commit; it is still checked against
+# these markers, so pinning the wrong one is reported rather than silently believed.
+_PRE_REFACTOR_MARKERS = ('def _config_is_sane(', 'def fetch_marks_for_cycle(',
+                         'def apply_seed_thresholds(')
 
-# REVISION_SYSTEM_PROMPT's hash at BASELINE_COMMIT, measured outside the container (so
+# REVISION_SYSTEM_PROMPT's hash at the baseline, measured outside the container (so
 # friction/caps fall back to 12.0/100.0/4.0/0.50). A cross-check on the differential
 # below, not a substitute for it: this constant is environment-dependent and the
 # differential is not.
@@ -93,24 +103,74 @@ def skip(label, why):
 
 # ---------------------------------------------------------------- loading the baseline
 
+def _git_show(repo, ref):
+    """`git -C repo show ref` stdout, or None."""
+    r = subprocess.run(['git', '-C', str(repo), 'show', ref],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _layouts():
+    """The (repo, path prefix) pairs monitor.py might live under, nearest first.
+
+    ('', so monitor.py at the repo root) is the container's /opt/master_agent;
+    ('master_agent/') is the outer mirror repo. Trying both is what lets one script run in
+    either place, which matters because the differential is the whole value of this file
+    and it is silently worthless if the baseline cannot be found.
+    """
+    here = Path(__file__).resolve().parent
+    return [(here, ''), (here.parent, 'master_agent/')]
+
+
+def _find_baseline(max_commits=200):
+    """(repo, prefix, commit) for the newest pre-refactor monitor.py, or None.
+
+    Content-addressed rather than configured: walk each candidate repo's history for
+    monitor.py and take the first commit whose blob still defines the functions that moved
+    into domain_sdex. A pinned DOMAIN_BASELINE_COMMIT is verified the same way instead of
+    being trusted.
+    """
+    forced = os.environ.get('DOMAIN_BASELINE_COMMIT')
+    for repo, prefix in _layouts():
+        if not (repo / '.git').exists():
+            continue
+        path = f'{prefix}monitor.py'
+        if forced:
+            commits = [forced]
+        else:
+            log = subprocess.run(['git', '-C', str(repo), 'log', '--format=%H',
+                                  f'-n{max_commits}', '--', path],
+                                 capture_output=True, text=True)
+            commits = log.stdout.split() if log.returncode == 0 else []
+        for commit in commits:
+            blob = _git_show(repo, f'{commit}:{path}')
+            if blob and all(m in blob for m in _PRE_REFACTOR_MARKERS):
+                return repo, prefix, commit
+    return None
+
+
+_BASELINE = _find_baseline()
+BASELINE_COMMIT = _BASELINE[2][:12] if _BASELINE else '(not found)'
+
+
 def _load_baseline_monitor():
-    """monitor.py as of BASELINE_COMMIT, imported as its own module. None if unavailable.
+    """The pre-refactor monitor.py, imported as its own module. None if unavailable.
 
     strat_manager is stubbed, not imported: it mkdirs /opt/strategies as an import side
     effect, and the only thing baseline monitor wants from it is _strategy_python.
     """
-    here = Path(__file__).resolve().parent
-    src = subprocess.run(['git', '-C', str(here), 'show',
-                          f'{BASELINE_COMMIT}:master_agent/monitor.py'],
-                         capture_output=True, text=True)
-    if src.returncode != 0:
+    if _BASELINE is None:
+        return None
+    repo, prefix, commit = _BASELINE
+    source = _git_show(repo, f'{commit}:{prefix}monitor.py')
+    if source is None:
         return None
     if 'strat_manager' not in sys.modules:
         stub = types.ModuleType('strat_manager')
         stub._strategy_python = lambda: sys.executable
         sys.modules['strat_manager'] = stub
     path = Path(tempfile.mkdtemp(prefix='domain_baseline_')) / 'baseline_monitor.py'
-    path.write_text(src.stdout)
+    path.write_text(source)
     spec = importlib.util.spec_from_file_location('baseline_monitor', path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules['baseline_monitor'] = mod
@@ -118,8 +178,8 @@ def _load_baseline_monitor():
     return mod
 
 
-def _load_master_agent(commit=None):
-    """master-agent.py (hyphen: not importable normally) at `commit`, or from disk.
+def _load_master_agent(baseline=None):
+    """master-agent.py (hyphen: not importable normally), from disk or at the baseline.
 
     Third-party imports are stubbed so this works without the container's venv. Loaded
     under a unique module name each time so baseline and current can coexist.
@@ -131,22 +191,28 @@ def _load_master_agent(commit=None):
     sys.modules['ollama'].ResponseError = type('ResponseError', (Exception,), {})
     os.environ.setdefault('OLLAMA_API_KEY', 'selftest-stub')
     here = Path(__file__).resolve().parent
-    if commit is None:
+    if baseline is None:
         path = here / 'master-agent.py'
         label = 'current'
     else:
-        src = subprocess.run(['git', '-C', str(here), 'show',
-                              f'{commit}:master_agent/master-agent.py'],
-                             capture_output=True, text=True)
-        if src.returncode != 0:
-            skip('loading master-agent.py at ' + commit, src.stderr.strip())
+        repo, prefix, commit = baseline
+        source = _git_show(repo, f'{commit}:{prefix}master-agent.py')
+        if source is None:
+            skip(f'loading master-agent.py at {commit[:12]}',
+                 f'not in {repo} at that commit')
             return None
         scratch = Path(tempfile.mkdtemp(prefix='domain_baseline_ma_'))
         path = scratch / 'master_agent_at.py'
-        path.write_text(src.stdout)
+        path.write_text(source)
         # It resolves tools.json relative to its own __file__ and reads it at import.
-        shutil.copy(here / 'tools.json', scratch / 'tools.json')
-        label = commit
+        # Prefer the baseline's copy; fall back to the current one, which only affects
+        # TOOL_SCHEMAS and not the prompt this compares.
+        schemas = _git_show(repo, f'{commit}:{prefix}tools.json')
+        if schemas is not None:
+            (scratch / 'tools.json').write_text(schemas)
+        else:
+            shutil.copy(here / 'tools.json', scratch / 'tools.json')
+        label = commit[:12]
     spec = importlib.util.spec_from_file_location(f'ma_{label.replace("-", "_")}', path)
     mod = importlib.util.module_from_spec(spec)
     try:
@@ -310,8 +376,17 @@ check('observation_line(None) is the NOT PROVIDED branch',
 # ================================================== 3. differential against the baseline
 
 BASE = _load_baseline_monitor()
+
+# A FAILURE, not a skip. Everything below this line is the reason this file exists, and a
+# run that cannot find a baseline would otherwise print "ok - N checks passed" having
+# verified almost nothing -- which is worse than a red run, because it reads as evidence.
+check('a pre-refactor monitor.py was found to compare against', BASE is not None,
+      f'searched for {", ".join(_PRE_REFACTOR_MARKERS)} in the monitor.py history of '
+      + ' and '.join(f'{r}/{p}' for r, p in _layouts())
+      + '; pin one with DOMAIN_BASELINE_COMMIT')
+
 if BASE is None:
-    skip('every differential check', f'could not load monitor.py at {BASELINE_COMMIT}')
+    skip('every differential check', 'no pre-refactor monitor.py found')
 else:
     IN_CONTAINER = Path('/opt/tools').exists()
 
@@ -556,7 +631,7 @@ else:
 # =============================================== 4. the revision prompt, differentially
 
 CUR_MA = _load_master_agent()
-BASE_MA = _load_master_agent(BASELINE_COMMIT)
+BASE_MA = _load_master_agent(_BASELINE) if _BASELINE else None
 if CUR_MA is None:
     skip('prompt checks', 'could not load master-agent.py from disk')
 elif BASE_MA is None:
@@ -682,7 +757,11 @@ finally:
 # --------------------------------------------------------------------------------- done
 
 mode = 'in the container' if Path('/opt/tools').exists() else 'outside the container'
-print(f'ran {mode}; baseline {BASELINE_COMMIT}')
+if _BASELINE:
+    _repo, _prefix, _commit = _BASELINE
+    print(f'ran {mode}; baseline {_commit[:12]} ({_prefix or ""}monitor.py in {_repo})')
+else:
+    print(f'ran {mode}; NO BASELINE FOUND -- every differential check was skipped')
 for s in _skipped:
     print(f'  SKIP {s}')
 

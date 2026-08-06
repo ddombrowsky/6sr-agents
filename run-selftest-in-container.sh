@@ -16,16 +16,19 @@
 #     running monitor, and it makes /opt/master_agent dirty -- which is exactly what
 #     check_boundary_integrity() halts live trading on. This script is for checking the
 #     refactor before you decide to deploy it, so it must not deploy it.
-#  2. selftest_domain.py's strong assertions are differential: it loads monitor.py as it
-#     was at DOMAIN_BASELINE_COMMIT out of git and requires the old code and the new domain
-#     members to agree. /opt/master_agent is a *different* git repo with a different
-#     history -- 2d8704e does not exist in it and the path master_agent/monitor.py is not
-#     how files are laid out there. Run from /opt, every differential check silently skips
-#     and the run proves almost nothing.
+#  2. it tests the code in THIS working tree, including uncommitted changes, rather than
+#     whatever was last deployed. That is what you want before deciding to deploy.
 #
 # So instead: copy this repo (with its .git) to a container-local path outside the /opt
 # bind mount, and run the self-test from there. It imports the new modules from that copy,
 # and reads /opt/strategy_state.json and /opt/strategies for the real-population checks.
+#
+# ONCE YOU HAVE DEPLOYED (`./copy.sh --to`), PREFER THE OTHER SCRIPT
+# ==================================================================
+# `docker exec <container> /opt/selftest.sh` tests the *deployed* code, finds its baseline
+# in /opt/master_agent's own history, and additionally checks the container's health (the
+# ollama import, the missing .gitignore that halts live trading, whether a watched repo is
+# already dirty). This script is the pre-deploy check; that one is the post-deploy check.
 #
 # WHY /opt/tools IS COPIED TOO
 # ============================
@@ -44,7 +47,6 @@
 set -e
 
 CONTAINER="${CONTAINER:-$(cat "$(dirname "$0")/.containername")}"
-BASELINE="${DOMAIN_BASELINE_COMMIT:-2d8704e}"
 REPO="$(cd "$(dirname "$0")" && pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 HOST_LOG="$REPO/selftest-logs/container-$STAMP.log"
@@ -56,7 +58,6 @@ LOGDIR=/root/domain-selftest-logs
 mkdir -p "$REPO/selftest-logs"
 
 echo "container : $CONTAINER"
-echo "baseline  : $BASELINE"
 echo "log       : $HOST_LOG"
 echo
 
@@ -87,7 +88,6 @@ echo "running the self-test ..."
 set +e
 docker exec \
     -e PYTHONPATH="$TOOLS" \
-    -e DOMAIN_BASELINE_COMMIT="$BASELINE" \
     -e SMOKE_TEST_SECONDS=3 \
     -e GIT_CONFIG_GLOBAL=/dev/null \
     "$CONTAINER" sh -c "cd $DEST/master_agent && \
