@@ -80,8 +80,25 @@ Everything that *is* about a specific way of making money sits behind one module
   FUTURE.md's plan.
 - `master_agent/selftest_domain.py` — run this after touching any of the above. It loads
   the pre-refactor `monitor.py` out of git and requires the new domain members to give the
-  same answers, so a behaviour change cannot pass unnoticed. Runs inside or outside the
-  container; run it in the container before letting a cycle go.
+  same answers, so a behaviour change cannot pass unnoticed.
+
+Two ways to run it:
+
+```
+python3 master_agent/selftest_domain.py     # on the host: /opt/tools is absent, so the
+                                            # asset/basis/replay paths take their degraded
+                                            # branch (on both sides of the differential)
+./run-selftest-in-container.sh              # in the container, against the real /opt/tools
+                                            # and the real population. Deploys nothing.
+```
+
+Prefer the container run before letting a cycle go — it is the only one that exercises the
+real order books, the recorded basis distribution, `regime.suggest_bands`' band grid and
+the live population. Read the header of `run-selftest-in-container.sh` for why it copies
+the repo and `/opt/tools` to container-local paths instead of using `copy.sh --to`: running
+from `/opt` would silently skip every differential check (different git repo) and would
+dirty the repos `check_boundary_integrity()` halts live trading on. Logs land in
+`selftest-logs/` (gitignored) and in the container under `/root/domain-selftest-logs/`.
 
 Rule of thumb: if you are about to write `price`, an asset code, a threshold or a trade
 into `monitor.py`, it belongs in a domain module instead. The per-cycle `obs` the loop
