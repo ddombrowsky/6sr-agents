@@ -48,7 +48,9 @@ into a separate multi-repo trading-agent system (`master_agent/`, `template_repo
 
 - `./copy.sh --to` — root → `v/agents/`: copies `requirements.txt`,
   `agent-bootstrap.py`, `sr_agent_tools.py` and `tools.json` in, backing up the previous
-  copy into `v/agents/bak.<random>/` first.
+  copy into `v/agents/bak.<random>/` first. It also copies `master_agent/*`, `tools/*`,
+  `template_repo/*` and `scripts/*.sh` across — with **flat globs**, so a new file must be
+  flat inside those directories or it will silently not deploy.
 - `./copy.sh` (no args) — `v/` → root: copies `v/agents/*` to the repo root and
   `v/{master_agent,tools,template_repo}/*` over their root-level counterparts.
 
@@ -59,6 +61,31 @@ sync is manual, though, so don't assume they're current unless `copy.sh` has bee
 recently — and don't edit the root-level copies expecting it to affect a running system.
 The live versions are the ones under `v/`, separate repos that get rewritten by the
 self-modifying agent while the container runs.
+
+## Architecture: the domain boundary (master_agent/)
+
+`master_agent/monitor.py` is the domain-agnostic evolutionary loop: score, rank, cull,
+retire, clone, revise, gate, promote, sleep. It knows nothing about what is being traded.
+Everything that *is* about a specific way of making money sits behind one module:
+
+- `master_agent/domain.py` — the contract, plus the `DOMAIN` env-var registry
+  (`domain.get()`), a `check(mod)` validator, and the shared filesystem/role constants.
+  Its module docstring is the spec: read it before adding anything to `monitor.py`.
+- `master_agent/domain_sdex.py` — the Stellar DEX domain (the default). Prices, marks,
+  order books, assets, threshold bands, the config gates, the seed/tweak fallbacks, the
+  promotion gates, the real-money caps.
+- `master_agent/domain_null.py` — a coin-flip forecasting game with no prices and no
+  money. Selected with `DOMAIN=null`. It exists to prove the contract carries a domain
+  that has none of sdex's furniture, and is the skeleton for the benchmark domain in
+  FUTURE.md's plan.
+- `master_agent/selftest_domain.py` — run this after touching any of the above. It loads
+  the pre-refactor `monitor.py` out of git and requires the new domain members to give the
+  same answers, so a behaviour change cannot pass unnoticed. Runs inside or outside the
+  container; run it in the container before letting a cycle go.
+
+Rule of thumb: if you are about to write `price`, an asset code, a threshold or a trade
+into `monitor.py`, it belongs in a domain module instead. The per-cycle `obs` the loop
+threads around is deliberately opaque — the loop only tests it for `None`.
 
 ## Architecture: tool-calling loop
 
