@@ -198,6 +198,27 @@ CYCLE_SLEEP = 3600
 # asleep will not notice the file until the sleep ends).
 EXIT_FILE = Path('/opt/.monitor.py.exit')
 
+# 'auto' (default) revises via master-agent.py's Ollama-backed run_turn loop, unchanged.
+# 'manual' dumps the same prompt to disk instead and blocks the entire cycle -- not just
+# the one revision -- for a human to carry it out through Claude Code under direct
+# supervision. See _run_revision_manual. Single-flight by construction: provisioning is
+# sequential, so at most one manual revision is ever pending, hence fixed paths rather
+# than per-strategy ones, matching EXIT_FILE's style. Read/written by master-agent.py's
+# dump-revision-prompt / revision-done subcommands -- keep both files in sync if either
+# path changes.
+REVISION_MODE = os.environ.get('REVISION_MODE', 'auto')
+MANUAL_REVISION_PROMPT_FILE = Path('/opt/emperor_logs/pending_revision.md')
+MANUAL_REVISION_DONE_FILE = Path('/opt/.revision_done')
+MANUAL_REVISION_POLL_S = int(os.environ.get('MANUAL_REVISION_POLL_S', 30))
+# Deliberately NOT EXIT_FILE: EXIT_FILE's whole contract is "checked only at the
+# cycle-boundary sleeps, so nothing is in flight when it fires" (see EXIT_FILE above),
+# and once.sh already relies on being able to pre-touch it seconds after launch to mean
+# "stop after this one cycle" -- with a manual revision potentially pending, that would
+# abandon the wait almost immediately instead of giving a human time to act. This is a
+# separate signal for aborting one specific in-flight wait; touching EXIT_FILE keeps
+# meaning exactly what it always has.
+MANUAL_REVISION_ABORT_FILE = Path('/opt/.revision_abort')
+
 
 def _strategy_python():
     """Which interpreter a strategy is really started under.
@@ -624,6 +645,8 @@ def _run_revision(name, parent_name, score, leaderboard, obs, role=ROLE_REFINE):
     silent shape as the interpreter bug above, and selftest_domain.py asserts the round
     trip for exactly that reason.
     """
+    if REVISION_MODE == 'manual':
+        return _run_revision_manual(name, parent_name, score, leaderboard, obs, role)
     if not MASTER_AGENT_SCRIPT.exists():
         return False
     _check_revision_interpreter()
@@ -647,6 +670,76 @@ def _run_revision(name, parent_name, score, leaderboard, obs, role=ROLE_REFINE):
     except Exception as e:
         print(f'Master agent revision errored for {name} ({role}): {e}')
     return False
+
+
+def _run_revision_manual(name, parent_name, score, leaderboard, obs, role):
+    """Dump the revision prompt to disk and block the whole cycle for a human.
+
+    Same True/False contract as _run_revision -- False sends the caller to the
+    mechanical-tweak fallback exactly as an unreachable model would, e.g. if
+    dump-revision-prompt itself fails. Reaching MANUAL_REVISION_DONE_FILE always
+    returns True: it deliberately does not re-check the working tree itself, because
+    provision_strategy's own revision_changed_anything call right after this returns
+    already does that -- a human/Claude Code session that touched nothing is caught the
+    same way a no-op model reply is today.
+
+    Never calls master-agent.py's revise-strategy path, so _check_revision_interpreter
+    (which guards the Ollama turn's access to strategy dependencies) does not apply here.
+    """
+    if not MASTER_AGENT_SCRIPT.exists():
+        return False
+    for stale in (MANUAL_REVISION_DONE_FILE, MANUAL_REVISION_ABORT_FILE):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        result = subprocess.run(
+            [sys.executable, str(MASTER_AGENT_SCRIPT), 'dump-revision-prompt',
+             name, parent_name, str(score), leaderboard,
+             DOMAIN.encode_observation(obs), role, str(MANUAL_REVISION_PROMPT_FILE)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f'Could not prepare a manual revision for {name} ({role}): '
+                  f'{result.stderr.strip()}')
+            return False
+        print(result.stdout.strip())
+    except Exception as e:
+        print(f'Manual revision prompt for {name} ({role}) errored: {e}')
+        return False
+
+    print(
+        f'\n=== Cycle paused for a manual revision of {name} ({role}) ===\n'
+        f'In Claude Code:\n'
+        f'  Read {MANUAL_REVISION_PROMPT_FILE} and follow its instructions.\n'
+        f'When it has finished editing (no need to commit -- monitor.py does that), run:\n'
+        f'  python3 {MASTER_AGENT_SCRIPT} revision-done {name}\n'
+        f'to resume this cycle. Or touch {MANUAL_REVISION_ABORT_FILE} to give up on this '
+        f'one revision and exit instead. Waiting...\n'
+    )
+    sys.stdout.flush()
+    while not MANUAL_REVISION_DONE_FILE.exists():
+        if MANUAL_REVISION_ABORT_FILE.exists():
+            # Deliberately its own file, not EXIT_FILE -- see MANUAL_REVISION_ABORT_FILE
+            # above. Safe to abandon here for the same reason a cycle-boundary sleep is:
+            # this clone has been created but not yet gated, committed, or started, so
+            # abandoning it is exactly the "checked out but never started" case
+            # strat_manager.py reconcile/prune already cleans up next cycle -- nothing
+            # new to build for that.
+            print(f'{MANUAL_REVISION_ABORT_FILE} exists; abandoning the manual revision '
+                  f'of {name} and exiting instead of waiting further')
+            try:
+                MANUAL_REVISION_ABORT_FILE.unlink()
+            except OSError as e:
+                print(f'Warning: could not remove {MANUAL_REVISION_ABORT_FILE}: {e}')
+            sys.stdout.flush()
+            raise SystemExit(0)
+        time.sleep(MANUAL_REVISION_POLL_S)
+    MANUAL_REVISION_DONE_FILE.unlink()
+    print(f'Resuming: manual revision of {name} ({role}) marked done')
+    return True
+
 
 def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, leaderboard,
                        obs, revise, inject, seed_fallback, role=None):

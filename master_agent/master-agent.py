@@ -1310,21 +1310,17 @@ def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_lin
     )
 
 
-def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
-                     leaderboard_json: str = '{}', observation: str = '',
-                     role: str = ROLE_REFINE) -> None:
-    """One-shot entry point invoked by monitor.py's provisioning stage.
+def _compose_revision_messages(strategy_name: str, parent_name: str, parent_score: str,
+                                leaderboard_json: str, observation: str, role: str):
+    """Build the exact messages a revision turn would open with, no model call.
 
-    Hands a freshly-created, not-yet-started strategy directory to the LLM with full
-    tool access so it can rewrite config/code and commit the revision itself, instead
-    of monitor.py applying a fixed random tweak.
+    Shared by `revise_strategy` (which sends this to `run_turn`) and
+    `dump_revision_prompt` (which writes it to a file for a human to carry out via
+    Claude Code instead) -- both must ask for identically the same revision.
 
     `role` picks the user prompt: `refine` for a clone of a leader (parent config, state,
     trade tail and score -- improve on it), `explore` for a fresh template spawn (a
-    census of what the population already runs, and an instruction to differ). It is a
-    trailing positional rather than a flag because __main__ below is a bare
-    `revise_strategy(*sys.argv[2:])` splat, so a defaulted positional keeps a hand-typed
-    five-argument invocation working with no change there.
+    census of what the population already runs, and an instruction to differ).
 
     `observation` is whatever the domain knew at the top of the cycle, encoded as one argv
     token by monitor.py (see domain.py). For sdex that is still literally `str(price)`, so
@@ -1332,6 +1328,8 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     empty string means monitor could not observe anything this cycle, which the prompt has
     a branch for. Decoding is the domain's job so a domain with a structured observation
     needs no change to this argv contract.
+
+    Returns `(messages, resolved_role, strategy_path)`.
     """
     strategy_path = STRATEGIES_DIR / strategy_name
     if role not in (ROLE_REFINE, ROLE_EXPLORE):
@@ -1342,7 +1340,6 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
         # the refine prompt degenerates on. This holds even if a future caller forgets
         # the role argument entirely.
         role = ROLE_EXPLORE
-    print(f'[revise-strategy] {strategy_name} role={role}')
 
     try:
         leaderboard = json.loads(leaderboard_json)
@@ -1369,6 +1366,25 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
 
     messages = _load_revision_history(strategy_path)
     messages.append({'role': 'user', 'content': prompt})
+    return messages, role, strategy_path
+
+
+def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = '',
+                     leaderboard_json: str = '{}', observation: str = '',
+                     role: str = ROLE_REFINE) -> None:
+    """One-shot entry point invoked by monitor.py's provisioning stage.
+
+    Hands a freshly-created, not-yet-started strategy directory to the LLM with full
+    tool access so it can rewrite config/code and commit the revision itself, instead
+    of monitor.py applying a fixed random tweak.
+
+    `role` is a trailing positional rather than a flag because __main__ below is a bare
+    `revise_strategy(*sys.argv[2:])` splat, so a defaulted positional keeps a hand-typed
+    five-argument invocation working with no change there.
+    """
+    messages, role, strategy_path = _compose_revision_messages(
+        strategy_name, parent_name, parent_score, leaderboard_json, observation, role)
+    print(f'[revise-strategy] {strategy_name} role={role}')
 
     # The retry loop. `before` is captured once, outside: the question at every attempt is
     # "has anything changed since the clone was handed to me", not "since the last turn",
@@ -1434,6 +1450,57 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
         sys.exit(1)
 
 
+# Sentinel monitor.py's REVISION_MODE=manual polls for -- see dump_revision_prompt /
+# revision_done below and monitor.py's matching MANUAL_REVISION_DONE_FILE. Keep both
+# files in sync if either path changes.
+MANUAL_REVISION_DONE_FILE = Path('/opt/.revision_done')
+DEFAULT_REVISION_PROMPT_FILE = Path('/opt/emperor_logs/pending_revision.md')
+
+
+def dump_revision_prompt(strategy_name: str, parent_name: str, parent_score: str = '',
+                          leaderboard_json: str = '{}', observation: str = '',
+                          role: str = ROLE_REFINE, out_path: str = '') -> None:
+    """Write the revision prompt to a file instead of sending it to the model.
+
+    For monitor.py's REVISION_MODE=manual: the same prompt `revise_strategy` would open
+    a run_turn loop with, dumped so a human can paste it into Claude Code and carry out
+    the revision by hand under direct supervision -- see `_compose_revision_messages`,
+    which both share so a manual revision is asked exactly what an automatic one would
+    be. Never calls the model and never touches `.strategy-revision-history.json`.
+    """
+    messages, role, strategy_path = _compose_revision_messages(
+        strategy_name, parent_name, parent_score, leaderboard_json, observation, role)
+    print(f'[dump-revision-prompt] {strategy_name} role={role}')
+
+    out = Path(out_path) if out_path else DEFAULT_REVISION_PROMPT_FILE
+    parts = [
+        f'# Manual revision for `{strategy_name}` (role={role})\n',
+        f'All edits must be made under this exact absolute path -- use it for every '
+        f'read/write regardless of your own current working directory:\n\n'
+        f'    {strategy_path}\n',
+    ]
+    for m in messages:
+        label = {'system': 'SYSTEM', 'user': 'TASK'}.get(m['role'], m['role'].upper())
+        parts.append(f'\n---\n## {label}\n\n{m["content"]}\n')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text('\n'.join(parts))
+    print(f'Wrote revision prompt for {strategy_name} to {out}')
+
+
+def revision_done(strategy_name: str = '') -> None:
+    """Touch the sentinel monitor.py's manual-revision wait polls for.
+
+    Not a hard gate -- touching this early or by mistake costs at most one wasted
+    revision slot, since `revision_changed_anything` back in monitor.py still checks
+    the working tree independently before anything is committed, exactly as it does for
+    a no-op model reply today.
+    """
+    MANUAL_REVISION_DONE_FILE.touch()
+    label = f' for {strategy_name}' if strategy_name else ''
+    print(f'Marked the manual revision{label} done ({MANUAL_REVISION_DONE_FILE}); '
+          f'monitor.py will resume at its next poll.')
+
+
 def main():
     messages = [{
           'role': 'system',
@@ -1470,5 +1537,9 @@ def main():
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'revise-strategy':
         revise_strategy(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == 'dump-revision-prompt':
+        dump_revision_prompt(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == 'revision-done':
+        revision_done(*sys.argv[2:])
     else:
         main()
