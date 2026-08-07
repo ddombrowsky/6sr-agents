@@ -1104,6 +1104,65 @@ def _config_only_correction(strategy_path: Path) -> str:
     )
 
 
+def _smoke_test_correction(reason: str) -> str:
+    """Sent back for one extra turn when monitor.py's post-hoc smoke test failed.
+
+    The smoke test runs main.py as main() would run it in production -- not just
+    imports decide() the way backtest_forecast_strategy/backtest_strategy does -- and it
+    only runs in monitor.py, after this session has already exited once. This is the
+    only way the model ever finds out that backtest passing and beats_null/beats_buy_hold
+    being true was not the same as the file actually running. Quotes the exact failure
+    monitor.py logged, since a vague "it didn't work" would waste the one retry on the
+    model guessing at what broke instead of fixing it.
+    """
+    return (
+        f"Your revision was committed, but monitor.py's smoke test failed:\n\n"
+        f'  {reason}\n\n'
+        f'That smoke test actually starts main.py as a standalone process the way '
+        f'production does, which is a different and stricter check than the backtest '
+        f'tool you already ran -- decide_source == "main.py:decide" only proves decide() '
+        f'is importable, not that the file still runs. Common causes: the rewrite '
+        f"dropped main() or the `if __name__ == '__main__':` guard entirely (the file "
+        f'defines functions and exits immediately with no output), or it kept them but '
+        f'broke something in the process itself -- a forgotten import, a NameError, an '
+        f'exception before the first state save.\n\n'
+        f'Read main.py back with `read_file`, fix whatever the error above points at '
+        f'without discarding your actual decide() logic, and write the corrected file. '
+        f'This is your last attempt this cycle -- if it fails again the whole revision '
+        f'is discarded and replaced with a mechanical tweak.'
+    )
+
+
+def retry_after_smoke_failure(strategy_name: str, reason: str = '') -> None:
+    """One bounded extra turn after monitor.py's post-hoc main.py smoke test fails.
+
+    Distinct from the in-session retry loop inside revise_strategy (which only fires for
+    "wrote nothing" / "config-only", both detectable before that subprocess exits): the
+    smoke test itself only runs in monitor.py, after the revision subprocess has already
+    exited and main.py has already been checked out to a fresh branch. The only way to
+    get the failure back to the model is a second invocation reusing the persisted
+    conversation, so it can see exactly what it wrote and why -- rather than starting
+    over with the original task prompt, which is what a fresh revise_strategy call would
+    do. monitor.py calls this at most once per revision; see its call site for the bound.
+    """
+    strategy_path = STRATEGIES_DIR / strategy_name
+    print(f'[revise-strategy-retry] {strategy_name}')
+    messages = _load_revision_history(strategy_path)
+    if len(messages) <= 1:
+        # Nothing but the system prompt -- e.g. the history file is missing or was
+        # never written. No real conversation exists to append the correction to.
+        print(f'[revise-strategy-retry] {strategy_name}: no revision history to retry '
+              f'against')
+        sys.exit(1)
+    messages.append({'role': 'user', 'content': _smoke_test_correction(reason)})
+    reply = run_turn(messages)
+    print(reply)
+    _save_revision_history(strategy_path, messages)
+    if reply.startswith('[error:'):
+        print(reply, file=sys.stderr)
+        sys.exit(1)
+
+
 def _load_revision_history(strategy_path: Path) -> list:
     history_file = strategy_path / REVISION_HISTORY_FILENAME
     if history_file.exists():
@@ -1483,5 +1542,7 @@ def main():
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'revise-strategy':
         revise_strategy(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == 'retry-after-smoke-failure':
+        retry_after_smoke_failure(*sys.argv[2:])
     else:
         main()

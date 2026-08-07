@@ -670,6 +670,36 @@ def _run_revision(name, parent_name, score, leaderboard, obs, role=ROLE_REFINE):
         print(f'Master agent revision errored for {name} ({role}): {e}')
     return False
 
+
+def _run_smoke_retry(name, reason):
+    """One follow-up call to master-agent.py after main_py_is_sane fails, feeding the
+    exact failure back into that revision's own persisted conversation.
+
+    A second subprocess call rather than a loop inside _run_revision, because the smoke
+    test that produces `reason` only runs here in monitor.py, after the revision
+    subprocess has already exited -- see retry_after_smoke_failure's docstring in
+    master-agent.py. Bounded to exactly one call by the caller never invoking this
+    twice for the same failure, matching the cost/benefit the user signed off on: a
+    failed revision now costs one more LLM round trip and one more SMOKE_TEST_SECONDS
+    run, not an unbounded retry loop.
+    """
+    if not MASTER_AGENT_SCRIPT.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, str(MASTER_AGENT_SCRIPT), 'retry-after-smoke-failure',
+             name, reason],
+            capture_output=True, text=True, timeout=REVISION_TIMEOUT,
+        )
+        if result.returncode == 0:
+            print(f'Master agent retried {name} after smoke failure:\n{result.stdout.strip()}')
+            return True
+        print(f'Master agent smoke-failure retry failed for {name}: {result.stderr.strip()}')
+    except Exception as e:
+        print(f'Master agent smoke-failure retry errored for {name}: {e}')
+    return False
+
+
 def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, leaderboard,
                        obs, revise, inject, seed_fallback, role=None):
     """Create one strategy: clone -> optional revision -> gates -> fallback -> commit.
@@ -752,6 +782,17 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
         ok, reason = main_py_is_sane(strategy_dir, name, obs,
                                      baseline_source=_main_py_at(strategy_dir, before_head))
         print(f'main.py check for {name}: {"passed" if ok else "FAILED"} -- {reason}')
+        # Only worth a retry when a revision actually produced this main.py: the
+        # mechanical fallbacks never touch it, so a failure here with `revised` already
+        # False is either injection-only or a pre-existing broken file, and there is no
+        # revision conversation for the model to react to either way.
+        if not ok and revised:
+            if _run_smoke_retry(name, reason):
+                ok, reason = main_py_is_sane(
+                    strategy_dir, name, obs,
+                    baseline_source=_main_py_at(strategy_dir, before_head))
+                print(f'main.py check for {name} (after smoke-failure retry): '
+                      f'{"passed" if ok else "FAILED"} -- {reason}')
         if not ok:
             revert_main_py(strategy_dir, before_head, name)
             revised = False
