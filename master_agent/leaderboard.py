@@ -95,7 +95,7 @@ def main():
               f"{'ACTIONS':>10}{'AGE(h)':>9}  {'IDLE'}")
     print(header)
     print('-' * len(header))
-    for name, status, pid, score, count, age_s in rows:
+    for name, status, pid, score, count, age_s in rows[:20]:
         score_s = f'{score:.2f}' if score is not None else 'N/A'
         pid_s = str(pid) if pid else '-'
         age_s_str = f'{age_s / 3600:.1f}' if age_s is not None else 'N/A'
