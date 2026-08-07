@@ -582,7 +582,10 @@ def _revision_budget():
     All-or-nothing, not a per-candidate coin flip: the ~25% of cycles that return 0 are
     the control arm, a whole batch built by DOMAIN.tweak_config / DOMAIN.seed_config
     alone, which is what the revised batches are compared against.
+
+    When in 'manual' mode, there is effectively no revision budget limit.
     """
+    if REVISION_MODE == 'manual': return 999999
     return REVISIONS_PER_CYCLE if random.random() < REVISION_CHANCE else 0
 
 _REVISION_INTERPRETER_CHECKED = []
