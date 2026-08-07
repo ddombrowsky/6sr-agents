@@ -479,7 +479,15 @@ def revert_main_py(strategy_dir, before_head, name):
 REVISION_IGNORES = ('state.json', '.strategy-revision-history.json')
 
 def _git(path, *args):
-    return subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True)
+    # `-c safe.directory=<path>` scoped to exactly this repo, not a global exception:
+    # these strategy dirs are cloned and committed by this same process, then can be
+    # edited by a manual revision pass running as a different uid (see the "manual
+    # revision" pause in _run_revision) -- which changes effective ownership and makes
+    # every subsequent git call here fail with "dubious ownership" otherwise. That
+    # failure used to be swallowed by _git_is_dirty/_git_head as "nothing changed",
+    # silently skipping the commit in commit_revision.
+    return subprocess.run(['git', '-c', f'safe.directory={path}', '-C', str(path), *args],
+                          capture_output=True, text=True)
 
 def _git_head(path):
     r = _git(path, 'rev-parse', 'HEAD')
@@ -498,7 +506,14 @@ def _main_py_at(strategy_dir, before_head):
 
 def _git_is_dirty(path):
     r = _git(path, 'status', '--porcelain')
-    return bool(r.stdout.strip()) if r.returncode == 0 else False
+    if r.returncode != 0:
+        # Unknown beats wrong: this return value gates whether commit_revision even
+        # attempts a commit, so a git failure here must never read as "clean" -- that
+        # silently discarded a real revision the one time this fired for real
+        # (seed_f6bc13d677a0, 2026-08-07, dubious-ownership swallowed as not-dirty).
+        print(f'git status failed for {path}: {r.stderr.strip()}')
+        return True
+    return bool(r.stdout.strip())
 
 def revision_changed_anything(path, before_head):
     """True if anything at all happened to `path` since it was cloned.
