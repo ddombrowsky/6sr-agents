@@ -268,18 +268,33 @@ def compute_strategy_score(strategy_name, state_entry, obs):
 
 
 def strategy_age_s(state_entry):
-    """Seconds since this strategy's directory was created, or None.
+    """Seconds since this strategy was actually cloned, or None.
 
-    The directory is created by `git clone` in strat_manager and never recreated, so its
-    ctime is the strategy's birth. config.json's mtime would not do -- a revision rewrites
-    it -- and state.json's is refreshed every 30s by the running loop.
+    Reads strat_manager's birth.json, written once at clone time and never touched
+    again (see clone_strategy). Preferred over the directory's st_ctime, which this
+    used until 2026-08-07: ctime is inode-metadata time, not creation time, and moves
+    on anything that changes the directory's own metadata -- not just a reclone but a
+    chmod/chown, e.g. a manual revision pass running under a different uid (see the
+    safe.directory fix a few lines up). clone_5ed6c72b0487's state.json carried a
+    ctime a full day after the strategy's real creation for exactly that reason.
+
+    Falls back to ctime for strategies cloned before birth.json existed. That fallback
+    inherits the same staleness risk this function exists to avoid, but it is still
+    better than None for a strategy the file predates.
 
     Overstates opportunity slightly for a strategy that spent part of its life stopped by
     the cull. That is the right direction for the only thing this is used for: deciding
     when a strategy has had enough market to prove it can act at all.
     """
+    from strat_manager import BIRTH_FILE
+    path = state_entry['path']
     try:
-        return max(0.0, time.time() - os.stat(state_entry['path']).st_ctime)
+        birth = json.load(open(os.path.join(path, BIRTH_FILE)))
+        return max(0.0, time.time() - birth['created_s'])
+    except Exception:
+        pass
+    try:
+        return max(0.0, time.time() - os.stat(path).st_ctime)
     except Exception:
         return None
 
