@@ -81,6 +81,23 @@ STARTING_SCORE = 1000.0
 # apart is a recurring, specifically-named failure mode in this codebase.
 SCORE_SCALE = 1000.0
 
+# How much weight a strategy's own track record gets before it is trusted over the base
+# rate, and the ceiling on how much raw volume alone can grow a score once it clearly is
+# trusted. Both serve the SAME purpose SCORE_SCALE's comment names -- a lucky small sample
+# must not be able to outrank an established track record -- they just asymptote instead
+# of compounding forever. Measured against the 2026-08-06 forecast run's cycle-5
+# leaderboard: uncapped, a 3210-forecast strategy at brier=0.2199 permanently outranked a
+# 1854-forecast strategy at a genuinely better brier=0.2128, and every strategy spawned
+# after cycle 1 was still short of the leader's forecast count five cycles (7+ hours)
+# later -- score was rewarding age, not skill, once both strategies had long since cleared
+# any reasonable noise floor. CONFIDENCE_PRIOR_N sets that floor (below it, score stays
+# close to STARTING_SCORE regardless of how lucky the sample looks); CONFIDENCE_CAP sets
+# where volume stops mattering and skill takes over completely. Both are round numbers,
+# not fit to this one run -- revisit with a real backtest if questions_per_tick or
+# TICK_SECONDS changes enough to move how many forecasts a cycle actually produces.
+CONFIDENCE_PRIOR_N = 200.0
+CONFIDENCE_CAP = 1500.0
+
 # No money exists in this domain, so there is no execution to suppress. See domain.py's
 # contract: an empty dict is the honest answer here, unlike sdex where omitting
 # PAPER_ONLY would let a smoke run place a real order.
@@ -169,6 +186,17 @@ def observation_line(obs):
             f'and resolved outcomes.\n')
 
 
+def _shrunk_edge(count, mean_brier, mean_base):
+    """Blend a strategy's observed mean_brier with the base rate it's measured against,
+    weighted down for a small sample (CONFIDENCE_PRIOR_N), then weight the resulting edge
+    by volume up to a ceiling (CONFIDENCE_CAP) rather than without bound. See those
+    constants for why: this is what stops score from just measuring strategy age."""
+    shrunk_brier = ((CONFIDENCE_PRIOR_N * mean_base + count * mean_brier)
+                     / (CONFIDENCE_PRIOR_N + count))
+    weight = min(count, CONFIDENCE_CAP)
+    return weight * (mean_base - shrunk_brier)
+
+
 def score(state_dict, obs):
     """See the module docstring's WHY score() AND score_path() DIVERGE section. Reads
     the running tally the template keeps in state.json, not the log."""
@@ -180,7 +208,8 @@ def score(state_dict, obs):
         return STARTING_SCORE, ['forecasts_made']
     if count <= 0:
         return STARTING_SCORE, []
-    return STARTING_SCORE + SCORE_SCALE * (base_sum - brier_sum), []
+    edge = _shrunk_edge(count, brier_sum / count, base_sum / count)
+    return STARTING_SCORE + SCORE_SCALE * edge, []
 
 
 def score_path(strategy_path, obs):
@@ -194,7 +223,7 @@ def score_path(strategy_path, obs):
     count, mean_brier, mean_base = engine.cumulative_brier(name)
     if count == 0:
         return STARTING_SCORE
-    return STARTING_SCORE + SCORE_SCALE * count * (mean_base - mean_brier)
+    return STARTING_SCORE + SCORE_SCALE * _shrunk_edge(count, mean_brier, mean_base)
 
 
 def activity_log_path(name):

@@ -799,6 +799,19 @@ def _build_forecast_revision_system_prompt():
     "rather than your code. Fix the structure and re-run until decide_source is "
     "'main.py:decide'; a revision that never reaches its own fitness check has not been "
     'tested at all.\n'
+    "  * decide_source == 'main.py:decide' is NOT the same as \"this file still runs\". "
+    'backtest_forecast_strategy only ever imports the module and calls decide() '
+    'directly -- it never starts main() or the tick loop, so a main.py containing '
+    'nothing but a bare decide() function passes this check perfectly and then dies in '
+    'production: strat_manager starts it once as a standalone process, it defines a '
+    'function, reaches the bottom of the file, and exits immediately with no output, '
+    'which fails the separate smoke test and reverts your whole revision -- silently, '
+    'after this session has already ended, discarding whatever decide() logic you wrote. '
+    "If you rewrite main.py instead of leaving it as-is, keep main() (the "
+    "load_config/load_state/tick-loop/save_state machinery) and its "
+    "`if __name__ == '__main__':` guard exactly as structured in the template, calling "
+    "your new decide(); do not delete them to get a \"cleaner\" file. Only decide() (and "
+    "any helper functions it calls) is where your actual logic change belongs.\n"
     "  * Once decide_source is 'main.py:decide', treat `beats_null: false` (mean_brier "
     ">= mean_base_brier) as a failed revision and try something else -- a strategy that "
     "cannot beat guessing 0.5 is not worth starting.\n"

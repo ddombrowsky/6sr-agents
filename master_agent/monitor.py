@@ -2,7 +2,8 @@
 """The evolutionary loop. Runs forever, one cycle per hour.
 
 Every cycle it ranks *all* known strategies (running or stopped) by the active domain's
-score, stops anything ranked below KEEP_TOP_N, and adds three newcomers: CLONES_PER_CYCLE
+score, stops anything ranked below KEEP_TOP_N (unless it is younger than YOUNG_GRACE_S --
+see that constant), and adds three newcomers: CLONES_PER_CYCLE
 clones of the best distinct performers plus TEMPLATE_SPAWNS_PER_CYCLE pulled fresh from
 the domain's template repo, all with slightly tweaked/revised parameters. It then makes
 sure those plus the rest of the top N are running -- so the rank-based cull stops three per
@@ -128,6 +129,27 @@ RETIRE_BELOW_RANK = KEEP_TOP_N * 3 # stopped, never-acted strategies below this 
 # reaps them a cycle later. A strategy is only demoted once it has had IDLE_GRACE_S of
 # real market to act in, so a fresh clone is never punished for being new.
 IDLE_GRACE_S = int(os.environ.get('IDLE_GRACE_S', 3 * 3600))
+
+# How long a strategy is exempt from the rank-KEEP_TOP_N cull, counted from when its
+# directory was created (see strategy_age_s). Distinct from IDLE_GRACE_S: that one
+# protects a strategy that has not acted yet from being ranked last; this one protects a
+# strategy that HAS acted from being stopped for a low cumulative score before it has had
+# a fair chance to earn one.
+#
+# DOMAIN.score / score_path sum edge over every resolved forecast/trade rather than
+# averaging it (see domain_forecast.py's score docstring), so score scales with how long
+# a strategy has been running as well as with how good it is. A strategy that has been
+# alive for one cycle cannot out-accumulate one seven cycles old even if its per-action
+# skill is strictly better -- measured on the 2026-08-06 forecast run: every one of the
+# 9+ clones spawned across 5 cycles was stopped the cycle immediately after it started
+# (one cycle's worth of action, ~1 CYCLE_SLEEP), so no revision -- LLM-authored or a
+# mechanical fallback tweak -- ever ran long enough to be judged on comparable footing
+# against the original bootstrap strategies, and the population was structurally unable
+# to turn over. Grace period gives a newcomer a few cycles of real action before its
+# score is trusted enough to cull it, without exempting it forever the way skipping the
+# cull for idle strategies would. Three cycles' worth at the default CYCLE_SLEEP (3600s);
+# not a reference to that constant because it is defined later in the file.
+YOUNG_GRACE_S = int(os.environ.get('YOUNG_GRACE_S', 3 * 3600))
 
 # Repos whose contents decide how real money moves. Watched every cycle by
 # check_boundary_integrity(); see that function for why. Not the domain's business: these
@@ -1201,6 +1223,12 @@ def run():
             if info and info.get('status') == 'running':
                 if name == live_name:
                     print(f'Skipping cull for {name}: currently the live pubnet strategy')
+                    continue
+                age = strategy_age_s(info)
+                if age is not None and age < YOUNG_GRACE_S and name not in idle_names:
+                    print(f'Skipping cull for {name}: only {age / 3600:.1f}h old, below '
+                          f'{YOUNG_GRACE_S / 3600:.0f}h grace period (rank alone is not '
+                          f'enough evidence yet)')
                     continue
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'stop', name])
