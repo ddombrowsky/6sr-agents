@@ -25,15 +25,12 @@ export MASTER_AGENT_MODEL=granite
 export REVISION_MODE=manual
 
 date > $LOG
+touch /opt/.monitor.py.exit
 # Piped through tee rather than redirected straight to $LOG: under REVISION_MODE=manual
 # the cycle can pause and print a banner asking for action (what to read, what command
 # to run to resume) -- that has to reach this terminal, not just the log file, or
 # there'd be nothing here telling you to go do it.
 python3 -u monitor.py 2>&1 | tee -a $LOG &
-
-sleep 5
-
-touch /opt/.monitor.py.exit
 
 echo Logging to $LOG
 echo waiting for exit...
