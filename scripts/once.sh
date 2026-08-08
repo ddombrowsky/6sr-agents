@@ -17,11 +17,8 @@ python3 monitor.py --ensure-recorder
 export MASTER_AGENT_MODEL=granite
 
 date > $LOG
-python3 -u monitor.py >> $LOG 2>&1 &
-
-sleep 5
-
 touch /opt/.monitor.py.exit
+python3 -u monitor.py 2>&1 | tee $LOG &
 
 echo Logging to $LOG
 echo waiting for exit...

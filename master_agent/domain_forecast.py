@@ -97,7 +97,7 @@ SCORE_SCALE = 1000.0
 # not fit to this one run -- revisit with a real backtest if questions_per_tick or
 # TICK_SECONDS changes enough to move how many forecasts a cycle actually produces.
 CONFIDENCE_PRIOR_N = 200.0
-CONFIDENCE_CAP = 1500.0
+CONFIDENCE_CAP = 1500.0  # about 12.5 hours
 
 # No money exists in this domain, so there is no execution to suppress. See domain.py's
 # contract: an empty dict is the honest answer here, unlike sdex where omitting
@@ -194,6 +194,7 @@ def _shrunk_edge(count, mean_brier, mean_base):
     constants for why: this is what stops score from just measuring strategy age."""
     shrunk_brier = ((CONFIDENCE_PRIOR_N * mean_base + count * mean_brier)
                      / (CONFIDENCE_PRIOR_N + count))
+    # this should reach full weight in about 12.5 hours
     weight = min(count, CONFIDENCE_CAP)
     return weight * (mean_base - shrunk_brier)
 
