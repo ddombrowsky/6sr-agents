@@ -17,6 +17,12 @@ LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json')  # written by monitor.py
 # Preferred interpreter for a strategy's main.py, same path emperor.sh picks for monitor.
 VENV_PYTHON = os.environ.get('STRATEGY_PYTHON', '/opt/agents/venv/bin/python')
 
+# Per-clone creation marker (see monitor.strategy_age_s). Committed, not gitignored, so
+# it survives in the repo's history -- but clone_strategy overwrites it on every clone
+# before committing, the same way it overwrites config.json's inherited name, so a
+# child never keeps its parent's birth time.
+BIRTH_FILE = 'birth.json'
+
 
 def _strategy_python():
     """Which python runs a strategy's main.py.
@@ -63,8 +69,9 @@ def save_state(state):
     with STATE_FILE.open('w') as f:
         json.dump(state, f, indent=2)
 
-def _commit_clone_name(target, name):
-    """Commit the config.json name rewrite, so a fresh clone starts git-clean.
+def _commit_clone_metadata(target, name):
+    """Commit the config.json name rewrite and the fresh birth.json, so a clone starts
+    git-clean with both.
 
     monitor.revision_changed_anything() decides whether the revision model actually
     did anything by asking whether the clone is dirty or its HEAD moved since the
@@ -77,26 +84,35 @@ def _commit_clone_name(target, name):
     started. The gate's own docstring names that exact scenario as what it prevents.
 
     The rewrite belongs to the clone, not to the revision, so commit it here and let
-    the dirty check mean what it says. Also puts the name in the committed history
-    rather than only the working tree, which is what the next generation's `git
-    clone` copies. Non-fatal on failure: the clone is still usable, it just costs
-    that signal for this one strategy.
+    the dirty check mean what it says. Also puts the name (and now the birth time) in
+    the committed history rather than only the working tree, which is what the next
+    generation's `git clone` copies. Non-fatal on failure: the clone is still usable,
+    it just costs that signal -- and the age fallback -- for this one strategy.
     """
     def git(*args):
         return subprocess.run(['git', '-C', str(target), *args],
                               capture_output=True, text=True)
 
-    if git('diff', '--quiet', '--', 'config.json').returncode == 0:
-        return  # untracked, or the name already matched
+    # `git add` first: birth.json is untracked on a strategy's very first clone (the
+    # template repo doesn't carry one), so a `git diff -- birth.json` would see no
+    # tracked change to report even though the file is new. Staging both, then asking
+    # whether anything landed in the index, catches "new file" the same as "changed
+    # file".
+    paths = [p for p in ('config.json', BIRTH_FILE) if (target / p).exists()]
+    if not paths:
+        return
+    git('add', '--', *paths)
+    if git('diff', '--cached', '--quiet').returncode == 0:
+        return  # neither file actually changed (name already matched, birth already fresh)
     commit_args = ['commit', '-m', f'clone: set config name to {name}',
-                   '--', 'config.json']
+                   '--', *paths]
     if not git('config', 'user.email').stdout.strip():
         # Fresh container: git has no identity configured and commit would abort.
         commit_args = ['-c', 'user.email=monitor@localhost',
                        '-c', 'user.name=strat_manager.py'] + commit_args
     r = git(*commit_args)
     if r.returncode != 0:
-        print(f"Warning: could not commit config.json name for '{name}': "
+        print(f"Warning: could not commit config.json/birth.json for '{name}': "
               f"{r.stderr.strip() or r.stdout.strip()}")
 
 
@@ -120,8 +136,17 @@ def clone_strategy(name, repo_url):
             json.dump(cfg, cfg_path.open('w'), indent=2)
         except Exception as e:
             print(f"Warning: could not update config.json name for '{name}': {e}")
-        else:
-            _commit_clone_name(target, name)
+    # Stamp this clone's real creation time. Unconditional and always overwritten: a
+    # `git clone` of a parent that already has a birth.json (i.e. any non-template
+    # source) checks that parent's file out too, and it must not survive as this
+    # clone's birth time. See monitor.strategy_age_s for why this exists instead of
+    # os.stat -- filesystem ctime moves on ownership/permission changes that have
+    # nothing to do with when the strategy was actually created.
+    try:
+        (target / BIRTH_FILE).write_text(json.dumps({'created_s': time.time()}, indent=2))
+    except Exception as e:
+        print(f"Warning: could not write {BIRTH_FILE} for '{name}': {e}")
+    _commit_clone_metadata(target, name)
     state = load_state()
     state[name] = {'path': str(target), 'pid': None, 'status': 'stopped'}
     save_state(state)

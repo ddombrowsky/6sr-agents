@@ -220,6 +220,27 @@ CYCLE_SLEEP = 3600
 # asleep will not notice the file until the sleep ends).
 EXIT_FILE = Path('/opt/.monitor.py.exit')
 
+# 'auto' (default) revises via master-agent.py's Ollama-backed run_turn loop, unchanged.
+# 'manual' dumps the same prompt to disk instead and blocks the entire cycle -- not just
+# the one revision -- for a human to carry it out through Claude Code under direct
+# supervision. See _run_revision_manual. Single-flight by construction: provisioning is
+# sequential, so at most one manual revision is ever pending, hence fixed paths rather
+# than per-strategy ones, matching EXIT_FILE's style. Read/written by master-agent.py's
+# dump-revision-prompt / revision-done subcommands -- keep both files in sync if either
+# path changes.
+REVISION_MODE = os.environ.get('REVISION_MODE', 'auto')
+MANUAL_REVISION_PROMPT_FILE = Path('/opt/emperor_logs/pending_revision.md')
+MANUAL_REVISION_DONE_FILE = Path('/opt/.revision_done')
+MANUAL_REVISION_POLL_S = int(os.environ.get('MANUAL_REVISION_POLL_S', 30))
+# Deliberately NOT EXIT_FILE: EXIT_FILE's whole contract is "checked only at the
+# cycle-boundary sleeps, so nothing is in flight when it fires" (see EXIT_FILE above),
+# and once.sh already relies on being able to pre-touch it seconds after launch to mean
+# "stop after this one cycle" -- with a manual revision potentially pending, that would
+# abandon the wait almost immediately instead of giving a human time to act. This is a
+# separate signal for aborting one specific in-flight wait; touching EXIT_FILE keeps
+# meaning exactly what it always has.
+MANUAL_REVISION_ABORT_FILE = Path('/opt/.revision_abort')
+
 
 def _strategy_python():
     """Which interpreter a strategy is really started under.
@@ -269,18 +290,33 @@ def compute_strategy_score(strategy_name, state_entry, obs):
 
 
 def strategy_age_s(state_entry):
-    """Seconds since this strategy's directory was created, or None.
+    """Seconds since this strategy was actually cloned, or None.
 
-    The directory is created by `git clone` in strat_manager and never recreated, so its
-    ctime is the strategy's birth. config.json's mtime would not do -- a revision rewrites
-    it -- and state.json's is refreshed every 30s by the running loop.
+    Reads strat_manager's birth.json, written once at clone time and never touched
+    again (see clone_strategy). Preferred over the directory's st_ctime, which this
+    used until 2026-08-07: ctime is inode-metadata time, not creation time, and moves
+    on anything that changes the directory's own metadata -- not just a reclone but a
+    chmod/chown, e.g. a manual revision pass running under a different uid (see the
+    safe.directory fix a few lines up). clone_5ed6c72b0487's state.json carried a
+    ctime a full day after the strategy's real creation for exactly that reason.
+
+    Falls back to ctime for strategies cloned before birth.json existed. That fallback
+    inherits the same staleness risk this function exists to avoid, but it is still
+    better than None for a strategy the file predates.
 
     Overstates opportunity slightly for a strategy that spent part of its life stopped by
     the cull. That is the right direction for the only thing this is used for: deciding
     when a strategy has had enough market to prove it can act at all.
     """
+    from strat_manager import BIRTH_FILE
+    path = state_entry['path']
     try:
-        return max(0.0, time.time() - os.stat(state_entry['path']).st_ctime)
+        birth = json.load(open(os.path.join(path, BIRTH_FILE)))
+        return max(0.0, time.time() - birth['created_s'])
+    except Exception:
+        pass
+    try:
+        return max(0.0, time.time() - os.stat(path).st_ctime)
     except Exception:
         return None
 
@@ -480,7 +516,15 @@ def revert_main_py(strategy_dir, before_head, name):
 REVISION_IGNORES = ('state.json', '.strategy-revision-history.json')
 
 def _git(path, *args):
-    return subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True)
+    # `-c safe.directory=<path>` scoped to exactly this repo, not a global exception:
+    # these strategy dirs are cloned and committed by this same process, then can be
+    # edited by a manual revision pass running as a different uid (see the "manual
+    # revision" pause in _run_revision) -- which changes effective ownership and makes
+    # every subsequent git call here fail with "dubious ownership" otherwise. That
+    # failure used to be swallowed by _git_is_dirty/_git_head as "nothing changed",
+    # silently skipping the commit in commit_revision.
+    return subprocess.run(['git', '-c', f'safe.directory={path}', '-C', str(path), *args],
+                          capture_output=True, text=True)
 
 def _git_head(path):
     r = _git(path, 'rev-parse', 'HEAD')
@@ -499,7 +543,14 @@ def _main_py_at(strategy_dir, before_head):
 
 def _git_is_dirty(path):
     r = _git(path, 'status', '--porcelain')
-    return bool(r.stdout.strip()) if r.returncode == 0 else False
+    if r.returncode != 0:
+        # Unknown beats wrong: this return value gates whether commit_revision even
+        # attempts a commit, so a git failure here must never read as "clean" -- that
+        # silently discarded a real revision the one time this fired for real
+        # (seed_f6bc13d677a0, 2026-08-07, dubious-ownership swallowed as not-dirty).
+        print(f'git status failed for {path}: {r.stderr.strip()}')
+        return True
+    return bool(r.stdout.strip())
 
 def revision_changed_anything(path, before_head):
     """True if anything at all happened to `path` since it was cloned.
@@ -583,7 +634,10 @@ def _revision_budget():
     All-or-nothing, not a per-candidate coin flip: the ~25% of cycles that return 0 are
     the control arm, a whole batch built by DOMAIN.tweak_config / DOMAIN.seed_config
     alone, which is what the revised batches are compared against.
+
+    When in 'manual' mode, there is effectively no revision budget limit.
     """
+    if REVISION_MODE == 'manual': return 999999
     return REVISIONS_PER_CYCLE if random.random() < REVISION_CHANCE else 0
 
 _REVISION_INTERPRETER_CHECKED = []
@@ -646,6 +700,8 @@ def _run_revision(name, parent_name, score, leaderboard, obs, role=ROLE_REFINE):
     silent shape as the interpreter bug above, and selftest_domain.py asserts the round
     trip for exactly that reason.
     """
+    if REVISION_MODE == 'manual':
+        return _run_revision_manual(name, parent_name, score, leaderboard, obs, role)
     if not MASTER_AGENT_SCRIPT.exists():
         return False
     _check_revision_interpreter()
@@ -699,6 +755,73 @@ def _run_smoke_retry(name, reason):
         print(f'Master agent smoke-failure retry errored for {name}: {e}')
     return False
 
+def _run_revision_manual(name, parent_name, score, leaderboard, obs, role):
+    """Dump the revision prompt to disk and block the whole cycle for a human.
+
+    Same True/False contract as _run_revision -- False sends the caller to the
+    mechanical-tweak fallback exactly as an unreachable model would, e.g. if
+    dump-revision-prompt itself fails. Reaching MANUAL_REVISION_DONE_FILE always
+    returns True: it deliberately does not re-check the working tree itself, because
+    provision_strategy's own revision_changed_anything call right after this returns
+    already does that -- a human/Claude Code session that touched nothing is caught the
+    same way a no-op model reply is today.
+
+    Never calls master-agent.py's revise-strategy path, so _check_revision_interpreter
+    (which guards the Ollama turn's access to strategy dependencies) does not apply here.
+    """
+    if not MASTER_AGENT_SCRIPT.exists():
+        return False
+    for stale in (MANUAL_REVISION_DONE_FILE, MANUAL_REVISION_ABORT_FILE):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        result = subprocess.run(
+            [sys.executable, str(MASTER_AGENT_SCRIPT), 'dump-revision-prompt',
+             name, parent_name, str(score), leaderboard,
+             DOMAIN.encode_observation(obs), role, str(MANUAL_REVISION_PROMPT_FILE)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f'Could not prepare a manual revision for {name} ({role}): '
+                  f'{result.stderr.strip()}')
+            return False
+        print(result.stdout.strip())
+    except Exception as e:
+        print(f'Manual revision prompt for {name} ({role}) errored: {e}')
+        return False
+
+    print(
+        f'\n=== Cycle paused for a manual revision of {name} ({role}) ===\n'
+        f'In Claude Code:\n'
+        f'  Read {MANUAL_REVISION_PROMPT_FILE} and follow its instructions.\n'
+        f'When it has finished editing (no need to commit -- monitor.py does that), run:\n'
+        f'  python3 {MASTER_AGENT_SCRIPT} revision-done {name}\n'
+        f'to resume this cycle. Or touch {MANUAL_REVISION_ABORT_FILE} to give up on this '
+        f'one revision and exit instead. Waiting...\n'
+    )
+    sys.stdout.flush()
+    while not MANUAL_REVISION_DONE_FILE.exists():
+        if MANUAL_REVISION_ABORT_FILE.exists():
+            # Deliberately its own file, not EXIT_FILE -- see MANUAL_REVISION_ABORT_FILE
+            # above. Safe to abandon here for the same reason a cycle-boundary sleep is:
+            # this clone has been created but not yet gated, committed, or started, so
+            # abandoning it is exactly the "checked out but never started" case
+            # strat_manager.py reconcile/prune already cleans up next cycle -- nothing
+            # new to build for that.
+            print(f'{MANUAL_REVISION_ABORT_FILE} exists; abandoning the manual revision '
+                  f'of {name} and exiting instead of waiting further')
+            try:
+                MANUAL_REVISION_ABORT_FILE.unlink()
+            except OSError as e:
+                print(f'Warning: could not remove {MANUAL_REVISION_ABORT_FILE}: {e}')
+            sys.stdout.flush()
+            raise SystemExit(0)
+        time.sleep(MANUAL_REVISION_POLL_S)
+    MANUAL_REVISION_DONE_FILE.unlink()
+    print(f'Resuming: manual revision of {name} ({role}) marked done')
+    return True
 
 def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, leaderboard,
                        obs, revise, inject, seed_fallback, role=None):
