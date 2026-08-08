@@ -55,6 +55,7 @@ this domain and nothing here should pretend otherwise.
 Select it with DOMAIN=forecast.
 """
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -211,6 +212,19 @@ def score(state_dict, obs):
     edge = _shrunk_edge(count, brier_sum / count, base_sum / count)
     return STARTING_SCORE + SCORE_SCALE * edge, []
 
+def score_timeout_factor(count):
+    """After a period of time, the score begins to degrade back to 0.  This allows
+    a perfect strategy to rise to the top, and then leave room for new clones.
+    This is a test domain, after all.  It can be useful for testing new templates
+    or LLMs against each other."""
+    t0 = 24 * 3600 # no score change in first 24 hours
+    t1 = 72 * 3600 # score goes to 0 after 72 hours
+    sec_per_count = 30
+    t = sec_per_count * count
+    if (t <= t0): return 1
+    if (t >= t1): return 0
+    x = (t - t0) / (t1 - t0)
+    return 0.5 * (1.0 + math.cos(math.pi * x))
 
 def score_path(strategy_path, obs):
     """The authoritative score: independently judged from the forecast log, not from
@@ -223,7 +237,13 @@ def score_path(strategy_path, obs):
     count, mean_brier, mean_base = engine.cumulative_brier(name)
     if count == 0:
         return STARTING_SCORE
-    return STARTING_SCORE + SCORE_SCALE * _shrunk_edge(count, mean_brier, mean_base)
+    # mathematically, this means the score will approach 376000 if the strategy
+    # is perfectly accurate (i.e. mean_brier = 0).  base_brier -- in this test forecast
+    # module -- is always 0.25, so the mean is always 0.25.
+    return ((STARTING_SCORE +
+             SCORE_SCALE *
+             _shrunk_edge(count, mean_brier, mean_base)) *
+            score_timeout_factor(count))
 
 
 def activity_log_path(name):
