@@ -82,7 +82,8 @@ def main():
             if score == -float('inf'):
                 score = None       # display-only; the raw -inf still sorts last below
         age_s = monitor.strategy_age_s(info)
-        rows.append((name, info.get('status'), info.get('pid'), score, count, age_s))
+        max_score = info.get('max_score')
+        rows.append((name, info.get('status'), info.get('pid'), score, count, age_s, max_score))
 
     # The same order monitor.run() ranks on: strategies that have ever acted first (see
     # monitor.IDLE_GRACE_S), then by score, then by action count as a tiebreak.
@@ -91,16 +92,17 @@ def main():
               reverse=True)
 
     name_w = max(len(r[0]) for r in rows) + 2
-    header = (f"{'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>16}"
+    header = (f"{'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>16}{'MAX SCORE':>16}"
               f"{'ACTIONS':>10}{'AGE(h)':>9}  {'IDLE'}")
     print(header)
     print('-' * len(header))
-    for name, status, pid, score, count, age_s in rows[:20]:
+    for name, status, pid, score, count, age_s, max_score in rows[:20]:
         score_s = f'{score:.2f}' if score is not None else 'N/A'
+        max_score_s = f'{max_score:.2f}' if max_score is not None else 'N/A'
         pid_s = str(pid) if pid else '-'
         age_s_str = f'{age_s / 3600:.1f}' if age_s is not None else 'N/A'
         idle_s = 'yes' if name in idle_names else ''
-        print(f'{name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>16}'
+        print(f'{name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>16}{max_score_s:>16}'
               f'{count:>10}{age_s_str:>9}  {idle_s}')
 
     print(f'\nDomain: {DOMAIN.NAME}')

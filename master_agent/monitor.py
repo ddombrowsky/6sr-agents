@@ -1181,6 +1181,16 @@ def run():
             if is_idle(name, trade_counts[name], info):
                 idle_names.add(name)
             performances.append((name, score))
+            # -inf means compute_strategy_score couldn't read this strategy's state this
+            # cycle (see its docstring) -- not a real result, so it must not overwrite a
+            # genuine max_score from an earlier cycle.
+            if score != -float('inf'):
+                info['max_score'] = max(info.get('max_score', score), score)
+        # Persist the max_score update now, before any of the strat_manager.py subprocess
+        # calls below (stop/clone/start) read-modify-write STATE_FILE themselves -- they
+        # only touch their own keys per entry (see strat_manager.py's start_strategy/
+        # stop_strategy), so this ordering is what lets max_score survive those writes.
+        save_state(state)
         # Sort key, outermost first:
         #
         # 1. Has it ever acted (given IDLE_GRACE_S to do so)? A strategy that has not is
