@@ -745,95 +745,8 @@ if _DOMAIN.NAME == 'forecast':
 def _build_forecast_revision_system_prompt():
     return (
     'You are the strategy-revision agent for an evolutionary forecasting-benchmark '
-    'system (FUTURE.md item 3: a free, fast, unambiguously-scored domain with no money '
-    'at all -- a research harness for the evolutionary loop itself, not a trading '
-    'system). Each cycle monitor.py creates a small batch of new strategies -- clones of '
-    'the best current performers, plus one pulled fresh from the template -- and hands '
-    'each of them to you before it starts. The user message tells you which job you have '
-    'for this one: `refine` (improve on a parent with a real track record) or `explore` '
-    '(a fresh template strategy with no meaningful parent, where the job is to try '
-    'something the population is not already doing). Everything below applies to both. '
-    "You have full read/write/exec access to the strategy's directory and may change "
-    "anything about it: config.json, main.py's forecasting logic, or add new files "
-    "entirely.\n\n"
-    'THE GAME. Every 30 seconds the strategy is handed `questions_per_tick` questions '
-    '(a config.json knob). Each question gives you exactly one number, `feature`, in '
-    '[0, 1] -- a noisy but genuinely informative signal correlated with a hidden true '
-    'probability. Your job is to answer with `p_hat`, your own calibrated probability '
-    'estimate in [0, 1] that the question resolves True. You never see the true '
-    'probability or the outcome -- there would be nothing left to forecast if you did -- '
-    'and the answer is scored by /opt/tools/forecast_engine.py, independently of '
-    'anything this strategy claims about itself.\n\n'
-    "main.py's top-level `decide(feature, history, state, config)` is what "
-    '`backtest_forecast_strategy` replays and what `beats_null` is measured on -- keep '
-    'that exact signature even if the body changes completely. `history` is this '
-    "strategy's own past features, oldest first (not past outcomes -- it never learns "
-    'those). The template default is linear calibration: `p_hat = clip(0.5 + '
-    "confidence_gain * (feature - 0.5), 0, 1)`, with `confidence_gain` read from "
-    "config.json. Freely rewrite decide() -- that is the actual strategy. Do NOT call "
-    "forecast_engine.submit_forecast yourself or touch state.json's running tally "
-    "directly; main()'s tick loop already does both, and duplicating or bypassing it "
-    'only desyncs the tally from what actually got scored.\n\n'
-    f'You are scored on accumulated skill: '
-    f'{_FACTS["starting_score"]:.0f} + {_FACTS["score_scale"]:.0f} * sum(base_brier - '
-    f'brier) over every resolved forecast, summed rather than averaged so volume '
-    f'compounds -- more good calls ranks higher than fewer good calls at the same '
-    f'accuracy. {_FACTS["null_baseline"]} Growing that sum is the entire objective; a '
-    'strategy that ignores `feature` and always answers 0.5 scores exactly the starting '
-    'value and gets you nowhere, the same way sitting in cash forever would in a trading '
-    'domain.\n\n'
-    'You can and should test a revision before committing it. '
-    '`backtest_forecast_strategy(strategy_path)` replays the strategy over a fixed set '
-    'of already-resolved questions and returns trades, decide_source, mean_brier, '
-    'mean_base_brier, beats_null and null_pct in a fraction of a second -- use it as '
-    'your fitness check instead of guessing, and iterate until the numbers improve.\n'
-    '  * CHECK `decide_source` FIRST, before you read any other field. The backtester '
-    'only replays your logic if main.py exposes a top-level '
-    '`decide(feature, history, state, config)` returning a plain float, AND main.py\'s '
-    "top level contains nothing but imports, assignments, defs, the docstring and an "
-    "`if __name__ == '__main__'` guard (a bare `sys.path.append(...)` call, a top-level "
-    "print, an `if`/`with` or the tick loop itself all disqualify it -- write `sys.path "
-    "= sys.path + ['/opt/tools']` as an assignment instead). If it cannot, decide_source "
-    "comes back as something other than 'main.py:decide', a WARNING key is present, and "
-    'every number in the result describes the mechanical confidence_gain-only fallback '
-    "rather than your code. Fix the structure and re-run until decide_source is "
-    "'main.py:decide'; a revision that never reaches its own fitness check has not been "
-    'tested at all.\n'
-    "  * Once decide_source is 'main.py:decide', treat `beats_null: false` (mean_brier "
-    ">= mean_base_brier) as a failed revision and try something else -- a strategy that "
-    "cannot beat guessing 0.5 is not worth starting.\n"
-    '  * The fixed question set used here is unrelated to the live game\'s actual '
-    'questions (different seed, see forecast_engine.py\'s docstring), so results are '
-    'always comparable across runs and across strategies -- there is no equivalent of '
-    "sdex's \"only 12 hours of recorded basis history\" caveat to worry about here.\n\n"
-    'You are free to invent config.json knobs beyond confidence_gain -- a nonlinearity, '
-    'a confidence threshold below which you hedge toward 0.5, a per-tick ensemble of '
-    'rules, or something else entirely. ALWAYS read a key you add as '
-    '`config.get("your_key", <sensible default>)`, never `config["your_key"]`: a '
-    'main.py that raises KeyError on its first tick fails the smoke test and is '
-    'reverted. Do not rename, repurpose or drop `name`, `schema_version`, '
-    '`questions_per_tick` or `confidence_gain` -- monitor and the shared tally in '
-    'state.json read those; add alongside them.\n\n'
-    'When you are done, commit your changes on a new git branch inside the '
-    "strategy's own directory (`git checkout -b auto/<timestamp>` then `git add -A "
-    '&& git commit -m ...`) so the revision is tracked.\n\n'
-    # Same incident, same fix, same domain-agnostic reason it sits last -- see the sdex
-    # prompt above for the measured counts this addresses.
-    'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
-    'nothing: pasting the new config.json into your answer does not write it, quoting a '
-    'main.py diff does not apply it, and a `git commit` line inside a code fence does '
-    'not run. monitor.py reads the directory, never your summary, and a revision that '
-    'left the files untouched is discarded and replaced with a mechanical threshold '
-    'nudge: the slot is spent and your analysis is lost. So before you write your final '
-    'reply, `read_file` every path you claim to have changed and confirm the new content '
-    'is really on disk. And check the order you did things in -- a '
-    '`backtest_forecast_strategy` result from before you wrote the file describes the '
-    'old code, not your revision, so re-run it rather than quoting it.\n\n'
-    'Finish by replying with a short summary of the changes you have already written to '
-    'disk, and why.'
-    )
-
+    'system.  Your purpose is to revise main.py and the associated files in order '
+    'to increase your score and win the game.')
 
 if _DOMAIN.NAME == 'forecast':
     REVISION_SYSTEM_PROMPT = _build_forecast_revision_system_prompt()
@@ -1091,6 +1004,65 @@ def _config_only_correction(strategy_path: Path) -> str:
     )
 
 
+def _smoke_test_correction(reason: str) -> str:
+    """Sent back for one extra turn when monitor.py's post-hoc smoke test failed.
+
+    The smoke test runs main.py as main() would run it in production -- not just
+    imports decide() the way backtest_forecast_strategy/backtest_strategy does -- and it
+    only runs in monitor.py, after this session has already exited once. This is the
+    only way the model ever finds out that backtest passing and beats_null/beats_buy_hold
+    being true was not the same as the file actually running. Quotes the exact failure
+    monitor.py logged, since a vague "it didn't work" would waste the one retry on the
+    model guessing at what broke instead of fixing it.
+    """
+    return (
+        f"Your revision was committed, but monitor.py's smoke test failed:\n\n"
+        f'  {reason}\n\n'
+        f'That smoke test actually starts main.py as a standalone process the way '
+        f'production does, which is a different and stricter check than the backtest '
+        f'tool you already ran -- decide_source == "main.py:decide" only proves decide() '
+        f'is importable, not that the file still runs. Common causes: the rewrite '
+        f"dropped main() or the `if __name__ == '__main__':` guard entirely (the file "
+        f'defines functions and exits immediately with no output), or it kept them but '
+        f'broke something in the process itself -- a forgotten import, a NameError, an '
+        f'exception before the first state save.\n\n'
+        f'Read main.py back with `read_file`, fix whatever the error above points at '
+        f'without discarding your actual decide() logic, and write the corrected file. '
+        f'This is your last attempt this cycle -- if it fails again the whole revision '
+        f'is discarded and replaced with a mechanical tweak.'
+    )
+
+
+def retry_after_smoke_failure(strategy_name: str, reason: str = '') -> None:
+    """One bounded extra turn after monitor.py's post-hoc main.py smoke test fails.
+
+    Distinct from the in-session retry loop inside revise_strategy (which only fires for
+    "wrote nothing" / "config-only", both detectable before that subprocess exits): the
+    smoke test itself only runs in monitor.py, after the revision subprocess has already
+    exited and main.py has already been checked out to a fresh branch. The only way to
+    get the failure back to the model is a second invocation reusing the persisted
+    conversation, so it can see exactly what it wrote and why -- rather than starting
+    over with the original task prompt, which is what a fresh revise_strategy call would
+    do. monitor.py calls this at most once per revision; see its call site for the bound.
+    """
+    strategy_path = STRATEGIES_DIR / strategy_name
+    print(f'[revise-strategy-retry] {strategy_name}')
+    messages = _load_revision_history(strategy_path)
+    if len(messages) <= 1:
+        # Nothing but the system prompt -- e.g. the history file is missing or was
+        # never written. No real conversation exists to append the correction to.
+        print(f'[revise-strategy-retry] {strategy_name}: no revision history to retry '
+              f'against')
+        sys.exit(1)
+    messages.append({'role': 'user', 'content': _smoke_test_correction(reason)})
+    reply = run_turn(messages)
+    print(reply)
+    _save_revision_history(strategy_path, messages)
+    if reply.startswith('[error:'):
+        print(reply, file=sys.stderr)
+        sys.exit(1)
+
+
 def _load_revision_history(strategy_path: Path) -> list:
     history_file = strategy_path / REVISION_HISTORY_FILENAME
     if history_file.exists():
@@ -1234,25 +1206,7 @@ def _refine_prompt_forecast(strategy_name, parent_name, strategy_path, parent_sc
     parent_state = _read_json(parent_path / 'state.json', {})
     forecast_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
     clone_main_py = _read_text(strategy_path / 'main.py')
-    return (
-        f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
-        f'`{strategy_path}` (a git checkout of the strategy code). It has not made a '
-        f'forecast yet.\n\n'
-        f'{tick_line}'
-        f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
-        f"Parent `{parent_name}`'s current state.json (forecasts_made/brier_sum/"
-        f"base_brier_sum -- a running tally, lower brier_sum per forecast is better): "
-        f"{json.dumps(parent_state)}\n"
-        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
-        f"Parent `{parent_name}`'s most recent resolved forecasts:\n{forecast_tail}\n\n"
-        f"The clone's main.py (identical to the parent's right now -- this is what you'd "
-        f"edit to change forecasting logic, not just config.json):\n"
-        f"```python\n{clone_main_py}\n```\n\n"
-        f'Current leaderboard (strategy name -> score, all strategies currently '
-        f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
-        f'Revise the clone at `{strategy_path}` however you think will improve on its '
-        f'parent, then commit your changes to a new git branch inside that directory.'
-    )
+    return ('adjust config.json to increase your performance')
 
 
 def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_line) -> str:
@@ -1268,46 +1222,7 @@ def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_lin
     """
     own_config = _read_json(strategy_path / 'config.json', {})
     own_main_py = _read_text(strategy_path / 'main.py')
-    return (
-        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
-        f'unmodified checkout of /opt/template_repo_forecast -- NOT a clone of any '
-        f'existing strategy. It has no parent, no forecast history and no track record, '
-        f'so there is nothing here to improve on. Your job this time is EXPLORATION: '
-        f'give the population a strategy that is structurally different from what it '
-        f'already runs.\n\n'
-        f'{tick_line}'
-        f'Its config.json right now: {json.dumps(own_config)}\n'
-        f'monitor.py checks the config you leave behind: `name` must still be exactly '
-        f'"{strategy_name}", `questions_per_tick` must be a positive integer (at most '
-        f'{_FACTS["max_questions_per_tick"]}), and `confidence_gain` must be in '
-        f'[0, {_FACTS["max_confidence_gain"]}]. Even if your logic does not use '
-        f'a plain linear gain at all, you must still leave those two knobs in range -- '
-        f'otherwise monitor repairs them back to safe defaults.\n\n'
-        f'CONFIG.JSON IS YOURS TO EXTEND beyond those two required keys -- nothing here '
-        f'validates it against a schema, and the entire config dict is handed to your '
-        f'`decide(feature, history, state, config)` unchanged, in live running and '
-        f'inside backtest_forecast_strategy alike. A nonlinearity\'s shape, a confidence '
-        f'threshold below which you hedge toward 0.5, an ensemble weight -- whatever '
-        f'your logic needs belongs in config.json under a name that says what it means, '
-        f'not hardcoded in main.py. Two rules:\n'
-        f'  * ALWAYS read your own keys as `config.get("your_key", <sensible '
-        f'default>)`, never `config["your_key"]`. A main.py that raises KeyError on its '
-        f'first tick fails the smoke test and is reverted.\n'
-        f'  * Do not rename, repurpose or drop `name`, `schema_version`, '
-        f'`questions_per_tick` or `confidence_gain` -- monitor and the shared tally in '
-        f'state.json read those. Add alongside them.\n\n'
-        f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
-        f'proven code, so you are free to restructure it):\n'
-        f'```python\n{own_main_py}\n```\n\n'
-        f'Current leaderboard (strategy name -> score, all strategies currently '
-        f'running): {json.dumps(leaderboard)}\n\n'
-        f'Whatever you write, a top-level `decide()` must remain importable '
-        f'(backtest_forecast_strategy must report decide_source "main.py:decide", not '
-        f'anything else) and beats_null must come back true -- for a strategy with no '
-        f'track record that is the entire acceptance test, so run '
-        f'backtest_forecast_strategy and iterate until it passes.\n\n'
-        f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
-    )
+    return ('adjust config.json to increase your performance')
 
 
 def _compose_revision_messages(strategy_name: str, parent_name: str, parent_score: str,
@@ -1537,6 +1452,8 @@ def main():
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'revise-strategy':
         revise_strategy(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == 'retry-after-smoke-failure':
+        retry_after_smoke_failure(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == 'dump-revision-prompt':
         dump_revision_prompt(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == 'revision-done':

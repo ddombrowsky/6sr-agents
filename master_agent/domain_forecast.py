@@ -55,6 +55,7 @@ this domain and nothing here should pretend otherwise.
 Select it with DOMAIN=forecast.
 """
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -80,6 +81,23 @@ STARTING_SCORE = 1000.0
 # docstring on why a number stated in a prompt and a number enforced in code drifting
 # apart is a recurring, specifically-named failure mode in this codebase.
 SCORE_SCALE = 1000.0
+
+# How much weight a strategy's own track record gets before it is trusted over the base
+# rate, and the ceiling on how much raw volume alone can grow a score once it clearly is
+# trusted. Both serve the SAME purpose SCORE_SCALE's comment names -- a lucky small sample
+# must not be able to outrank an established track record -- they just asymptote instead
+# of compounding forever. Measured against the 2026-08-06 forecast run's cycle-5
+# leaderboard: uncapped, a 3210-forecast strategy at brier=0.2199 permanently outranked a
+# 1854-forecast strategy at a genuinely better brier=0.2128, and every strategy spawned
+# after cycle 1 was still short of the leader's forecast count five cycles (7+ hours)
+# later -- score was rewarding age, not skill, once both strategies had long since cleared
+# any reasonable noise floor. CONFIDENCE_PRIOR_N sets that floor (below it, score stays
+# close to STARTING_SCORE regardless of how lucky the sample looks); CONFIDENCE_CAP sets
+# where volume stops mattering and skill takes over completely. Both are round numbers,
+# not fit to this one run -- revisit with a real backtest if questions_per_tick or
+# TICK_SECONDS changes enough to move how many forecasts a cycle actually produces.
+CONFIDENCE_PRIOR_N = 200.0
+CONFIDENCE_CAP = 1500.0  # about 12.5 hours
 
 # No money exists in this domain, so there is no execution to suppress. See domain.py's
 # contract: an empty dict is the honest answer here, unlike sdex where omitting
@@ -169,6 +187,18 @@ def observation_line(obs):
             f'and resolved outcomes.\n')
 
 
+def _shrunk_edge(count, mean_brier, mean_base):
+    """Blend a strategy's observed mean_brier with the base rate it's measured against,
+    weighted down for a small sample (CONFIDENCE_PRIOR_N), then weight the resulting edge
+    by volume up to a ceiling (CONFIDENCE_CAP) rather than without bound. See those
+    constants for why: this is what stops score from just measuring strategy age."""
+    shrunk_brier = ((CONFIDENCE_PRIOR_N * mean_base + count * mean_brier)
+                     / (CONFIDENCE_PRIOR_N + count))
+    # this should reach full weight in about 12.5 hours
+    weight = min(count, CONFIDENCE_CAP)
+    return weight * (mean_base - shrunk_brier)
+
+
 def score(state_dict, obs):
     """See the module docstring's WHY score() AND score_path() DIVERGE section. Reads
     the running tally the template keeps in state.json, not the log."""
@@ -180,8 +210,22 @@ def score(state_dict, obs):
         return STARTING_SCORE, ['forecasts_made']
     if count <= 0:
         return STARTING_SCORE, []
-    return STARTING_SCORE + SCORE_SCALE * (base_sum - brier_sum), []
+    edge = _shrunk_edge(count, brier_sum / count, base_sum / count)
+    return STARTING_SCORE + SCORE_SCALE * edge, []
 
+def score_timeout_factor(count):
+    """After a period of time, the score begins to degrade back to 0.  This allows
+    a perfect strategy to rise to the top, and then leave room for new clones.
+    This is a test domain, after all.  It can be useful for testing new templates
+    or LLMs against each other."""
+    t0 = 24 * 3600 # no score change in first 24 hours
+    t1 = 72 * 3600 # score goes to 0 after 72 hours
+    sec_per_count = 30
+    t = sec_per_count * count
+    if (t <= t0): return 1
+    if (t >= t1): return 0
+    x = (t - t0) / (t1 - t0)
+    return 0.5 * (1.0 + math.cos(math.pi * x))
 
 def score_path(strategy_path, obs):
     """The authoritative score: independently judged from the forecast log, not from
@@ -194,7 +238,13 @@ def score_path(strategy_path, obs):
     count, mean_brier, mean_base = engine.cumulative_brier(name)
     if count == 0:
         return STARTING_SCORE
-    return STARTING_SCORE + SCORE_SCALE * count * (mean_base - mean_brier)
+    # mathematically, this means the score will approach 376000 if the strategy
+    # is perfectly accurate (i.e. mean_brier = 0).  base_brier -- in this test forecast
+    # module -- is always 0.25, so the mean is always 0.25.
+    return ((STARTING_SCORE +
+             SCORE_SCALE *
+             _shrunk_edge(count, mean_brier, mean_base)) *
+            score_timeout_factor(count))
 
 
 def activity_log_path(name):
