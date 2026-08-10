@@ -11,12 +11,12 @@ if [ "$1" = "--to" ] ; then
     cp -v ./tools/* ./v/tools/
     cp -v ./template_repo/* ./v/template_repo/
     rm -f ./scripts/env.sh
-    cp -v ./scripts/*.sh ./v/
+    cp -v ./scripts/*.{sh,py} ./v/
 else
     cp -v ./v/agents/* ./ 2>/dev/null
     cp -v ./v/master_agent/* ./master_agent/ 2>/dev/null
     cp -v ./v/tools/* ./tools/ 2>/dev/null
     cp -v ./v/template_repo/* ./template_repo/ 2>/dev/null
     cp -v ./v/template_repo_forecast/* ./template_repo_forecast/ 2>/dev/null
-    cp -v ./v/*.sh ./scripts/ 2>/dev/null
+    cp -v ./v/*.{sh,py} ./scripts/ 2>/dev/null
 fi
