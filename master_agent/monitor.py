@@ -1255,6 +1255,87 @@ def promote_live_strategy(current_leader, leader_score):
     save_live_strategy(current_leader, sizing=DOMAIN.promotion_sizing(current_leader),
                        trustlines=trustlines)
 
+
+def promote_strategy_manual(name, force=False):
+    """Operator-driven promotion: wind down whoever is live, put `name` live instead.
+
+    Same shape as promote_live_strategy, called by hand (`monitor.py --promote NAME`)
+    against an operator's own choice of strategy rather than this cycle's #1. The three
+    hard gates are never bypassable, --force or not, because each guards something a
+    human picking a name by hand cannot substitute for:
+      * check_boundary_integrity  -- a compromised revision boundary
+      * DOMAIN.can_execute_live   -- a strategy structurally incapable of a real order
+      * DOMAIN.retire_live        -- a real position left behind with nothing watching it
+    --force only skips qualifies_for_live's track-record bar (trade count/age/score),
+    since that gate exists purely as a stand-in for judgment an operator is now supplying
+    directly by picking this name. Returns (ok, [lines to print]).
+    """
+    if not (STRATEGIES_DIR / name / 'main.py').exists():
+        return False, [f'{name}: no such strategy ({STRATEGIES_DIR / name} has no main.py)']
+
+    intact, problems = check_boundary_integrity()
+    if not intact:
+        return False, ['refusing to promote -- the real-money safety boundary has changed:',
+                        *[f'  - {p}' for p in problems],
+                        f'  review the changes, commit them, then delete {INTEGRITY_BASELINE} '
+                        f'to re-baseline']
+
+    can_execute, why_not = DOMAIN.can_execute_live(name)
+    if not can_execute:
+        return False, [f'refusing to promote {name}: {why_not}']
+
+    live = load_live_strategy()
+    if live and live.get('name') == name:
+        flag = STRATEGIES_DIR / name / 'live.flag'
+        if not flag.exists():
+            set_live_flag(name, True)
+        return True, [f'{name} is already live']
+
+    state = load_state()
+    lines = []
+    if name in state:
+        obs = DOMAIN.observe()
+        if obs is not None:
+            obs = DOMAIN.observe_population(obs, state)
+            score = compute_strategy_score(name, state[name], obs)
+            ok, reason = qualifies_for_live(name, score)
+            if ok:
+                lines.append(f'{name} qualifies for live: {reason}')
+            elif force:
+                lines.append(f'{name} does not meet the automatic track-record bar '
+                             f'({reason}); promoting anyway (--force)')
+            else:
+                return False, [f'{name} does not qualify for live: {reason}',
+                               '  pass --force to override this check (trade count/age/'
+                               'score only -- boundary integrity and can_execute_live are '
+                               'never overridden)']
+        else:
+            lines.append(f'{DOMAIN.OBSERVE_FAILURE_NOTE}; could not verify track record '
+                         f'this pass')
+            if not force:
+                return False, [*lines, f'pass --force to promote {name} without that '
+                               f'verification']
+    elif not force:
+        return False, [f'{name} is not a tracked strategy (not in {STATE_FILE}); '
+                       f'pass --force to promote it anyway']
+
+    if live and live.get('name'):
+        old_name = live['name']
+        lines.append(f'Live strategy changing from {old_name} to {name}; winding down '
+                     f'{old_name} first')
+        flattened, wind_lines = DOMAIN.retire_live(old_name)
+        lines.extend(f'  {l}' for l in wind_lines)
+        if not flattened:
+            return False, lines
+        set_live_flag(old_name, False)
+
+    lines.append(f'Promoting {name} to live')
+    trustlines = DOMAIN.prepare_live(name)
+    set_live_flag(name, True)
+    save_live_strategy(name, sizing=DOMAIN.promotion_sizing(name), trustlines=trustlines)
+    return True, lines
+
+
 def run():
     while True:
         print('--- Monitoring cycle', datetime.datetime.now(), '---')
@@ -1492,12 +1573,19 @@ def run():
         # Wait an hour before next cycle (or exit here if asked to stop)
         sleep_or_exit(CYCLE_SLEEP)
 
-USAGE = """usage: monitor.py [--ensure-recorder]
+USAGE = """usage: monitor.py [--ensure-recorder | --promote NAME [--force]]
 
-  (no arguments)      run the evolutionary loop forever, one cycle per hour
-  --ensure-recorder   start the domain's background jobs if they are not already
-                      running, print their report, and exit.
-                      Exits 1 if they could not be confirmed running.
+  (no arguments)        run the evolutionary loop forever, one cycle per hour
+  --ensure-recorder     start the domain's background jobs if they are not already
+                        running, print their report, and exit.
+                        Exits 1 if they could not be confirmed running.
+  --promote NAME        wind down whoever is currently live and promote NAME instead.
+                        Refuses if the safety boundary is compromised, if NAME cannot
+                        structurally place a real order, or if winding down the outgoing
+                        strategy doesn't fully flatten it. Also refuses if NAME hasn't
+                        earned the same track record an automatic promotion requires,
+                        unless --force is given.
+  --force               with --promote, skip only the track-record check above.
 """
 
 if __name__ == '__main__':
@@ -1518,6 +1606,14 @@ if __name__ == '__main__':
         alive = DOMAIN.background_jobs_alive()
         print(f'recorder running: {alive}')
         sys.exit(0 if alive else 1)
+    elif args and args[0] == '--promote' and len(args) in (2, 3) and \
+            (len(args) == 2 or args[2] == '--force'):
+        name = args[1]
+        force = len(args) == 3
+        ok, lines = promote_strategy_manual(name, force=force)
+        for line in lines:
+            print(line)
+        sys.exit(0 if ok else 1)
     else:
         print(USAGE, end='')
         sys.exit(0 if args in (['-h'], ['--help']) else 2)
