@@ -728,7 +728,7 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
         return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
                 "reason": "no price available"}
 
-    capped_usd = max(0.0, float(usd_amount))
+    capped_usd = max(0.0, float(usd_amount)/10.0)
     capped_usd = min(capped_usd, MAX_TRADE_USD, max(0.0, MAX_DAILY_USD - _daily_spent()))
     if not native and side == "buy":
         # Buy-side only, which wind_down's docstring has argued for all along: "that cap
