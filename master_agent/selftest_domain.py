@@ -171,7 +171,16 @@ def _load_baseline_monitor():
     """The pre-refactor monitor.py, imported as its own module. None if unavailable.
 
     strat_manager is stubbed, not imported: it mkdirs /opt/strategies as an import side
-    effect, and the only thing baseline monitor wants from it is _strategy_python.
+    effect. This stub is not scoped to baseline monitor alone, though -- it caches into
+    sys.modules['strat_manager'] for the rest of the process, so the CURRENT monitor.py
+    imported below (section 5) gets it too, on purpose: see the `_strategy_python`
+    monkeypatch there ("no strat_manager outside /opt"), which exists because this
+    self-test is meant to run outside the container, where the real strat_manager's
+    module-level mkdir has no /opt to land in. So every name current or baseline
+    monitor.py reaches for on strat_manager has to be shimmed here, not just whatever
+    baseline monitor.py happens to want. BIRTH_FILE is a plain filename constant
+    (strat_manager.BIRTH_FILE = 'birth.json'), not a fact that drifts like a price or a
+    haircut, so duplicating its value here is safe.
     """
     if _BASELINE is None:
         return None
@@ -182,6 +191,7 @@ def _load_baseline_monitor():
     if 'strat_manager' not in sys.modules:
         stub = types.ModuleType('strat_manager')
         stub._strategy_python = lambda: sys.executable
+        stub.BIRTH_FILE = 'birth.json'
         sys.modules['strat_manager'] = stub
     path = Path(tempfile.mkdtemp(prefix='domain_baseline_')) / 'baseline_monitor.py'
     path.write_text(source)
@@ -672,11 +682,16 @@ if CUR_MA is None:
 elif BASE_MA is None:
     skip('prompt differential', f'could not load master-agent.py at {BASELINE_COMMIT}')
 else:
-    same('REVISION_SYSTEM_PROMPT is byte-identical to the baseline',
-         hashlib.sha256(BASE_MA.REVISION_SYSTEM_PROMPT.encode()).hexdigest(),
-         hashlib.sha256(CUR_MA.REVISION_SYSTEM_PROMPT.encode()).hexdigest())
-    same('REVISION_SYSTEM_PROMPT length', len(BASE_MA.REVISION_SYSTEM_PROMPT),
-         len(CUR_MA.REVISION_SYSTEM_PROMPT))
+    # There used to be a same('REVISION_SYSTEM_PROMPT is byte-identical to the
+    # baseline', ...) pair here, proving the 2026 domain-plugin refactor (hardcoded sdex
+    # text -> _build_sdex_revision_system_prompt()) did not alter the prompt itself. That
+    # was a one-time proof about THAT refactor, not a promise the wording would never
+    # change again -- and it was retired 2026-08-11 when the prompt was deliberately
+    # rewritten for a token-diet pass (see the "freeze was lifted" comment above
+    # _build_sdex_revision_system_prompt in master-agent.py). Keeping it would fail this
+    # self-test forever for a change that was intentional; the checks below it, which
+    # verify every number the prompt states still matches the module that enforces it,
+    # are the ones that still matter and do not depend on exact wording.
     if not Path('/opt/tools').exists():
         check('the baseline prompt hash matches the recorded constant',
               hashlib.sha256(BASE_MA.REVISION_SYSTEM_PROMPT.encode()).hexdigest()
