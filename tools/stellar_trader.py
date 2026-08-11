@@ -105,6 +105,13 @@ _MAX_WIND_DOWN_CHUNKS_PER_CALL = 20  # safety bound; remainder retried next moni
 # see _sellable_xlm's docstring for why the ordinary sell path now honours it too.
 MIN_TRUSTLINE_RESERVE_XLM = MIN_XLM_OPERATING_BUFFER + MAX_OPEN_NONBASE_ASSETS * _BASE_RESERVE_XLM
 
+# Real, pre-funded XLM set aside to back short-sells (SHORTING_PLAN.md). Not part of any
+# strategy's ordinary trading capital: _sellable_xlm floors above it whenever a buffer has
+# been funded, so an ordinary sell or wind_down can never spend it by accident. There is
+# no protocol margin here -- a short-sell literally spends out of this pre-funded reserve,
+# and a cover buy replenishes it.
+SHORT_BUFFER_XLM = 60.0
+
 
 def _paper_only():
     """True when this process must never sign or submit a real transaction.
@@ -132,6 +139,11 @@ _TRUSTLINES_PATH = BASE_DIR / '.trustlines.json'
 _STUCK_PATH = BASE_DIR / '.stuck_positions.json'
 # Operator-visible kill switch. While this exists nothing trades, including XLM.
 _HALT_PATH = BASE_DIR / '.live_halt'
+# Written once, by hand, after an operator deposits SHORT_BUFFER_XLM beyond the ordinary
+# reserve. submit_trade re-checks this independently of a caller's short=True -- a
+# short-sell request with no recorded, sufficiently-funded buffer is refused, never
+# silently allowed through. See _short_buffer_funded.
+_SHORT_BUFFER_PATH = BASE_DIR / '.short_buffer.json'
 
 _verify_cache = {}
 
@@ -290,6 +302,23 @@ def _spendable_xlm(account_json):
     return max(0.0, balance - reserve - _FEE_BUFFER_XLM)
 
 
+def _short_buffer_funded():
+    """True only if a human has recorded a real, sufficient SHORT_BUFFER_XLM deposit.
+
+    Fails closed on a missing file, a malformed one, or a recorded amount below
+    SHORT_BUFFER_XLM -- a short-sell request is refused rather than silently allowed
+    through on the caller's say-so alone, the same "request, not instruction" pattern
+    _verified_asset already applies to asset admission.
+    """
+    record = _read_json(_SHORT_BUFFER_PATH, None)
+    if not record:
+        return False
+    try:
+        return float(record.get('funded_xlm', 0.0)) >= SHORT_BUFFER_XLM
+    except (TypeError, ValueError):
+        return False
+
+
 def _sellable_xlm(account_json):
     """Spendable XLM that may be sold — spendable minus the trustline/fee reserve.
 
@@ -311,8 +340,57 @@ def _sellable_xlm(account_json):
     What the floor actually costs a strategy: MIN_TRUSTLINE_RESERVE_XLM is 2.0 XLM, about
     $0.35, against a MAX_TRADE_USD chunk of $4.00 ≈ 23 XLM. Under 9% of a single chunk,
     and only ever on the last sell of a full liquidation.
+
+    When a short buffer has been funded (SHORTING_PLAN.md), the floor rises by
+    SHORT_BUFFER_XLM on top of MIN_TRUSTLINE_RESERVE_XLM, so an ordinary sell or
+    wind_down -- both call this, never _short_sellable_xlm -- can never spend into it by
+    accident.
+    """
+    floor = MIN_TRUSTLINE_RESERVE_XLM
+    if _short_buffer_funded():
+        floor += SHORT_BUFFER_XLM
+    return max(0.0, _spendable_xlm(account_json) - floor)
+
+
+def _short_sellable_xlm(account_json):
+    """The short buffer itself — spendable XLM above only MIN_TRUSTLINE_RESERVE_XLM.
+
+    Used exclusively by submit_trade's short-sell path, and only once
+    _short_buffer_funded() has independently confirmed the buffer is real. Deliberately
+    does NOT also subtract SHORT_BUFFER_XLM -- that would floor a short-sell out of the
+    very reserve it exists to draw down.
     """
     return max(0.0, _spendable_xlm(account_json) - MIN_TRUSTLINE_RESERVE_XLM)
+
+
+def short_buffer_status():
+    """Public status check for the short buffer (SHORTING_PLAN.md): is it funded, and
+    does claudio's live spendable XLM right now actually cover the required floor?
+
+    The public counterpart to the _short_buffer_funded/_short_sellable_xlm internals
+    above, for callers outside this module -- domain_sdex.can_execute_live gates
+    promotion of an allow_shorting strategy on this, since a strategy's config flag
+    saying "shorting is on" does not imply the real money backing it exists. Fails
+    closed (funded=False) on any read/network error.
+
+    Returns {'funded': bool, 'spendable_xlm': float|None, 'required_xlm': float,
+             'reason': str|None}.
+    """
+    required = MIN_TRUSTLINE_RESERVE_XLM + SHORT_BUFFER_XLM
+    if not _short_buffer_funded():
+        return {'funded': False, 'spendable_xlm': None, 'required_xlm': required,
+                'reason': f'no funded buffer recorded at {_SHORT_BUFFER_PATH}'}
+    try:
+        account = _account(_source_address())
+        spendable = _spendable_xlm(account)
+    except Exception as e:
+        return {'funded': False, 'spendable_xlm': None, 'required_xlm': required,
+                'reason': f'could not read live XLM balance: {e}'}
+    if spendable < required:
+        return {'funded': False, 'spendable_xlm': spendable, 'required_xlm': required,
+                'reason': f'spendable {spendable:.4f} XLM below required {required} XLM'}
+    return {'funded': True, 'spendable_xlm': spendable, 'required_xlm': required,
+            'reason': None}
 
 
 def _current_live_name():
@@ -654,7 +732,7 @@ def _most_recent_tx_hash(address):
     return records[0]["hash"] if records else ""
 
 
-def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
+def submit_trade(side: str, usd_amount: float, *, asset='XLM', short=False) -> dict:
     """Sign and submit a real trade on pubnet using the `claudio` identity.
 
     side: 'buy' (spend USDC for `asset`) or 'sell' (spend `asset` for USDC). asset:
@@ -668,6 +746,14 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
     MAX_DAILY_USD_PER_ASSET budget, MAX_POSITION_USD_PER_ASSET and
     MAX_TOTAL_NONBASE_EXPOSURE_USD. Sells are not: those cap entry risk, and applying
     them to an exit is what made a fully-sized leg unsellable for 24h.
+
+    short: XLM-only (SHORTING_PLAN.md). A *request* like `asset`, not an instruction --
+    honoured only for a native sell, and only once _short_buffer_funded() has
+    independently confirmed a real, sufficient deposit is recorded at
+    _SHORT_BUFFER_PATH. When honoured, the sell draws against the pre-funded short
+    buffer (_short_sellable_xlm) instead of ordinary trading capital (_sellable_xlm), so
+    it can spend the account down past the ordinary MIN_TRUSTLINE_RESERVE_XLM floor.
+    Ignored on every other side/asset combination.
 
     Returns {'submitted': bool, 'tx_hash': str|None, 'amount_usd': float, 'reason': str|None}.
     """
@@ -693,6 +779,15 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
 
     native = _is_native(spec)
     code, issuer = (spec.split(':') + [None])[:2] if not native else ("XLM", None)
+
+    # short is a request, not an instruction (see docstring): re-verified here rather
+    # than trusted, so a short-sell request with no recorded, sufficiently-funded buffer
+    # is refused outright instead of silently falling through to an ordinary sell that
+    # could dip into infrastructure reserve.
+    if short and side == "sell" and native and not _short_buffer_funded():
+        return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
+                "reason": f"short-sell requested but no funded buffer recorded at "
+                          f"{_SHORT_BUFFER_PATH}"}
 
     if not native:
         # Admission is absolute for buys -- this is the third and only unskippable
@@ -776,9 +871,16 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM') -> dict:
     floored_reason = None
     if side == "sell":
         if native:
-            # _sellable_xlm, not _spendable_xlm: the trustline and fee reserve is
-            # infrastructure, not part of any strategy's position. See its docstring.
-            available_usd = _sellable_xlm(account) * price
+            if short:
+                # Fail-closed funding check already ran above; this draws against the
+                # buffer itself rather than ordinary trading capital.
+                available_usd = _short_sellable_xlm(account) * price
+            else:
+                # _sellable_xlm, not _spendable_xlm: the trustline and fee reserve is
+                # infrastructure, not part of any strategy's position. See its
+                # docstring. Also floors above any funded short buffer, so an ordinary
+                # sell can never spend into it.
+                available_usd = _sellable_xlm(account) * price
             if available_usd <= 0 < _spendable_xlm(account):
                 # Distinct from an empty account, which is what this used to look like.
                 # "insufficient balance or caps exhausted" was 101 of 133 live records on

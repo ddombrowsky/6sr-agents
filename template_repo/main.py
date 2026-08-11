@@ -87,6 +87,13 @@ STATE_PATH = Path('state.json')
 TICK_SECONDS = 30
 MAX_HISTORY = 500
 
+# Shorting (SHORTING_PLAN.md, XLM leg only): forces a cover once the buy-back would cost
+# this multiple of what the short actually received. 1.5 = a 50% adverse move forces a
+# cover -- deliberately in the tick loop, not in decide(), because it has to fire on
+# ticks where decide() returns nothing; a price moving hard against an open short can't
+# wait for the next vote.
+SHORT_STOP_OUT_RATIO = 1.5
+
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -274,10 +281,22 @@ def main():
             state.pop('basis_bp', None)
             state.pop('basis_tradeable_bp', None)
 
+        # Stop-out check: must run every tick, independent of decide(), because a price
+        # moving hard against an open short can't wait for the next vote. See
+        # SHORT_STOP_OUT_RATIO above.
+        borrowed = state.get('borrowed_xlm', 0.0)
+        if borrowed > 0:
+            proceeds = state.get('short_proceeds_usd', 0.0)
+            buyback_cost = borrowed * price
+            if buyback_cost > proceeds * SHORT_STOP_OUT_RATIO:
+                state = execute_trade(agent_name, 'cover_stoploss', 'buy', price, buyback_cost,
+                                      state, allow_shorting=True)
+
         decision = decide(price, history, state, config)
         if decision:
             side, action, requested_usd = decision
-            state = execute_trade(agent_name, action, side, price, requested_usd, state)
+            state = execute_trade(agent_name, action, side, price, requested_usd, state,
+                                  allow_shorting=config.get('allow_shorting', False))
 
         for asset in extra_assets:
             leg_price = get_mark(asset['spec'])

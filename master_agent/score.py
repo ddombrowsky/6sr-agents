@@ -118,6 +118,22 @@ def compute_score_multi(state, marks):
         haircut = UNREALIZED_HAIRCUT if spec == _assets.NATIVE else ILLIQUID_HAIRCUT
         total += value * haircut
 
+    # Short liability (SHORTING_PLAN.md): borrowed_xlm is a debt, not a position, so it
+    # never appears in `positions` -- it must be subtracted separately or a strategy that
+    # never covers would look like it kept the sale proceeds for free. Deliberately NOT
+    # ILLIQUID_HAIRCUT -- that's a mark-realism discount on thin non-XLM books, a
+    # different kind of number (see this file's own commentary above). The buy-back
+    # costs slightly *more*, not less, hence dividing by UNREALIZED_HAIRCUT rather than
+    # multiplying.
+    borrowed = state.get('borrowed_xlm', 0.0)
+    if borrowed > 0:
+        mark = marks.get(_assets.NATIVE)
+        price = _portfolio.mark_price(mark) if mark is not None else None
+        if price is None:
+            unpriced.append('XLM:short-liability')  # can't mark it -> don't silently ignore a real liability
+        else:
+            total -= borrowed * price / UNREALIZED_HAIRCUT
+
     return total, unpriced
 
 

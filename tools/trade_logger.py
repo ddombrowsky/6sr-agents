@@ -83,7 +83,7 @@ def _live_fields(side, requested_usd, result):
 
 def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd, balance_xlm,
                  *, asset='XLM', asset_issuer=None, amount_asset=None, balance_asset=None,
-                 live=None, fill_price=None, friction_bp=None):
+                 live=None, fill_price=None, friction_bp=None, short=None):
     """Append one JSON line to /opt/trades/<agent_name>.log.
 
     The seven positional parameters and their meanings are unchanged -- strategies
@@ -113,6 +113,10 @@ def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd,
     after crossing the book; the difference between them is the cost that used to be
     silently zero. Absent on a line written before friction existed, which is precisely
     how to tell the two eras apart when comparing P&L across the cutover.
+
+    `short`: same presence-is-the-marker convention, True only for a sell that drew on
+    the borrow facility (see SHORTING_PLAN.md). Absent on every line written before
+    shorting existed and on every non-shorting line since.
     """
     spec = _assets.canonical(asset, asset_issuer) if asset_issuer else _spec_of(asset)
     code, issuer = _assets.parse(spec)
@@ -137,13 +141,15 @@ def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd,
     if fill_price is not None:
         entry["fill_price"] = fill_price
         entry["friction_bp"] = friction_bp
+    if short:
+        entry["short"] = True
     log_path = BASE_DIR / f"{agent_name}.log"
     with open(log_path, 'a') as f:
         f.write(json.dumps(entry) + "\n")
 
 
 def execute_trade(agent_name, action, side, price, requested_usd, state, *,
-                  asset='XLM', is_live=None):
+                  asset='XLM', is_live=None, allow_shorting=False):
     """Mutate `state` for one trade, log it, and submit it live if this strategy is live.
 
     This is the single place strategy execution mechanics live, so that a strategy's
@@ -175,6 +181,11 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
         the current working directory -- callers (main.py) run with cwd set to their own
         strategy directory, so this resolves correctly without the caller needing to
         check it itself. Pass explicitly to override (e.g. for tests).
+    allow_shorting: XLM-only. When True and side is 'sell', a sell beyond what's held
+        draws against state['borrowed_xlm'] (capped at portfolio.MAX_BORROWED_XLM)
+        instead of clamping to the held amount. A later buy always repays any
+        outstanding borrow before it grows the real position, regardless of this flag --
+        the flag only gates *opening* a short, not unwinding one. See SHORTING_PLAN.md.
 
     No-ops (returns state unchanged, no log line, no live submission) if the clamped
     trade size is <= 0, or if `price`/`requested_usd` is not a usable positive number.
@@ -225,21 +236,45 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
     fill = _friction.fill_price(spec, side, price, h=half)
     friction_bp = round(half * 10000, 3)
 
+    short = False  # set True below only for a sell that draws on the borrow facility
     if side == 'buy':
         actual_usd = min(requested_usd, state['balance_usd'])
         if actual_usd <= 0:
             return state
         amount_asset = actual_usd / fill
         state['balance_usd'] -= actual_usd
-        _portfolio.add_amount(state, spec, amount_asset)
         trade_usd = actual_usd
+        if is_native:
+            # Repay any outstanding short before growing the real position -- always,
+            # not gated on allow_shorting, so flipping the flag off doesn't strand a
+            # borrow that can no longer be covered.
+            borrowed = state.get('borrowed_xlm', 0.0)
+            repay = min(amount_asset, borrowed)
+            if repay > 0:
+                state['borrowed_xlm'] = borrowed - repay
+                proceeds = state.get('short_proceeds_usd', 0.0)
+                state['short_proceeds_usd'] = max(0.0, proceeds - repay * fill)
+                amount_asset -= repay
+        if amount_asset > 0:
+            _portfolio.add_amount(state, spec, amount_asset)
     else:
         held = _portfolio.get_amount(state, spec)
-        actual_asset = min(requested_usd / fill, held)
+        if is_native and allow_shorting:
+            borrowed = state.get('borrowed_xlm', 0.0)
+            headroom = max(0.0, _portfolio.MAX_BORROWED_XLM - borrowed)
+        else:
+            headroom = 0.0
+        actual_asset = min(requested_usd / fill, held + headroom)
         if actual_asset <= 0:
             return state
         trade_usd = actual_asset * fill
-        _portfolio.add_amount(state, spec, -actual_asset)
+        from_held = min(actual_asset, held)
+        from_borrow = actual_asset - from_held
+        _portfolio.add_amount(state, spec, -from_held)
+        if from_borrow > 0:
+            state['borrowed_xlm'] = state.get('borrowed_xlm', 0.0) + from_borrow
+            state['short_proceeds_usd'] = state.get('short_proceeds_usd', 0.0) + from_borrow * fill
+            short = True
         state['balance_usd'] += trade_usd
         amount_asset = actual_asset
 
@@ -272,9 +307,9 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
             # Nothing here decides whether the trade is allowed. submit_trade re-checks
             # admission, trustline, per-asset and aggregate caps, stuck legs and the halt
             # file, and refuses with a reason that lands in the log line below.
-            result = submit_trade(side, trade_usd, asset=spec)
+            result = submit_trade(side, trade_usd, asset=spec, short=short)
             print(f"[{agent_name}] LIVE: submit_trade({side!r}, {trade_usd}, "
-                  f"asset={spec!r}) -> {result}")
+                  f"asset={spec!r}, short={short!r}) -> {result}")
             live_record = _live_fields(side, trade_usd, result)
     finally:
         try:
@@ -284,7 +319,7 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
                 amount_asset if is_native else 0.0,
                 state['balance_usd'], state['balance_xlm'],
                 asset=spec, amount_asset=amount_asset, balance_asset=balance_asset,
-                live=live_record, fill_price=fill, friction_bp=friction_bp)
+                live=live_record, fill_price=fill, friction_bp=friction_bp, short=short)
         except Exception as e:
             # A logging failure must not be able to take down a strategy that has already
             # traded; the balances in `state` are the authoritative record either way.

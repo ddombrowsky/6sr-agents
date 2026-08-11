@@ -411,6 +411,11 @@ def can_execute_live(name):
     doesn't exist.
 
     Returns (ok, reason). An unreadable or unparseable main.py fails closed.
+
+    A second, independent check runs once the AST check passes (SHORTING_PLAN.md): a
+    strategy whose config.json sets allow_shorting must also have a real, funded short
+    buffer before it may go live -- the config flag is a paper-side capability switch,
+    not proof the money backing it exists. See _can_short_live.
     """
     import ast
     main_py = STRATEGIES_DIR / name / 'main.py'
@@ -418,15 +423,53 @@ def can_execute_live(name):
         tree = ast.parse(main_py.read_text())
     except Exception as e:
         return False, f'could not parse main.py ({e})'
+    calls_execute_trade = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         called = func.attr if isinstance(func, ast.Attribute) else getattr(func, 'id', None)
         if called == 'execute_trade':
-            return True, ''
-    return False, ('main.py never calls execute_trade (inline record_trade style), '
-                   'so it cannot submit a real order')
+            calls_execute_trade = True
+            break
+    if not calls_execute_trade:
+        return False, ('main.py never calls execute_trade (inline record_trade style), '
+                       'so it cannot submit a real order')
+    return _can_short_live(name)
+
+
+def _can_short_live(name):
+    """Second half of can_execute_live's gate (SHORTING_PLAN.md), only reached once the
+    AST check above passes.
+
+    Not gated by anything a revision can flip on its own: `allow_shorting` lives in
+    config.json, which a revision can set, but the buffer it checks for is a real
+    deposit recorded by a human via stellar_trader's _SHORT_BUFFER_PATH marker file, and
+    the balance check hits Horizon directly. Setting the config flag alone cannot make
+    this pass. Fails closed on any read/network error, same contract as
+    can_execute_live itself (see domain.py) -- this guards real money, not a fitness
+    signal, and `--force` deliberately cannot skip it (only qualifies_for_live's
+    track-record bar).
+    """
+    try:
+        cfg = json.load(open(STRATEGIES_DIR / name / 'config.json'))
+    except Exception as e:
+        return False, f'could not read config.json ({e})'
+    if not cfg.get('allow_shorting'):
+        return True, ''
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import stellar_trader
+    except Exception as e:
+        return False, f'could not import stellar_trader to verify short buffer ({e})'
+    try:
+        status = stellar_trader.short_buffer_status()
+    except Exception as e:
+        return False, f'could not verify short buffer ({e})'
+    if not status['funded']:
+        return False, f'allow_shorting is set but short buffer is not ready: {status["reason"]}'
+    return True, ''
 
 
 def promotion_sizing(name):

@@ -62,6 +62,10 @@ SCHEMA_VERSION = 2
 # the *additional* discovered assets. Enforced here and re-enforced in monitor.py.
 MAX_EXTRA_ASSETS = 2
 
+# Paper-side ceiling on the XLM short facility (see SHORTING_PLAN.md). Not config-driven,
+# same as MAX_EXTRA_ASSETS being a hard module constant rather than revision-widenable.
+MAX_BORROWED_XLM = 6000.0
+
 
 def _as_float(value, default=0.0):
     """Coerce to float without ever raising. Non-finite values become `default`, since
@@ -90,6 +94,10 @@ def normalize_state(state):
         state = {}
 
     state['balance_usd'] = _as_float(state.get('balance_usd'))
+    # Short-side ledger, deliberately separate from positions['XLM']: add_amount hard-
+    # clamps at zero and that invariant can't be touched without breaking every existing
+    # long-only reader. See SHORTING_PLAN.md.
+    state['borrowed_xlm'] = _as_float(state.get('borrowed_xlm'))
 
     raw = state.get('positions')
     positions = raw if isinstance(raw, dict) else {}

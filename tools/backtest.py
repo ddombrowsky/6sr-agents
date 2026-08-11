@@ -335,7 +335,8 @@ def _fresh_state():
     keeps working standalone -- it is a diagnostic tool and must not become the reason a
     revision can't be evaluated.
     """
-    state = {'balance_usd': START_USD, 'balance_xlm': START_XLM}
+    state = {'balance_usd': START_USD, 'balance_xlm': START_XLM,
+              'borrowed_xlm': 0.0, 'short_proceeds_usd': 0.0}
     try:
         import portfolio
         return portfolio.normalize_state(state)
@@ -602,6 +603,15 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
     basis_edges = []
     basis_buys = basis_sells = 0
 
+    # Shorting (SHORTING_PLAN.md): mirrors trade_logger.execute_trade's borrow/repay
+    # logic so a backtested return stays comparable to live paper numbers.
+    allow_shorting = bool(config.get('allow_shorting', False))
+    try:
+        import portfolio as _portfolio_mod
+        max_borrowed_xlm = _portfolio_mod.MAX_BORROWED_XLM
+    except Exception:
+        max_borrowed_xlm = 6000.0
+
     for candle, basis_row in zip(candles, basis_rows):
         price = candle['close']
         history.append(price)
@@ -638,8 +648,19 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
                 if actual_usd <= 0:
                     break
                 state['balance_usd'] -= actual_usd
-                _add_xlm(state, actual_usd / fill)
-                cost_basis += actual_usd
+                amount_xlm = actual_usd / fill
+                # Repay any outstanding short before growing the real position --
+                # always, not gated on allow_shorting. See trade_logger.execute_trade.
+                borrowed = state.get('borrowed_xlm', 0.0)
+                repay = min(amount_xlm, borrowed)
+                if repay > 0:
+                    state['borrowed_xlm'] = borrowed - repay
+                    proceeds = state.get('short_proceeds_usd', 0.0)
+                    state['short_proceeds_usd'] = max(0.0, proceeds - repay * fill)
+                    amount_xlm -= repay
+                if amount_xlm > 0:
+                    _add_xlm(state, amount_xlm)
+                    cost_basis += amount_xlm * fill
                 friction_usd += actual_usd * half
                 trades += 1
                 # A negative basis means the DEX is cheap against the CEX, which is
@@ -648,21 +669,33 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
                     basis_edges.append(-basis_bp)
                     basis_buys += 1
             elif side == 'sell':
-                actual_xlm = min(requested_usd / fill, state['balance_xlm'])
+                held = state['balance_xlm']
+                if allow_shorting:
+                    borrowed = state.get('borrowed_xlm', 0.0)
+                    headroom = max(0.0, max_borrowed_xlm - borrowed)
+                else:
+                    headroom = 0.0
+                actual_xlm = min(requested_usd / fill, held + headroom)
                 if actual_xlm <= 0:
                     break
-                held = state['balance_xlm']
+                from_held = min(actual_xlm, held)
+                from_borrow = actual_xlm - from_held
                 # A sell "wins" if it exits above the average price paid for the XLM
                 # being sold -- the only definition available without pairing up
                 # individual lots, and the one that matches how these bots trade.
                 # Measured on the FILL: a sell that clears the quote but not the spread
                 # is a loss, and calling it a win is how a win_rate of 60% coexisted
-                # with a strategy that bled.
+                # with a strategy that bled. Only the held portion has a cost basis to
+                # be measured against -- opening a short isn't exiting a lot.
                 avg_cost = cost_basis / held if held else 0.0
-                if fill > avg_cost:
+                if from_held > 0 and fill > avg_cost:
                     wins += 1
-                cost_basis -= avg_cost * actual_xlm
-                _add_xlm(state, -actual_xlm)
+                cost_basis -= avg_cost * from_held
+                _add_xlm(state, -from_held)
+                if from_borrow > 0:
+                    state['borrowed_xlm'] = state.get('borrowed_xlm', 0.0) + from_borrow
+                    state['short_proceeds_usd'] = (
+                        state.get('short_proceeds_usd', 0.0) + from_borrow * fill)
                 state['balance_usd'] += actual_xlm * fill
                 friction_usd += actual_xlm * fill * half
                 trades += 1
@@ -673,13 +706,18 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
             else:
                 break
 
-        net_worth = state['balance_usd'] + state['balance_xlm'] * price
+        # The short liability is what it would cost to buy back borrowed_xlm right now
+        # -- omitting it would let a strategy that never covers look like it kept the
+        # sale proceeds for free. Mirrors master_agent/score.py's compute_score_multi.
+        net_worth = (state['balance_usd'] + state['balance_xlm'] * price
+                     - state.get('borrowed_xlm', 0.0) * price)
         peak = max(peak, net_worth)
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - net_worth) / peak)
 
     final_price = candles[-1]['close']
-    final_net_worth = state['balance_usd'] + state['balance_xlm'] * final_price
+    final_net_worth = (state['balance_usd'] + state['balance_xlm'] * final_price
+                        - state.get('borrowed_xlm', 0.0) * final_price)
     # Buy-and-hold pays to get in, once. It is a real alternative a real operator could
     # take, not a costless abstraction, and exempting it while charging the strategy
     # would just invert the old bias instead of removing it. One entry, no exit: the
@@ -696,6 +734,7 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
         'win_rate': round(wins / sells, 4) if sells else None,  # over sells only
         'final_usd': round(state['balance_usd'], 4),
         'final_xlm': round(state['balance_xlm'], 4),
+        'final_borrowed_xlm': round(state.get('borrowed_xlm', 0.0), 4),
         'final_net_worth': round(final_net_worth, 2),
         'return_pct': round((final_net_worth / START_USD - 1) * 100, 3),
         'buy_hold_pct': round((buy_hold / START_USD - 1) * 100, 3),
