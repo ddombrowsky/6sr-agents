@@ -215,6 +215,12 @@ def net_worth(state, marks):
     confirm solvent", score.py falls back to a last-known-good mark up to an age limit
     and then to zero, because an asset that suddenly can't be priced is what a rug looks
     like and marking it at its last good price would reward holding one.
+
+    borrowed_xlm (SHORTING_PLAN.md) is a debt, not a position, so it never appears in
+    `positions` -- it is subtracted here too, raw (no haircut, matching this function's
+    own no-haircut contract; score.py applies UNREALIZED_HAIRCUT on top separately). A
+    smoke-tested allow_shorting strategy that opened a short must still be judged
+    solvent net of what covering it would cost, not on the sale proceeds alone.
     """
     state = normalize_state(state)
     total = state['balance_usd']
@@ -229,6 +235,16 @@ def net_worth(state, marks):
             unpriced.append(spec)
             continue
         total += value
+
+    borrowed = state.get('borrowed_xlm', 0.0)
+    if borrowed > 0:
+        mark = marks.get(assets.NATIVE) if isinstance(marks, dict) else None
+        price = mark_price(mark) if mark is not None else None
+        if price is None:
+            unpriced.append('XLM:short-liability')
+        else:
+            total -= borrowed * price
+
     return total, unpriced
 
 
