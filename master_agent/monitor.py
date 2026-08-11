@@ -1254,6 +1254,11 @@ def promote_live_strategy(current_leader, leader_score):
     # than it being silently overwritten here.
     save_live_strategy(current_leader, sizing=DOMAIN.promotion_sizing(current_leader),
                        trustlines=trustlines)
+    # Optional: not every domain moves real money. Must run after save_live_strategy,
+    # not before -- see DOMAIN.ensure_trading_cushion / stellar_trader's docstring.
+    ensure_cushion = getattr(DOMAIN, 'ensure_trading_cushion', None)
+    if ensure_cushion:
+        ensure_cushion(current_leader)
 
 
 def promote_strategy_manual(name, force=False):
@@ -1333,6 +1338,9 @@ def promote_strategy_manual(name, force=False):
     trustlines = DOMAIN.prepare_live(name)
     set_live_flag(name, True)
     save_live_strategy(name, sizing=DOMAIN.promotion_sizing(name), trustlines=trustlines)
+    ensure_cushion = getattr(DOMAIN, 'ensure_trading_cushion', None)
+    if ensure_cushion:
+        ensure_cushion(name)
     return True, lines
 
 

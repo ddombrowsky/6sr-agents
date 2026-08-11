@@ -537,6 +537,40 @@ def prepare_live(name):
     return results
 
 
+def ensure_trading_cushion(name):
+    """Top up claudio's real spendable XLM before `name` starts trading real money.
+
+    Called once at promotion, after live.flag and live_strategy.json both already point
+    at `name` -- ordering matters here, see stellar_trader.ensure_trading_cushion's
+    docstring for why. Not gated on declared assets the way prepare_live's trustline loop
+    is: this is about the native XLM leg every strategy trades, not about any one leg.
+
+    A failure is NOT fatal, same contract as prepare_live: a strategy that goes live with
+    a thin real balance just means more early sell refusals against
+    MIN_TRUSTLINE_RESERVE_XLM, not a broken promotion.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import stellar_trader
+    except Exception as e:
+        print(f'stellar_trader unavailable ({e}); skipping trading cushion for {name}')
+        return
+
+    try:
+        result = stellar_trader.ensure_trading_cushion()
+    except Exception as e:
+        print(f'could not fund trading cushion for {name}: {e}')
+        return
+
+    topped = result.get('topped_up_usd', 0.0)
+    if topped:
+        print(f'  funded ${topped:.2f} of trading cushion for {name} '
+              f'({result.get("chunks")} chunk(s))')
+    elif result.get('reason'):
+        print(f'  trading cushion for {name} not topped up: {result["reason"]}')
+
+
 def retire_live(old_name):
     """Flatten the outgoing live strategy's real position. Returns (ok, [lines to print]).
 

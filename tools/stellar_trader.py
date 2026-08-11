@@ -79,6 +79,12 @@ MIN_XLM_OPERATING_BUFFER = 1.0         # spendable XLM that must survive a new t
 MAX_STUCK_USD = 2.0                    # total unsellable notional before a full halt
 _VERIFY_TTL = 900                      # re-verification cache in the hot path
 
+# Target sellable-XLM headroom (in USD, above MIN_TRUSTLINE_RESERVE_XLM) a freshly
+# promoted leader should have before its own trading starts. See
+# ensure_trading_cushion's docstring for the incident this exists to prevent.
+MIN_LIVE_TRADING_CUSHION_USD = 5 * MAX_TRADE_USD
+_MAX_CUSHION_CHUNKS = 5                # bounds one promotion's worth of top-up buys
+
 _SLIPPAGE = 0.01  # dest-min tolerance on path payments
 _XLM_DUST = 0.5  # wind_down considers the position flat below this
 _BASE_RESERVE_XLM = 0.5  # current Stellar protocol base reserve per subentry
@@ -863,6 +869,68 @@ def _total_nonbase_exposure(account_json):
         if mark:
             total += amount * mark
     return total
+
+
+def ensure_trading_cushion(target_usd=None) -> dict:
+    """Buy XLM with USDC, in MAX_TRADE_USD chunks, until sellable headroom above
+    MIN_TRUSTLINE_RESERVE_XLM clears target_usd (default MIN_LIVE_TRADING_CUSHION_USD),
+    or funds/chunks run out.
+
+    Called once at promotion, by domain_sdex.ensure_trading_cushion, AFTER live.flag and
+    live_strategy.json already point at the new leader -- so each chunk goes through the
+    ordinary submit_trade path and attributes correctly via _current_live_name(), the
+    same audit trail every other real trade goes through. Do not call this before
+    live_strategy.json is updated, or the buys would misattribute to whoever was live
+    before.
+
+    Why this exists: a freshly-promoted strategy inherits whatever real balance the
+    outgoing leader's wind_down left behind (bounded below only by
+    MIN_TRUSTLINE_RESERVE_XLM), which can be thin. If it then opens with several
+    same-direction ticks in a row -- ordinary behavior for any threshold strategy whose
+    price sits past a threshold for a few minutes -- it grinds straight into the reserve
+    floor on its first sells rather than its last. Observed on clone_72b9b4cd5752,
+    2026-08-10: two clean $4 sells, a $0.02 partial, then eight refusals in four minutes,
+    while the paper book kept crediting full-sized sells throughout -- the single largest
+    driver of that promotion's paper/live return gap. A small cushion bought up front
+    gives the first real burst of trading room to work with instead.
+
+    submit_trade's usd_amount is a paper-scale request that it divides by 10 before
+    capping (real trades run at 1/10th paper size); passing 10 * MAX_TRADE_USD is what
+    makes each chunk land at exactly MAX_TRADE_USD once capped.
+
+    Never raises and never blocks promotion, same contract as prepare_live: an account
+    that stays thin just means more early floor refusals, not a broken promotion.
+
+    Returns {'topped_up_usd': float, 'chunks': int, 'reason': str | None}.
+    """
+    if target_usd is None:
+        target_usd = MIN_LIVE_TRADING_CUSHION_USD
+
+    if _paper_only():
+        return {'topped_up_usd': 0.0, 'chunks': 0,
+                'reason': 'PAPER_ONLY is set; refusing to fund a real cushion'}
+    if _halted():
+        return {'topped_up_usd': 0.0, 'chunks': 0,
+                'reason': f'live trading halted; see {_HALT_PATH}'}
+
+    spent = 0.0
+    chunks = 0
+    for _ in range(_MAX_CUSHION_CHUNKS):
+        price = get_price()
+        if price is None or price <= 0:
+            return {'topped_up_usd': spent, 'chunks': chunks,
+                    'reason': 'no price available'}
+        account = _account(_source_address())
+        have_usd = _sellable_xlm(account) * price
+        if have_usd >= target_usd:
+            break
+        result = submit_trade('buy', 10 * MAX_TRADE_USD, asset='XLM')
+        if not result.get('submitted'):
+            return {'topped_up_usd': spent, 'chunks': chunks,
+                    'reason': result.get('reason')}
+        spent += result.get('amount_usd', 0.0)
+        chunks += 1
+    return {'topped_up_usd': spent, 'chunks': chunks, 'reason': None}
 
 
 def wind_down() -> dict:
