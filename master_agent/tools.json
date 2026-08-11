@@ -140,6 +140,29 @@
   {
     "type": "function",
     "function": {
+      "name": "backtest_kalshi_strategy",
+      "description": "Replay a Kalshi strategy over a fixed set of ALREADY-RESOLVED real Kalshi markets and return trades, decide_source, mean_brier, mean_market_brier, beats_null and null_pct. Use it as your fitness check instead of guessing -- lower mean_brier is better, and beats_null is true only when your mean_brier is below mean_market_brier (what the market's own frozen price would have scored against the real outcome). Always check decide_source first: 'main.py:decide' means your code was replayed; anything else means the backtester could not import decide() from main.py and replayed the mechanical confidence_gain-only fallback instead -- in that case a top-level WARNING key is present and every number describes the fallback, not your code, so fix main.py's structure and re-run before trusting beats_null. Real Kalshi markets are efficiently priced, so beats_null being false is not automatically a failure -- but decide_source must always be 'main.py:decide'.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {
+            "type": "string",
+            "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"
+          },
+          "rebuild": {
+            "type": "boolean",
+            "description": "Force-rebuild the fixed resolved-market set from live Kalshi data before replaying (slow, makes real network calls). Default false reuses the cached set, which is what you want for iterating quickly -- the set is the same for a day at a time regardless."
+          }
+        },
+        "required": [
+          "strategy_path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "get_price_history",
       "description": "Return recent XLM/USD closing prices as a JSON list, oldest first, from real exchange candles (Kraken with a Coinbase fallback, cached and shared). Use when you want to look at the actual recent trend, volatility, or price range before choosing thresholds or indicator periods -- not the single spot price. Defaults to 720 hourly closes (~30 days).",
       "parameters": {

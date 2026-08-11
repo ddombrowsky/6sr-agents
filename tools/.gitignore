@@ -1,1 +1,4 @@
 __pycache__
+.kalshi_cache.json
+.kalshi_backtest_set.json
+
