@@ -820,6 +820,10 @@ def _run_revision_manual(name, parent_name, score, leaderboard, obs, role):
             raise SystemExit(0)
         time.sleep(MANUAL_REVISION_POLL_S)
     MANUAL_REVISION_DONE_FILE.unlink()
+    try:
+        MANUAL_REVISION_PROMPT_FILE.unlink()
+    except OSError as e:
+        print(f'Warning: could not remove {MANUAL_REVISION_PROMPT_FILE}: {e}')
     print(f'Resuming: manual revision of {name} ({role}) marked done')
     return True
 
