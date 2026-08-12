@@ -17,8 +17,6 @@ MODEL_NICKNAMES = {
 MODEL = MODEL_NICKNAMES['qwen']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
-TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
-STATE_FILE = os.path.join(os.path.dirname(SELF_FILE), '.agent-state.json')
 
 client = Client(
     host="http://172.17.0.1:11434",
@@ -29,29 +27,6 @@ TOOLS = sr_agent_tools.TOOLS
 
 with open(TOOLS_FILE) as f:
     TOOL_SCHEMAS = json.load(f)
-
-
-def _watched_mtimes() -> dict:
-    """mtimes of files that define tool implementations/schemas.
-
-    Compared against a startup snapshot so a tool that edits its own
-    definitions (e.g. via write_file) can trigger a re-exec that picks up
-    the change instead of running stale in-memory code.
-    """
-    paths = [TOOLS_FILE, TOOLS_MODULE_FILE]
-    return {p: os.path.getmtime(p) for p in paths if os.path.exists(p)}
-
-
-_STARTUP_MTIMES = _watched_mtimes()
-
-
-def _reexec_if_tools_changed(messages: list) -> None:
-    if _watched_mtimes() == _STARTUP_MTIMES:
-        return
-    print('[info] tools.json or sr_agent_tools.py changed on disk; re-executing to reload them...')
-    with open(STATE_FILE, 'w') as f:
-        json.dump(messages, f)
-    os.execv(sys.executable, [sys.executable, SELF_FILE])
 
 
 def dispatch(tool_call) -> dict:
@@ -147,7 +122,6 @@ def run_turn(messages: list) -> str:
 
         for call in tool_calls:
             messages.append(dispatch(call))
-            _reexec_if_tools_changed(messages)
 
 
 def _handle_model_command(user_input: str) -> bool:
@@ -197,32 +171,26 @@ def _read_piped_turn() -> str:
 
 
 def main():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            messages = json.load(f)
-        os.remove(STATE_FILE)
-        print('[info] reloaded tools; conversation resumed.')
-    else:
-        messages = [{
-            'role': 'system',
-            'content': (
-                'You are a bootstrapping agent. Your job is to investigate the system you are '
-                'running on, install whatever tools you need to get things done, and extend '
-                'your own capabilities by writing new agents and tools when the ones you have '
-                "aren't enough.\n\n"
-                'Start by understanding your environment: check uptime, read relevant files, '
-                'and use apt to see what is and is not already installed before assuming a '
-                'tool is missing. Use update_package_list before install_package if the '
-                'package cannot be found.\n\n'
-                'When a task calls for a capability you do not have, do not just say so — '
-                'write it. Use write_file to add new tool implementations (in a Python module '
-                'alongside your own) and update the tool schema so future turns can call them. '
-                'Prefer small, single-purpose tools over one large script, and verify a new '
-                'tool works before relying on it.\n\n'
-                'Be transparent about what you install and write to disk — this is a sandbox, '
-                'but treat package installs and file writes as real, auditable actions.'
-            )
-        }]
+    messages = [{
+        'role': 'system',
+        'content': (
+            'You are a bootstrapping agent. Your job is to investigate the system you are '
+            'running on, install whatever tools you need to get things done, and extend '
+            'your own capabilities by writing new agents and tools when the ones you have '
+            "aren't enough.\n\n"
+            'Start by understanding your environment: check uptime, read relevant files, '
+            'and use apt to see what is and is not already installed before assuming a '
+            'tool is missing. Use update_package_list before install_package if the '
+            'package cannot be found.\n\n'
+            'When a task calls for a capability you do not have, do not just say so — '
+            'write it. Use write_file to add new tool implementations (in a Python module '
+            'alongside your own) and update the tool schema so future turns can call them. '
+            'Prefer small, single-purpose tools over one large script, and verify a new '
+            'tool works before relying on it.\n\n'
+            'Be transparent about what you install and write to disk — this is a sandbox, '
+            'but treat package installs and file writes as real, auditable actions.'
+        )
+    }]
     print("Agent ready. Type 'exit' to quit.")
 
     if not sys.stdin.isatty():
