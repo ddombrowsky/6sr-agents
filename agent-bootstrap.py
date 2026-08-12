@@ -14,7 +14,7 @@ MODEL_NICKNAMES = {
     'buck': 'wonderful_buck_321/sixsr',
     'granite': 'granite4.1:8b',
 }
-MODEL = MODEL_NICKNAMES['granite']
+MODEL = MODEL_NICKNAMES['qwen']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
@@ -122,7 +122,7 @@ def run_turn(messages: list) -> str:
         print('...')
         print(f'[info] estimated context size: ~{_estimate_context_tokens(messages)} tokens')
         try:
-            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS)
+            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS, think=False)
         except ResponseError as e:
             error_text = str(e)
             if 'prompt too long' in error_text.lower() and _truncate_messages(messages, error_text):
