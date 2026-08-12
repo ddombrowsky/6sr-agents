@@ -16,6 +16,13 @@ Deliberately lives outside /opt/tools and /opt/master_agent: those two directori
 what monitor.check_boundary_integrity() watches, and this is a read-only report with no
 reason to trip the live-trading halt every time it changes.
 
+Short-selling: a real short-sell draws against /opt/trades/.short_buffer.json, XLM an
+operator deposited by hand as collateral (see tools/stellar_trader.py's
+SHORT_BUFFER_XLM/_short_buffer_funded) -- not money the strategy earned. _log_pubnet_trade
+logs a short-sell exactly like any other sell, so the per-trade ledger below can't tell
+them apart; that liability is reported separately rather than guessed at per-trade. See
+_read_short_buffer.
+
   python3 /opt/pubnet_tally.py                  # one summary line per strategy + grand total
   python3 /opt/pubnet_tally.py <name>           # full trade-by-trade running tally for one strategy
   python3 /opt/pubnet_tally.py --all            # merged running tally across every strategy, in time order
@@ -27,6 +34,7 @@ import time
 from pathlib import Path
 
 TRADES_DIR = Path('/opt/trades')
+SHORT_BUFFER_PATH = TRADES_DIR / '.short_buffer.json'
 
 
 def _read_entries(path):
@@ -46,7 +54,13 @@ def _read_entries(path):
 
 
 class _Ledger:
-    """Avg-cost running position for one (strategy, asset) pair."""
+    """Avg-cost running position for one (strategy, asset) pair.
+
+    self.qty is signed: positive is an ordinary long position, negative is a short (XLM
+    owed back, e.g. against the buffer in .short_buffer.json). avg_cost is always a
+    positive per-unit price -- the cost basis of a long, or the price a short was opened
+    at -- either way, what closing at the current price nets against.
+    """
 
     def __init__(self):
         self.qty = 0.0
@@ -61,17 +75,34 @@ class _Ledger:
         price = (usd / qty) if qty else None
         if price is not None:
             self.last_price = price
-        if action in ('buy',):
-            self.cash_flow -= usd
-            if qty:
-                new_qty = self.qty + qty
-                self.avg_cost = ((self.avg_cost * self.qty) + usd) / new_qty if new_qty else 0.0
-                self.qty = new_qty
-        else:  # sell, wind_down_sell
-            self.cash_flow += usd
-            if qty:
-                self.realized_pl += usd - qty * self.avg_cost
-                self.qty -= qty
+        if not qty:
+            return
+
+        delta = qty if action == 'buy' else -qty
+        self.cash_flow += -usd if action == 'buy' else usd
+
+        same_direction = self.qty == 0 or (self.qty > 0) == (delta > 0)
+        if same_direction:
+            # Opening, or adding to, a position in this direction -- long+buy or
+            # short+sell alike.
+            new_qty = self.qty + delta
+            self.avg_cost = ((self.avg_cost * abs(self.qty)) + usd) / abs(new_qty)
+            self.qty = new_qty
+        else:
+            # Reducing or closing -- selling a long, or buying back (covering) a short.
+            # A sell while short (self.qty < 0, delta < 0) can't reach here since that's
+            # same_direction; this branch only sees a genuine reduction.
+            closing = min(abs(delta), abs(self.qty))
+            sign = 1 if self.qty > 0 else -1
+            self.realized_pl += sign * closing * (price - self.avg_cost)
+            remainder = abs(delta) - closing
+            self.qty += delta
+            if remainder > 1e-12:
+                # Flipped through zero: the excess opens a new position at this trade's
+                # price (e.g. covering a short and going long in the same fill).
+                self.avg_cost = price
+            elif self.qty == 0:
+                self.avg_cost = 0.0
 
     @property
     def unrealized_pl(self):
@@ -104,6 +135,36 @@ def _strategy_name(path):
     return path.name[:-len('.pubnet.log')]
 
 
+def _read_short_buffer():
+    """Operator-funded short-sell collateral (tools/stellar_trader.py's SHORT_BUFFER_XLM),
+    written once by hand after a real deposit -- never by code, never per-strategy. An
+    absent or unreadable file means unfunded, 0.0, matching
+    stellar_trader._short_buffer_funded's own default rather than raising."""
+    try:
+        with SHORT_BUFFER_PATH.open() as f:
+            record = json.load(f)
+        return {'funded_xlm': float(record.get('funded_xlm', 0.0)),
+                'funded_at': record.get('funded_at')}
+    except Exception:
+        return {'funded_xlm': 0.0, 'funded_at': None}
+
+
+def _current_xlm_price(fallback=None):
+    """Live XLM/USD via tools/price_feed.py if reachable, else `fallback` (typically the
+    most recent trade price seen in the logs). Best-effort only -- this is a read-only
+    report outside /opt/tools and must not fail if that module can't be imported."""
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import price_feed
+        price = price_feed.get_price()
+        if price:
+            return price
+    except Exception:
+        pass
+    return fallback
+
+
 def print_verbose(name, entries):
     ledgers = {}
     print(f"{'timestamp':19}  {'asset':10} {'action':14} {'usd':>9} {'qty':>12} "
@@ -127,6 +188,7 @@ def print_verbose(name, entries):
 def print_summary(files, as_json=False):
     rows = []
     grand_total = 0.0
+    fallback_price, fallback_ts = None, -1
     for path in files:
         entries = _read_entries(path)
         if not entries:
@@ -146,10 +208,30 @@ def print_summary(files, as_json=False):
                            'total_pl': round(l.total_pl, 4)} for a, l in ledgers.items()},
             'total_pl': round(strat_total, 4),
         })
+        xlm_ledger = ledgers.get('XLM')
+        if xlm_ledger and xlm_ledger.last_price and (last_ts or 0) > fallback_ts:
+            fallback_ts, fallback_price = (last_ts or 0), xlm_ledger.last_price
     rows.sort(key=lambda r: r['first'])
 
+    buffer = _read_short_buffer()
+    xlm_price = _current_xlm_price(fallback=fallback_price)
+    buffer_usd = buffer['funded_xlm'] * xlm_price if (buffer['funded_xlm'] and xlm_price) else None
+    net_of_buffer = grand_total - buffer_usd if buffer_usd is not None else None
+
     if as_json:
-        print(json.dumps({'strategies': rows, 'grand_total_pl': round(grand_total, 4)}, indent=2))
+        print(json.dumps({
+            'strategies': rows,
+            'grand_total_pl': round(grand_total, 4),
+            'short_buffer': {
+                'funded_xlm': buffer['funded_xlm'],
+                'funded_at': buffer['funded_at'],
+                'xlm_price': xlm_price,
+                'liability_usd': round(buffer_usd, 4) if buffer_usd is not None else None,
+                'note': 'operator-funded short-sell collateral owed back; not strategy P&L',
+            },
+            'grand_total_pl_net_of_short_buffer': (
+                round(net_of_buffer, 4) if net_of_buffer is not None else None),
+        }, indent=2))
         return
 
     for r in rows:
@@ -158,6 +240,17 @@ def print_summary(files, as_json=False):
               f"total {r['total_pl']:+8.4f} USD  ({assets})")
     print(f"\n{'GRAND TOTAL':24} {'':4}{'':17}{'':22}total {grand_total:+8.4f} USD "
           f"across {len(rows)} strateg{'y' if len(rows) == 1 else 'ies'}")
+
+    if buffer['funded_xlm']:
+        funded_at = _fmt_ts(buffer['funded_at']) if buffer['funded_at'] else '?'
+        usd_str = f"{buffer_usd:+8.4f} USD" if buffer_usd is not None else "USD (no XLM price available)"
+        print(f"\n{'SHORT BUFFER':24} funded {buffer['funded_xlm']:.4f} XLM at {funded_at}  "
+              f"liability {usd_str}")
+        print("  (operator-deposited short-sell collateral, owed back -- not strategy "
+              "P&L, not included in GRAND TOTAL above)")
+        if net_of_buffer is not None:
+            print(f"{'GRAND TOTAL NET OF BUFFER':24} {'':4}{'':17}{'':22}total "
+                  f"{net_of_buffer:+8.4f} USD")
 
 
 def print_merged(files):
