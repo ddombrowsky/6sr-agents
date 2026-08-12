@@ -98,14 +98,8 @@ money boundary; Polymarket is on Polygon and brings a wallet/chain stack of its 
 
 ### 4. Shorting
 
-See `shorting.txt` for the original note. The honest read: the paper-side proposal (let an
-asset balance go to −$200 notional) will breed strategies that **cannot be executed live**
-— exactly the paper/live gap that already bit us, where the live strategy ran 343
-consecutive refused attempts at a realized `size_ratio` of 0.00.
-
-If we do it: put the Blend borrow rate into `tools/friction.py`, and cap paper shorts at
-what our actual collateral would support on Blend. Otherwise fitness selects for a
-strategy that cannot exist, and we learn nothing except how to lose the promotion slot.
+[DONE (for now)].  There is a manual shorting mechanism already in place.
+See `.short_buffer.json`.
 
 ### 5. Non-market income — the end state, not the next step
 
