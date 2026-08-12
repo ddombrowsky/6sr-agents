@@ -8,7 +8,7 @@
 #    next cycle-boundary sleep); TERM its process group only if that is still
 #    not enough after another full window.
 # 2. Feed that log plus the current SYSTEM_STATE.md to the
-#    agents/agent-bootstrap.py agent, and have it revise:
+#    agents/emperor-agent.py agent, and have it revise:
 #      * master_agent/master-agent.py
 #      * master_agent/monitor.py
 #      * master_agent/sr_agent_tools.py
@@ -57,7 +57,7 @@ if [ -e "$UNMANAGED_FILE" ]; then
     echo "[emperor] $UNMANAGED_FILE removed -- starting."
 fi
 
-# Which python runs monitor.py and agent-bootstrap.py. This used to be a bare `python3`,
+# Which python runs monitor.py and emperor-agent.py. This used to be a bare `python3`,
 # and that single word disabled the entire LLM layer of this system for an unknown number
 # of cycles: only /opt/agents/venv/bin/python has the `ollama` package, while a
 # non-interactive shell (which is what setsid, cron and `docker exec` give you) resolves
@@ -274,12 +274,12 @@ HEADER
         tail -n 4000 "$MONITOR_LOG"
     } > "$PROMPT_FILE"
 
-    echo "[emperor] running agent-bootstrap.py, logging to $AGENT_LOG"
+    echo "[emperor] running emperor-agent.py, logging to $AGENT_LOG"
     {
         cat "$PROMPT_FILE"
         printf '\nexit\n'
-    } | "$PYTHON" /opt/agents/agent-bootstrap.py > "$AGENT_LOG" 2>&1 || \
-        echo "[emperor] agent-bootstrap.py step failed this cycle; see $AGENT_LOG" >&2
+    } | "$PYTHON" /opt/agents/emperor-agent.py > "$AGENT_LOG" 2>&1 || \
+        echo "[emperor] emperor-agent.py step failed this cycle; see $AGENT_LOG" >&2
 
     echo "[emperor] verifying and committing master_agent/tools changes"
     verify_and_commit_repo /opt/master_agent "master_agent"

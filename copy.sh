@@ -56,9 +56,9 @@ copy_files() {
 
 if [ "$1" = "--to" ] ; then
     tf=`mktemp -d ./v/agents/bak.XXXXX`
-    mv -v ./v/agents/agent-bootstrap.py ./v/agents/sr_agent_tools.py \
+    mv -v ./v/agents/emperor-agent.py ./v/agents/sr_agent_tools.py \
         ./v/agents/tools.json $tf
-    cp -v requirements.txt agent-bootstrap.py sr_agent_tools.py \
+    cp -v requirements.txt emperor-agent.py sr_agent_tools.py \
         tools.json ./v/agents/
     for d in $SYNCED_DIRS ; do
         [ -d "./$d" ] || continue
