@@ -850,7 +850,11 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM', short=False) -> d
             MAX_TRADE_USD_NONBASE,
             max(0.0, MAX_DAILY_USD_PER_ASSET - _daily_spent(spec)))
 
-    account = _account(_source_address())
+    try:
+        account = _account(_source_address())
+    except Exception as e:
+        return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
+                "reason": f"could not fetch account state: {e}"}
 
     if not native and side == "buy":
         held = _asset_balance(account, code, issuer)
