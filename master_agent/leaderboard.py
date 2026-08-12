@@ -113,11 +113,13 @@ def main():
               reverse=True)
 
     name_w = max(len(r[0]) for r in rows) + 2
-    header = (f"{'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>16}{'MAX SCORE':>16}"
+    header = (f"    {'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>16}{'MAX SCORE':>16}"
               f"{'BORROWED':>12}{'ACTIONS':>10}{'AGE(h)':>9}  {'IDLE'}")
     print(header)
     print('-' * len(header))
-    for name, status, pid, score, count, age_s, max_score, borrowed in rows[:20]:
+    rank=0
+    for name, status, pid, score, count, age_s, max_score, borrowed in rows[:30]:
+        rank += 1
         score_s = f'{score:.2f}' if score is not None else 'N/A'
         max_score_s = f'{max_score:.2f}' if max_score is not None else 'N/A'
         # 0.00 (a real, checked zero) is left distinct from N/A (couldn't say, or this
@@ -127,7 +129,7 @@ def main():
         pid_s = str(pid) if pid else '-'
         age_s_str = f'{age_s / 3600:.1f}' if age_s is not None else 'N/A'
         idle_s = 'yes' if name in idle_names else ''
-        print(f'{name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>16}{max_score_s:>16}'
+        print(f'{rank:>2}: {name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>16}{max_score_s:>16}'
               f'{borrowed_s:>12}{count:>10}{age_s_str:>9}  {idle_s}')
 
     print(f'\nDomain: {DOMAIN.NAME}')
