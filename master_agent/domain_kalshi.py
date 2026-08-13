@@ -93,6 +93,18 @@ TEMPLATE_REPO = os.environ.get('KALSHI_TEMPLATE_REPO', 'file:///opt/template_rep
 
 STARTING_SCORE = 1000.0
 
+# monitor.py's rank-KEEP_TOP_N cull used to exempt every domain for a flat 3h
+# (YOUNG_GRACE_S) after a strategy starts acting -- long enough on domain_forecast, whose
+# questions resolve every ~30s, but not here. KALSHI.md's "core design problem" section
+# calls this out by name: an hourly, rank-based cull scored on markets that take days to
+# resolve would stop strategies on a trade-count tiebreak, not real evidence, because
+# score_path() sits at bare STARTING_SCORE until something resolves. Observed in Phase 1's
+# first real run: a strategy that logged ~600 forecasts in 4h had only 25 resolved. 24h
+# covers a full day of Climate/Weather dailies (Phase 1's starting category_filter) --
+# same "not tuned to a specific run yet, revisit once Phase 1 has run longer" caveat as
+# CONFIDENCE_PRIOR_N/CONFIDENCE_CAP above.
+RANK_GRACE_S = 24 * 3600
+
 # Each point of (mean_market_brier - mean_brier), summed over every RESOLVED forecast, is
 # worth this many score points -- same summed-not-averaged shape as domain_forecast's
 # SCORE_SCALE, for the same reason (criterion 5: more good calls should outrank fewer
