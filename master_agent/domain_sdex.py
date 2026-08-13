@@ -49,6 +49,13 @@ TEMPLATE_REPO = 'file:///opt/template_repo'
 # baseline the turnover report measures gain against.
 STARTING_SCORE = 1000.0
 
+# How long a strategy is exempt from the rank-KEEP_TOP_N cull after it starts acting (see
+# domain.py's criterion 1 docstring for why this moved from monitor.py's old bare
+# YOUNG_GRACE_S constant to a per-domain value). SDEX marks move every cycle, so three
+# cycles' worth of real trading is already enough evidence to rank on -- unchanged from
+# the constant every domain shared before this became domain-owned.
+RANK_GRACE_S = 3 * 3600
+
 # The environment the smoke-test harness runs candidate code under. PAPER_ONLY makes the
 # no-live-trading guarantee structural rather than relying on having remembered to drop
 # live.flag from the copy: stellar_trader._paper_only() refuses inside submit_trade, not

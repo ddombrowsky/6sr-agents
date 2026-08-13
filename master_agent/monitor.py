@@ -147,9 +147,16 @@ IDLE_GRACE_S = int(os.environ.get('IDLE_GRACE_S', 3 * 3600))
 # against the original bootstrap strategies, and the population was structurally unable
 # to turn over. Grace period gives a newcomer a few cycles of real action before its
 # score is trusted enough to cull it, without exempting it forever the way skipping the
-# cull for idle strategies would. Three cycles' worth at the default CYCLE_SLEEP (3600s);
-# not a reference to that constant because it is defined later in the file.
-YOUNG_GRACE_S = int(os.environ.get('YOUNG_GRACE_S', 3 * 3600))
+# cull for idle strategies would.
+#
+# Used to be a single constant applied to every domain (three cycles' worth at the
+# default CYCLE_SLEEP), until domain_kalshi.py hit the same failure mode for a different
+# reason: not too few cycles, but feedback that takes hours to days to resolve at all, so
+# three cycles of a flat STARTING_SCORE isn't "no evidence yet", it's the only score that
+# will exist for most of a strategy's early life. See domain.py's RANK_GRACE_S contract
+# entry -- this is now DOMAIN's opinion, not the loop's, with the env var still able to
+# force a value for ops purposes.
+YOUNG_GRACE_S = int(os.environ.get('YOUNG_GRACE_S', DOMAIN.RANK_GRACE_S))
 
 # Repos whose contents decide how real money moves. Watched every cycle by
 # check_boundary_integrity(); see that function for why. Not the domain's business: these
@@ -207,7 +214,8 @@ REVISIONS_PER_CYCLE = 3
 REVISION_CHANCE = 0.75
 
 OBSERVE_FAILURE_SLEEP = 300   # seconds to wait before retrying a cycle that got no obs
-CYCLE_SLEEP = 3600
+# Override with the CYCLE_SLEEP env var rather than editing this literal.
+CYCLE_SLEEP = int(os.environ.get('CYCLE_SLEEP', 3600))
 
 # Cooperative shutdown request. Touch this file and monitor.py exits the next time it
 # reaches a cycle-boundary sleep instead of sleeping. This is how emperor.sh ends a
