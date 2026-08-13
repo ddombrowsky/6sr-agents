@@ -83,7 +83,8 @@ def _live_fields(side, requested_usd, result):
 
 def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd, balance_xlm,
                  *, asset='XLM', asset_issuer=None, amount_asset=None, balance_asset=None,
-                 live=None, fill_price=None, friction_bp=None, short=None):
+                 live=None, fill_price=None, friction_bp=None, short=None, cover_asset=None,
+                 borrowed_xlm=None):
     """Append one JSON line to /opt/trades/<agent_name>.log.
 
     The seven positional parameters and their meanings are unchanged -- strategies
@@ -117,6 +118,24 @@ def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd,
     `short`: same presence-is-the-marker convention, True only for a sell that drew on
     the borrow facility (see SHORTING_PLAN.md). Absent on every line written before
     shorting existed and on every non-shorting line since.
+
+    `cover_asset`: same convention again, present only for a buy that repaid part or all
+    of an outstanding `borrowed_xlm` short. `amount_asset` on such a line is the *net*
+    position change (can be 0 or even omitted from add_amount entirely if the whole buy
+    went to repayment); `cover_asset` is how much of the gross fill that repayment ate,
+    so the two together reconstruct what the buy actually did.
+
+    `borrowed_xlm`: the short debt outstanding *after* this trade, same convention again
+    -- written only when non-zero, so absent means flat and every line predating shorting
+    reads correctly as 0.0. Post-trade, matching `balance_usd`/`balance_asset` rather than
+    the pre-trade reading, so one line is a complete snapshot of the book.
+
+    It is here because a reader that sees only `balance_usd` cannot tell a profit from a
+    short: the proceeds of the sell that opened the borrow are already *in* `balance_usd`,
+    with nothing on the line to say they are owed. live_report._returns did exactly that
+    until 2026-08-12 and reported a real -1.6% as +20.9%. Every other consumer of that
+    number (score.py, backtest.py, portfolio.py) reads state.json, where `borrowed_xlm`
+    has always been visible; the trade log was the one place it was missing.
     """
     spec = _assets.canonical(asset, asset_issuer) if asset_issuer else _spec_of(asset)
     code, issuer = _assets.parse(spec)
@@ -143,6 +162,10 @@ def record_trade(agent_name, action, price, amount_usd, amount_xlm, balance_usd,
         entry["friction_bp"] = friction_bp
     if short:
         entry["short"] = True
+    if cover_asset:
+        entry["cover_asset"] = cover_asset
+    if borrowed_xlm:
+        entry["borrowed_xlm"] = borrowed_xlm
     log_path = BASE_DIR / f"{agent_name}.log"
     with open(log_path, 'a') as f:
         f.write(json.dumps(entry) + "\n")
@@ -237,11 +260,13 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
     friction_bp = round(half * 10000, 3)
 
     short = False  # set True below only for a sell that draws on the borrow facility
+    cover_asset = 0.0  # set below only for a buy that repaid an outstanding short
     if side == 'buy':
         actual_usd = min(requested_usd, state['balance_usd'])
         if actual_usd <= 0:
             return state
         amount_asset = actual_usd / fill
+        bought_asset = amount_asset  # gross fill, before any short-cover repayment
         state['balance_usd'] -= actual_usd
         trade_usd = actual_usd
         if is_native:
@@ -255,6 +280,7 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
                 proceeds = state.get('short_proceeds_usd', 0.0)
                 state['short_proceeds_usd'] = max(0.0, proceeds - repay * fill)
                 amount_asset -= repay
+                cover_asset = repay
         if amount_asset > 0:
             _portfolio.add_amount(state, spec, amount_asset)
     else:
@@ -279,9 +305,17 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
         amount_asset = actual_asset
 
     balance_asset = _portfolio.get_amount(state, spec)
-    print(f"[{agent_name}] {'Bought' if side == 'buy' else 'Sold'} "
-          f"{amount_asset:.4f} {code} at ${fill:.6f} "
-          f"(ref ${price:.6f}, {friction_bp:.1f}bp)")
+    if cover_asset > 0:
+        # amount_asset alone is the *net* position change, which prints as 0.0000 (or
+        # near it) whenever a buy is mostly or entirely absorbed covering an outstanding
+        # short -- true, but reads as a no-op trade. Break out what was actually bought.
+        print(f"[{agent_name}] Bought {bought_asset:.4f} {code} at ${fill:.6f} "
+              f"(ref ${price:.6f}, {friction_bp:.1f}bp) -- "
+              f"{cover_asset:.4f} to cover short, {amount_asset:.4f} net")
+    else:
+        print(f"[{agent_name}] {'Bought' if side == 'buy' else 'Sold'} "
+              f"{amount_asset:.4f} {code} at ${fill:.6f} "
+              f"(ref ${price:.6f}, {friction_bp:.1f}bp)")
 
     if is_live is None:
         is_live = LIVE_FLAG.exists()
@@ -319,7 +353,9 @@ def execute_trade(agent_name, action, side, price, requested_usd, state, *,
                 amount_asset if is_native else 0.0,
                 state['balance_usd'], state['balance_xlm'],
                 asset=spec, amount_asset=amount_asset, balance_asset=balance_asset,
-                live=live_record, fill_price=fill, friction_bp=friction_bp, short=short)
+                live=live_record, fill_price=fill, friction_bp=friction_bp, short=short,
+                cover_asset=cover_asset if cover_asset > 0 else None,
+                borrowed_xlm=state.get('borrowed_xlm', 0.0))
         except Exception as e:
             # A logging failure must not be able to take down a strategy that has already
             # traded; the balances in `state` are the authoritative record either way.

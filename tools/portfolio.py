@@ -64,7 +64,16 @@ MAX_EXTRA_ASSETS = 2
 
 # Paper-side ceiling on the XLM short facility (see SHORTING_PLAN.md). Not config-driven,
 # same as MAX_EXTRA_ASSETS being a hard module constant rather than revision-widenable.
-MAX_BORROWED_XLM = 6000.0
+#
+# Derived from the live side, not chosen independently: submit_trade fills at 1/10th paper
+# size, and the only real XLM backing a short is stellar_trader.SHORT_BUFFER_XLM (60.0),
+# so 60 * 10 = 600 is the largest paper short real money can mirror. It was 6000 until
+# 2026-08-12, picked separately from the buffer -- paper could open a short ten times
+# larger than anything backing it, and because the live side fills every cover-buy but
+# refuses short-sells past the buffer, the real account accumulated a long while the paper
+# book was short. Not imported from stellar_trader: portfolio is imported by every
+# strategy, and the money boundary must not be dragged in behind it.
+MAX_BORROWED_XLM = 600.0
 
 
 def _as_float(value, default=0.0):
