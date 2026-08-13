@@ -63,8 +63,11 @@ def main():
 
     procs = {slot: None for slot in SLOTS}
     log_files = {slot: None for slot in SLOTS}
-    last_seen_mtime = {slot: None for slot in SLOTS}
-    last_dispatched_mtime = {slot: None for slot in SLOTS}
+    # Seed with each slot's current mtime so pre-existing content (including
+    # empty files) isn't mistaken for a fresh write once it's next observed
+    # as stable -- only mtime changes after startup should dispatch a run.
+    last_seen_mtime = {slot: os.path.getmtime(_slot_path(slot)) for slot in SLOTS}
+    last_dispatched_mtime = dict(last_seen_mtime)
 
     print(f'[swarm] watching {SWARM_DIR}, interpreter {sys.executable}')
 
