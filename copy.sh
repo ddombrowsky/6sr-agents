@@ -20,5 +20,5 @@ else
     cp -v ./v/template_repo/* ./template_repo/ 2>/dev/null
     cp -v ./v/template_repo_forecast/* ./template_repo_forecast/ 2>/dev/null
     cp -v ./v/template_repo_kalshi/* ./template_repo_kalshi/ 2>/dev/null
-    cp -v ./v/*.{sh,py} ./scripts/ 2>/dev/null
+    find ./v -maxdepth 1 \( -name \*.sh -o -name \*.py \) -a -type f -exec cp -v {} ./scripts/ \;
 fi
