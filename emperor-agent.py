@@ -173,7 +173,7 @@ def _read_piped_turn() -> str:
 
 def main():
     system_content = (
-        'You are a bootstrapping agent. Your job is to investigate the system you are '
+        'You are a top-level "emperor" agent. Your job is to investigate the system you are '
         'running on, install whatever tools you need to get things done, and extend '
         'your own capabilities by writing new agents and tools when the ones you have '
         "aren't enough.\n\n"
