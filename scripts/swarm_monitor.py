@@ -48,7 +48,7 @@ def _launch(slot):
     log_file = open(log_path, 'w')
     print(f'[swarm] {slot}: launching, logging to {log_path}')
     proc = subprocess.Popen(
-        [sys.executable, AGENT_PATH],
+        [sys.executable, '-u', AGENT_PATH],
         stdin=open(_slot_path(slot)),
         stdout=log_file,
         stderr=subprocess.STDOUT,
