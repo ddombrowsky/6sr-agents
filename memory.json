@@ -1,0 +1,3 @@
+{
+  "agent_input_files": "slot-1.txt, slot-2.txt, and slot-3.txt in /opt/agents/swarm/ are agent input files: swarm_monitor.py pipes whichever slot file changes as the opening turn into a fresh emperor-agent.py process (each run is a brand-new interpreter with no memory of prior runs, so this fact only persists via the remember tool / memory.json)."
+}

@@ -107,5 +107,56 @@
         "required": ["command"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "remember",
+      "description": "Persist a fact to disk under a short key so it is automatically loaded into the system prompt of every future emperor-agent.py run (including separate swarm slot runs), not just this session. Use this whenever you are told to remember something for later, or discover something worth carrying forward.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {"type": "string", "description": "Short identifier for this fact, e.g. \"agent_input_files\""},
+          "value": {"type": "string", "description": "The fact to remember, in plain text"}
+        },
+        "required": ["key", "value"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "recall",
+      "description": "Look up a single previously remembered fact by its key. Most remembered facts are already included in the system prompt automatically; use this only to check a specific key or after list_memories.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {"type": "string", "description": "The key previously used with remember"}
+        },
+        "required": ["key"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "forget",
+      "description": "Delete a previously remembered fact by key so it stops being loaded into future runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {"type": "string", "description": "The key previously used with remember"}
+        },
+        "required": ["key"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_memories",
+      "description": "List every remembered key and its value.",
+      "parameters": {"type": "object", "properties": {}}
+    }
   }
 ]
