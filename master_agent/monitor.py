@@ -228,6 +228,14 @@ CYCLE_SLEEP = int(os.environ.get('CYCLE_SLEEP', 3600))
 # asleep will not notice the file until the sleep ends).
 EXIT_FILE = Path('/opt/.monitor.py.exit')
 
+# Guards against two `run()` loops racing on strategy_state.json, the strategy git
+# repos and .verified_assets.json -- nothing else stops it, since both once.sh and
+# emperor.sh can be launched by hand. Found in the wild 2026-08-13: a once.sh run
+# whose monitor.py died mid-cycle (blocked inside a revise-strategy subprocess.run
+# call that never returned) while a second once.sh was started 8 minutes later against
+# the same state. See _acquire_lock / _release_lock and _reap_orphaned_revisions below.
+LOCK_FILE = Path('/opt/.monitor.lock')
+
 # 'auto' (default) revises via master-agent.py's Ollama-backed run_turn loop, unchanged.
 # 'manual' dumps the same prompt to disk instead and blocks the entire cycle -- not just
 # the one revision -- for a human to carry it out through Claude Code under direct
@@ -280,6 +288,95 @@ def sleep_or_exit(seconds, what='cycle'):
         raise SystemExit(0)
     print(f'Sleeping for {seconds}s...')
     time.sleep(seconds)
+
+
+def _pid_is_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _cmdline(pid):
+    try:
+        return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\x00', b' ').decode(errors='replace')
+    except OSError:
+        return ''
+
+
+def _ppid(pid):
+    try:
+        # comm can itself contain ')', so split on the LAST ')' rather than the first.
+        rest = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return int(rest[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _reap_orphaned_revisions():
+    """Kill any revise-strategy / retry-after-smoke-failure subprocess whose parent
+    monitor.py has already died (reparented to init, ppid 1).
+
+    _run_revision's subprocess.run() blocks the whole cycle on this call, so a live
+    child always has a live monitor.py above it in the process tree. A ppid of 1 means
+    that monitor.py exited -- crash, kill, a disconnected terminal -- while still
+    blocked waiting on it, so subprocess.run's own timeout/exception handling never ran
+    and nothing will ever collect this process's result or bound it short of
+    REVISION_TIMEOUT (up to 16.7h). Found in the wild 2026-08-13: exactly this, still
+    calling Ollama 20+ minutes after its monitor.py had exited, for a clone that was
+    never started and that no future cycle would ever pick back up.
+    """
+    proc_dir = Path('/proc')
+    if not proc_dir.exists():
+        return
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        cmdline = _cmdline(pid)
+        if 'master-agent.py' not in cmdline:
+            continue
+        if 'revise-strategy' not in cmdline and 'retry-after-smoke-failure' not in cmdline:
+            continue
+        if _ppid(pid) != 1:
+            continue
+        print(f'Reaping orphaned revision subprocess pid {pid} (parent monitor.py already '
+              f'exited): {cmdline[:160]}')
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            print(f'Warning: could not signal orphaned pid {pid}: {e}')
+
+
+def _acquire_lock():
+    """Refuse to start a cycle if another live monitor.py already holds LOCK_FILE.
+
+    A stale lock (file present, pid dead or not actually a monitor.py) is reclaimed
+    rather than trusted -- the common case is the previous holder being killed instead
+    of exiting through sleep_or_exit, which is exactly the scenario this guards.
+    """
+    if LOCK_FILE.exists():
+        try:
+            old_pid = int(LOCK_FILE.read_text().strip())
+        except (OSError, ValueError):
+            old_pid = None
+        if old_pid and _pid_is_alive(old_pid) and 'monitor.py' in _cmdline(old_pid):
+            print(f'{LOCK_FILE} held by live pid {old_pid}; refusing to start a second '
+                  f'monitor.py cycle against the same state. If that process is really '
+                  f'gone, remove {LOCK_FILE} by hand.')
+            raise SystemExit(1)
+        print(f'{LOCK_FILE} is stale (pid {old_pid} is not a live monitor.py); reclaiming it.')
+    LOCK_FILE.write_text(str(os.getpid()))
+
+
+def _release_lock():
+    try:
+        if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+            LOCK_FILE.unlink()
+    except OSError:
+        pass
+
 
 def load_state():
     if STATE_FILE.exists():
@@ -1614,7 +1711,12 @@ if __name__ == '__main__':
     # unrecognised (including --help, which used to fall through here and begin a
     # full cycle) prints usage instead of trading.
     if not args:
-        run()
+        _reap_orphaned_revisions()
+        _acquire_lock()
+        try:
+            run()
+        finally:
+            _release_lock()
     elif args == ['--ensure-recorder']:
         # Standalone supervision, for once.sh / cron / a hand check. The daemon is
         # setsid'd, so it outlives this process exiting seconds later exactly as it

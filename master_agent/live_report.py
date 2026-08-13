@@ -155,7 +155,24 @@ def report(name=None, since=None):
            'since_iso': time.strftime('%Y-%m-%d %H:%M', time.localtime(since)) if since else None,
            'trades': len(entries)}
     if not entries:
-        out['error'] = f'no trades logged for {name} since promotion'
+        # The paper log is written only by this strategy's own execute_trade calls, i.e.
+        # trades its decide() actually chose. It can legitimately stay empty since
+        # promotion (thresholds just haven't fired) while pubnet.log still gains lines
+        # under this name: stellar_trader.ensure_trading_cushion() buys real XLM once at
+        # promotion via submit_trade directly, bypassing execute_trade entirely, and
+        # _current_live_name() attributes it to whoever is live right now -- correctly,
+        # by that function's own design, but invisibly to a report that only reads the
+        # paper log. Without this check that real spend reads as "no trades" (seen on
+        # clone_72b9b4cd5752, 2026-08-13: 5 cushion buys on pubnet.log, zero paper lines).
+        pubnet = _pubnet_cross_check(name, since, 0, 0.0)
+        if pubnet.get('pubnet_trades'):
+            out['pubnet_cross_check'] = pubnet
+            out['note'] = (f"no strategy-decided trades since promotion, but "
+                           f"{pubnet['pubnet_trades']} real trade(s) totaling "
+                           f"${pubnet['pubnet_usd']:.2f} on pubnet.log in this window "
+                           f"(promotion cushion-funding, not a strategy decision)")
+        else:
+            out['error'] = f'no trades logged for {name} since promotion'
         return out
 
     attempts = submitted = refused = unrecorded = non_xlm_paper = 0
@@ -353,6 +370,8 @@ def summary_line(name=None):
         return f'LIVE vs PAPER: report failed ({e})'
     if r.get('error'):
         return f"LIVE vs PAPER {r.get('name', '?')}: {r['error']}"
+    if r.get('note'):
+        return f"LIVE vs PAPER {r.get('name', '?')}: {r['note']}"
 
     fill = r.get('fill_rate')
     parts = [f"LIVE vs PAPER {r['name']} (since {r['since_iso'] or 'all time'}): "
