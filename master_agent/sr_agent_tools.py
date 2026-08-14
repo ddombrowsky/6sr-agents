@@ -119,11 +119,9 @@ def backtest_strategy(strategy_path: str, days: float = 30, ticks_per_candle: in
     """
     try:
         from backtest import backtest
-        # legs=True costs nothing for an XLM-only strategy (no declared assets means no
-        # extra work) and is what makes a multi-asset revision reviewable at all.
         result = backtest(strategy_path, days=float(days),
                           ticks_per_candle=int(ticks_per_candle),
-                          interval=int(interval), legs=True)
+                          interval=int(interval))
         # decide_source has always been in the payload, and was never noticed: models read
         # the field they came for (beats_buy_hold), which the prompt tells them is
         # authoritative -- and which, on a config-thresholds replay, is a confident number
@@ -243,57 +241,6 @@ def get_news_sentiment(asset: str = 'XLM', limit: int = 10) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
-def list_candidate_assets(limit: int = 15) -> str:
-    """Ranked Stellar assets that could be added to a strategy, as JSON.
-
-    Proposals only -- presence here is not approval. Each entry still has to pass
-    verify_asset, and monitor re-checks it before the strategy starts.
-    """
-    try:
-        from asset_discovery import discover_candidates
-        return json.dumps(discover_candidates(limit=int(limit)), indent=2)
-    except Exception as e:
-        return f'error: {type(e).__name__}: {e}'
-
-
-def verify_asset(code: str, issuer: str) -> str:
-    """Check whether a (code, issuer) pair would be admitted, with the evidence."""
-    try:
-        from asset_discovery import asset_summary
-        return json.dumps(asset_summary(code, issuer), indent=2)
-    except Exception as e:
-        return f'error: {type(e).__name__}: {e}'
-
-
-def get_asset_price(code: str, issuer: str) -> str:
-    """Current USD mark and live order-book liquidity for one Stellar asset."""
-    try:
-        import assets as _assets
-        from dex_price import get_mark, get_orderbook
-        spec = _assets.canonical(code, issuer)
-        book = get_orderbook(spec) or {}
-        return json.dumps({
-            'spec': spec,
-            'mark_usd': get_mark(spec),
-            'spread_pct': book.get('spread_pct'),
-            'bid_depth_usd': book.get('bid_depth_usd'),
-            'ask_depth_usd': book.get('ask_depth_usd'),
-        }, indent=2)
-    except Exception as e:
-        return f'error: {type(e).__name__}: {e}'
-
-
-def get_asset_price_history(code: str, issuer: str, hours: int = 168) -> str:
-    """Hourly OHLC history for one Stellar asset, oldest first, as JSON."""
-    try:
-        import assets as _assets
-        from dex_price import get_candles
-        spec = _assets.canonical(code, issuer)
-        return json.dumps(get_candles(spec, hours=int(hours)))
-    except Exception as e:
-        return f'error: {type(e).__name__}: {e}'
-
-
 def get_dex_cex_basis(code: str = 'XLM', issuer: str = '') -> str:
     """Current DEX-vs-CEX dislocation, and whether it is worth crossing for."""
     try:
@@ -388,10 +335,6 @@ TOOLS = {
     'get_friction': get_friction,
     'get_market_history': get_market_history,
     'get_news_sentiment': get_news_sentiment,
-    'list_candidate_assets': list_candidate_assets,
-    'verify_asset': verify_asset,
-    'get_asset_price': get_asset_price,
-    'get_asset_price_history': get_asset_price_history,
     'backtest_strategy': backtest_strategy,
     'backtest_forecast_strategy': backtest_forecast_strategy,
     'backtest_kalshi_strategy': backtest_kalshi_strategy,

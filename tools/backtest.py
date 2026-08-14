@@ -34,13 +34,13 @@ the benchmark would replace one biased comparison with its mirror image. The res
 carries `friction_bp` and `total_friction_usd` so a revision can see what its own
 turnover cost it.
 
-Extra (non-XLM) assets: pass legs=True, or call backtest_asset() directly, to replay each
-declared extra asset over its own Stellar DEX candle history. Those results are reported
-separately under `legs` and are NEVER folded into `beats_buy_hold`, which stays a pure
-XLM-leg measure. That is a correctness boundary, not a stylistic one: DEX history for a
-thinly-traded asset is sparse and its VWAPs are noisy, so letting it into the gate would
-let book noise approve a revision and would silently change what the revision prompt's
-"treat beats_buy_hold: false as a failed revision" instruction means.
+XLM only. A `legs=True` argument used to replay each declared extra asset over its own
+Stellar DEX candle history and report the results under `legs`, deliberately never folded
+into `beats_buy_hold`. Extra assets were removed from the domain on 2026-08-13 and that
+machinery went with them. The reason it was quarantined is worth keeping if a second leg
+ever returns: DEX history for a thinly-traded asset is sparse and its VWAPs are noisy, so
+letting it into the gate would let book noise approve a revision and would silently change
+what the revision prompt's "treat beats_buy_hold: false as a failed revision" means.
 
 CLI:
     python3 /opt/tools/backtest.py /opt/strategies/<name> [days] [ticks_per_candle]
@@ -362,181 +362,6 @@ def _add_xlm(state, delta):
     state['balance_xlm'] = max(0.0, state['balance_xlm'] + delta)
 
 
-def _load_decide_asset(strategy_dir):
-    """The strategy's optional per-asset decide function, or None.
-
-    Same import path and same importability rules as `decide`. Absent, the leg is
-    replayed against its own buy_below/sell_above from config.json, which is exactly
-    what template_repo/main.py does when decide_asset is not defined -- so the backtest
-    matches the live behavior either way.
-    """
-    main_py = os.path.join(strategy_dir, 'main.py')
-    if not os.path.exists(main_py) or not _is_importable(main_py):
-        return None
-    try:
-        spec = importlib.util.spec_from_file_location(
-            f'_bta_{os.path.basename(strategy_dir)}', main_py)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return getattr(module, 'decide_asset', None)
-    except Exception:
-        return None
-
-
-def backtest_asset(strategy_dir, code, issuer, days=7, ticks_per_candle=1):
-    """Replay ONE extra (non-XLM) leg over its own DEX candle history.
-
-    Reported separately from the XLM leg and never folded into `beats_buy_hold`. That
-    separation is deliberate rather than tidiness: this history comes from Stellar's own
-    DEX via /trade_aggregations, where an asset with a few hundred dollars of daily
-    volume produces sparse buckets and noisy VWAPs. Letting that decide whether a
-    revision passes its fitness gate would let noise on a thin book approve a strategy,
-    and would silently change what "beats_buy_hold: false is a failed revision" means.
-
-    Treat the numbers here as indicative. Returns a dict, or {'error': ...}.
-    """
-    import assets
-    import dex_price
-
-    try:
-        spec = assets.canonical(code, issuer)
-    except Exception as e:
-        return {'error': f'malformed asset: {e}'}
-
-    config = {}
-    config_path = os.path.join(strategy_dir, 'config.json')
-    if os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                config = json.load(f)
-        except Exception:
-            pass
-
-    leg = None
-    try:
-        import portfolio
-        for candidate in portfolio.assets_from_config(config):
-            if candidate['spec'] == spec:
-                leg = candidate
-                break
-    except Exception:
-        pass
-    if leg is None:
-        leg = {'code': code, 'issuer': issuer, 'spec': spec,
-               'buy_below': 0.0, 'sell_above': 0.0,
-               'trade_amount_usd': config.get('trade_amount_usd', 10)}
-
-    candles = dex_price.get_candles(spec, hours=days * 24)
-    if len(candles) < 2:
-        return {'error': f'not enough DEX candle history for {assets.display(spec)}',
-                'spec': spec, 'candles': len(candles)}
-
-    decide_asset = _load_decide_asset(strategy_dir)
-    source = 'main.py:decide_asset' if decide_asset else 'config-thresholds'
-    if decide_asset is None:
-        def decide_asset(asset, price, history, state, config):
-            if asset.get('buy_below') and price <= asset['buy_below']:
-                return ('buy', 'buy', asset.get('trade_amount_usd', 10))
-            if asset.get('sell_above') and price >= asset['sell_above']:
-                return ('sell', 'sell', asset.get('trade_amount_usd', 10))
-            return None
-
-    state = _fresh_state()
-    history = []
-    trades = sells = 0
-
-    # This matters far more here than on the XLM leg. Measured 2026-08-03, XLM's book was
-    # 8.7 bp wide while AQUA's was 151 bp and ARS's 195 bp -- 17-22x. A leg strategy
-    # replayed without cost looks like a diversification win and is in fact a way to pay
-    # a 1.5% toll several times an hour, which is how "extra assets" would have entered
-    # the population looking profitable.
-    half = _friction_half(spec)
-    friction_usd = 0.0
-
-    for candle in candles:
-        price = candle['close']
-        history.append(price)
-        for _ in range(max(1, int(ticks_per_candle))):
-            try:
-                decision = _normalize(decide_asset(leg, price, history, state, config))
-            except Exception as e:
-                return {'error': f'decide_asset() raised {type(e).__name__}: {e}',
-                        'spec': spec, 'decide_source': source}
-            if not decision:
-                break
-            side, _action, requested_usd = decision
-            try:
-                requested_usd = float(requested_usd)
-            except (TypeError, ValueError):
-                break
-            if price is None or price != price or price <= 0:
-                break
-
-            held = _leg_amount(state, spec)
-            fill = _fill(side, price, half)
-            if side == 'buy':
-                actual_usd = min(requested_usd, state['balance_usd'])
-                if actual_usd <= 0:
-                    break
-                state['balance_usd'] -= actual_usd
-                _add_leg(state, spec, actual_usd / fill)
-                friction_usd += actual_usd * half
-                trades += 1
-            elif side == 'sell':
-                actual = min(requested_usd / fill, held)
-                if actual <= 0:
-                    break
-                _add_leg(state, spec, -actual)
-                state['balance_usd'] += actual * fill
-                friction_usd += actual * fill * half
-                trades += 1
-                sells += 1
-            else:
-                break
-
-    final_price = candles[-1]['close']
-    final_net_worth = state['balance_usd'] + _leg_amount(state, spec) * final_price
-    buy_hold = START_USD * final_price / _fill('buy', candles[0]['close'], half)
-    traded_buckets = sum(1 for c in candles if c.get('trade_count', 0) > 0)
-
-    return {
-        'spec': spec,
-        'decide_source': source,
-        'candles': len(candles),
-        'days': days,
-        # How much of the window actually had trades. A low number means the return
-        # figures rest on very little real price discovery.
-        'active_buckets': traded_buckets,
-        'trades': trades,
-        'sells': sells,
-        'final_usd': round(state['balance_usd'], 4),
-        'final_amount': round(_leg_amount(state, spec), 4),
-        'final_net_worth': round(final_net_worth, 2),
-        'return_pct': round((final_net_worth / START_USD - 1) * 100, 3),
-        'buy_hold_pct': round((buy_hold / START_USD - 1) * 100, 3),
-        'friction_bp': round(half * 10000, 2),
-        'total_friction_usd': round(friction_usd, 4),
-        # Reported for information only. beats_buy_hold on the XLM leg is the gate.
-        'beats_buy_hold_leg_only': final_net_worth > buy_hold,
-    }
-
-
-def _leg_amount(state, spec):
-    try:
-        import portfolio
-        return portfolio.get_amount(state, spec)
-    except Exception:
-        return 0.0
-
-
-def _add_leg(state, spec, delta):
-    try:
-        import portfolio
-        portfolio.add_amount(state, spec, delta)
-    except Exception:
-        pass
-
-
 def _normalize(decision):
     """Accept (side, action, usd), a dict, or None."""
     if not decision:
@@ -549,7 +374,7 @@ def _normalize(decision):
     return None
 
 
-def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False):
+def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60):
     """Replay `strategy_dir` over the last `days` of candles.
 
     ticks_per_candle: live strategies poll every 30s, so an hourly candle is really
@@ -764,8 +589,6 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
         coverage=result['basis_coverage'],
     ))
 
-    if legs:
-        result['legs'] = _backtest_legs(strategy_dir, config, days)
     return result
 
 
@@ -786,26 +609,10 @@ def backtest_basis(strategy_dir, hours=12, ticks_per_candle=2):
     upstream history there regardless of how much basis we have recorded.
     """
     result = backtest(strategy_dir, days=float(hours) / 24.0,
-                      ticks_per_candle=ticks_per_candle, interval=1, legs=False)
+                      ticks_per_candle=ticks_per_candle, interval=1)
     if isinstance(result, dict):
         result['window_hours'] = hours
     return result
-
-
-def _backtest_legs(strategy_dir, config, days):
-    """Replay each declared extra asset separately. [] if none or unavailable."""
-    try:
-        import portfolio
-        declared = portfolio.assets_from_config(config)
-    except Exception:
-        return []
-    out = []
-    for leg in declared:
-        # Extra legs get a shorter window than the XLM leg: DEX history is sparse
-        # enough that asking for 30 days mostly returns empty buckets.
-        out.append(backtest_asset(strategy_dir, leg['code'], leg['issuer'],
-                                  days=min(days, 7)))
-    return out
 
 
 if __name__ == '__main__':
@@ -823,4 +630,4 @@ if __name__ == '__main__':
     days = float(argv[1]) if len(argv) > 1 else 30
     ticks = int(argv[2]) if len(argv) > 2 else 1
     print(json.dumps(backtest(path, days=days, ticks_per_candle=ticks,
-                              interval=interval, legs=True), indent=2))
+                              interval=interval), indent=2))

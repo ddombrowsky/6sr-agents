@@ -91,9 +91,9 @@ ROLE_EXPLORE = domain.ROLE_EXPLORE
 CENSUS_CLUSTERS = 6
 
 # The /opt/tools modules a strategy would import for *signal*, as opposed to the
-# infrastructure every strategy already uses (trade_logger, price_feed, portfolio,
-# dex_price, assets). The census reports which of these nobody imports, which is the
-# concrete list of directions the population has not tried.
+# infrastructure every strategy already uses (trade_logger, price_feed, portfolio).
+# The census reports which of these nobody imports, which is the concrete list of
+# directions the population has not tried.
 SIGNAL_MODULES = (
     'basis', 'ema_sma', 'ema_sma_complete', 'friction', 'market_recorder',
     'moving_averages', 'news_feed', 'ohlc_history', 'orderbook_depth',
@@ -104,7 +104,7 @@ SIGNAL_MODULES = (
 # invented by some revision, and the census reports those back so an explore spawn can
 # see which parameters have already been tried before inventing another.
 STANDARD_CONFIG_KEYS = frozenset((
-    'name', 'schema_version', 'buy_below', 'sell_above', 'trade_amount_usd', 'assets',
+    'name', 'schema_version', 'buy_below', 'sell_above', 'trade_amount_usd',
     'news_veto_below', 'basis_min_bp',
 ))
 
@@ -397,8 +397,7 @@ def _build_sdex_revision_system_prompt():
     'scores exactly the starting balance and gets you nowhere.\n\n'
     'TRADING COSTS MONEY. Every fill crosses the order book: a buy lifts the ask, a '
     f'sell hits the bid. Right now a full buy-then-sell round trip in XLM costs about '
-    f'{_FACTS["xlm_round_trip_bp"]} basis points, and in a discovered non-XLM asset it is '
-    f'far worse -- assume at least {_FACTS["nonbase_round_trip_bp"]} bp and check with '
+    f'{_FACTS["xlm_round_trip_bp"]} basis points -- check with '
     '`friction.round_trip_bp`. This is charged for real: trade_logger.execute_trade '
     'fills you at the adjusted price and backtest_strategy replays it the same way, so '
     'it is already inside every number you are judged on. Consequences:\n'
@@ -489,47 +488,23 @@ def _build_sdex_revision_system_prompt():
     'veto degrades safely if the feed is down, leaving the price rule you already '
     'backtested. Never veto SELLS: stranding a position is worse than missing an '
     'entry.\n\n'
-    'ASSETS. The strategy trades XLM plus UP TO 2 additional Stellar assets, listed in '
-    "config.json's `assets` array (XLM is never listed there -- it is the permanent base "
-    'leg, carried by the top-level buy_below/sell_above/trade_amount_usd). Each entry is '
-    '{"code", "issuer", "buy_below", "sell_above", "trade_amount_usd"}. You may add, '
-    'change or remove those extra assets; you cannot remove XLM.\n'
-    '  * A Stellar asset is the PAIR (code, issuer). The code alone is meaningless: '
-    'anyone can issue an asset with code USDC or AQUA from their own account, and '
-    'impostors of common codes are live on the network right now. Always write both '
-    'fields.\n'
-    '  * NEVER write an issuer address from memory. Your recollection of an issuer is '
-    'exactly what an attacker impersonates. Get it from `list_candidate_assets` or '
-    '`verify_asset`, and copy the full 56-character G... address verbatim.\n'
-    '  * Your asset choice is a PROPOSAL, not a decision. monitor.py re-verifies every '
-    'asset before the clone starts and again on later cycles, and silently deletes any '
-    'that fails -- including one that was fine when you picked it and has since lost its '
-    'liquidity. A strategy whose entire thesis rests on one exotic asset will end up an '
-    'XLM-only strategy. Call `verify_asset` before you commit, and prefer assets that '
-    'pass it comfortably.\n'
-    '  * Extra assets trade only on Stellar\'s own DEX: no centralized-exchange price, '
-    'much thinner books, wider spreads, and short/gappy history. Size them well below '
-    'your XLM leg. Scoring marks them at what the live bid side could actually absorb '
-    'and applies an additional illiquidity haircut, so a large position in a thin asset '
-    'is scored at what it could really be sold for, not at its quoted price.\n'
-    '  * Put per-asset logic in an optional `decide_asset(asset, price, history, state, '
-    'config)` returning the same (side, action, requested_usd) 3-tuple or None, called '
-    'once per extra asset per tick under the same importability rules as `decide`. If '
-    'you omit it, each leg just uses its own thresholds from config.json. Keep `decide` '
-    'for the XLM leg -- that is what backtest_strategy replays and what beats_buy_hold '
-    'is measured on. Extra legs are reported separately over a shorter, less reliable '
-    'window, so do not over-fit to them.\n'
-    '  * Balances now live in `state["positions"]` keyed by asset, but execute_trade '
-    'still maintains them -- you never touch them yourself. Pass the asset as a keyword: '
-    "execute_trade(agent_name, action, side, price, requested_usd, state, "
-    "asset='CODE:ISSUER').\n"
-    '  * Extra legs CAN trade real money, but only on the live strategy, only once '
-    'monitor has opened a trustline for that asset at promotion, and only while the asset '
-    'stays admitted -- otherwise the leg is paper-only, the normal case since only one '
-    f'strategy is live at a time. Real non-XLM orders are clamped to '
-    f'${_FACTS["max_trade_usd_nonbase"]:.2f} per trade against '
-    f'${_FACTS["max_trade_usd"]:.2f} for XLM. Design for the paper book, and never build '
-    'a strategy whose thesis depends on any single real fill landing.\n\n'
+    'XLM IS THE ONLY ASSET. There is one tradeable instrument and one threshold band: '
+    "the top-level buy_below / sell_above / trade_amount_usd in config.json. Until "
+    '2026-08-13 a strategy could also declare up to two additional Stellar DEX assets in '
+    'an `assets` array and trade them through a `decide_asset()` hook; that was removed '
+    'because the population had effectively stopped using it. Do not try to bring it '
+    'back:\n'
+    '  * Do NOT add an `assets` key to config.json. monitor deletes it on the next cycle, '
+    'so it is wasted output, not a proposal.\n'
+    '  * Do NOT define `decide_asset()`. Nothing calls it.\n'
+    '  * Do NOT pass `asset=` to execute_trade. It refuses any asset this strategy does '
+    'not declare, and the only thing a strategy can declare now is XLM. A candidate whose '
+    'smoke run comes back holding a non-XLM position is rejected outright.\n'
+    '  * Balances live in `state["positions"]`, but execute_trade maintains them -- you '
+    'never touch them yourself.\n'
+    f'  * Real orders are clamped to ${_FACTS["max_trade_usd"]:.2f} per trade, far below '
+    'the paper book. Design for the paper book, and never build a strategy whose thesis '
+    'depends on any single real fill landing.\n\n'
     "Do not default to only nudging buy_below/sell_above. Threshold tweaks are the "
     "weakest lever available to you -- treat them as a last resort, not the first move. "
     "/opt/tools has indicator and signal modules you can import from a strategy's "
@@ -648,16 +623,15 @@ def _build_sdex_revision_system_prompt():
 # --------------------------------------------------------------------------------------
 # Domain-conditional prompt/tool swap for non-sdex domains (FUTURE.md items 3 and 4).
 #
-# The system prompt above -- and 15 of the 20 tools registered further up (TOOLS/
-# TOOL_SCHEMAS) -- are hardcoded to sdex: XLM, order books, trade_logger, basis, assets.
-# None of that exists in domain_forecast.py's or domain_kalshi.py's games, and handing
-# the revision model those tools/instructions unchanged would mean every non-sdex
-# revision gets sdex-flavored guidance and mostly fails its smoke test, falling back to
-# mechanical tweak_config jitter -- exercising evolution but never real LLM reasoning
-# about the new domain. domain.py itself defers a general `domain.llm_tools()` seam to
-# later (see its "what is deliberately not here" section); this is the minimal,
-# contained version of that for the domains that exist today -- a branch per domain, not
-# a plugin system.
+# The system prompt above -- and 7 of the 17 tools registered further up (TOOLS/
+# TOOL_SCHEMAS) -- are hardcoded to sdex: XLM, order books, trade_logger, basis.
+# None of that exists in domain_forecast.py's game, and handing the revision model those
+# tools/instructions unchanged would mean every forecast-domain revision gets sdex-
+# flavored guidance and mostly fails its smoke test, falling back to mechanical
+# tweak_config jitter -- exercising evolution but never real LLM reasoning about the new
+# domain. domain.py itself defers a general `domain.llm_tools()` seam to later (see its
+# "what is deliberately not here" section); this is the minimal, contained version of
+# that for exactly the one new domain that exists today -- a branch, not a plugin system.
 #
 # The sdex text above is untouched by this: REVISION_SYSTEM_PROMPT is only reassigned
 # below, never edited in place, so a run with DOMAIN=sdex (or unset) gets the exact same
@@ -1246,7 +1220,7 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
         f'rebuilds it from scratch at price*0.98 / price*1.02.\n\n'
         f'CONFIG.JSON IS YOURS TO EXTEND beyond those required keys -- nothing here '
         f'validates it against a schema, and the entire config dict reaches your '
-        f'`decide(price, history, state, config)` and `decide_asset(...)` unchanged, in '
+        f'`decide(price, history, state, config)` unchanged, in '
         f'live trading and backtest_strategy alike. A period, a lookback, a '
         f'stop-loss/take-profit percentage, a position-sizing fraction, a cooldown -- '
         f'whatever your logic needs belongs in config.json under a name that says what '
@@ -1257,9 +1231,9 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
         f'default>)`, never `config["your_key"]` -- a KeyError on the first tick fails '
         f'the smoke test and is reverted.\n'
         f'  * Do not rename, repurpose or drop `name`, `schema_version`, `buy_below`, '
-        f'`sell_above`, `trade_amount_usd` or `assets` -- monitor and the shared tools '
-        f'read those. Add alongside them, and remove only keys you introduced yourself '
-        f'and no longer use.\n\n'
+        f'`sell_above` or `trade_amount_usd` -- monitor and the shared tools read those. '
+        f'Add alongside them, and remove only keys you introduced yourself and no longer '
+        f'use.\n\n'
         f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
         f'proven code, so you are free to restructure it):\n'
         f'```python\n{own_main_py}\n```\n\n'
@@ -1274,10 +1248,6 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
         f'beats_buy_hold must come back true -- for a strategy with no track record '
         f'that is the entire acceptance test, so run backtest_strategy and iterate '
         f'until it passes.\n\n'
-        f'On assets: leaving `assets` empty lets monitor hand this strategy up to two '
-        f'verified discovered assets on a coin flip; declaring your own turns that off. '
-        f'Declare only if they are part of your thesis, and never write an issuer '
-        f'address from memory -- verify it first.\n\n'
         f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
     )
 
@@ -1285,7 +1255,7 @@ def _explore_prompt(strategy_name, strategy_path, leaderboard, price_line) -> st
 def _refine_prompt_forecast(strategy_name, parent_name, strategy_path, parent_score,
                             leaderboard, tick_line) -> str:
     """The forecast domain's clone case. Parallel to _refine_prompt, minus every
-    concept (price, trade_amount_usd, assets) that has no forecast-domain meaning."""
+    concept (price, trade_amount_usd) that has no forecast-domain meaning."""
     parent_path = STRATEGIES_DIR / parent_name
     parent_config = _read_json(parent_path / 'config.json', {})
     parent_state = _read_json(parent_path / 'state.json', {})

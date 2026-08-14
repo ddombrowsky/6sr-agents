@@ -23,10 +23,10 @@ export MASTER_AGENT_MODEL=gpt
 # revision prompt to /opt/emperor_logs/pending_revision.md and blocks the whole cycle
 # until `master-agent.py revision-done <name>` is run. See v/strategies/CLAUDE.md for
 # the human-side workflow. Comment out to go back to the local Ollama model.
-#export REVISION_MODE=manual
+export REVISION_MODE=manual
 
 date > $LOG
-#touch /opt/.monitor.py.exit
+touch /opt/.monitor.py.exit
 # Piped through tee rather than redirected straight to $LOG: under REVISION_MODE=manual
 # the cycle can pause and print a banner asking for action (what to read, what command
 # to run to resume) -- that has to reach this terminal, not just the log file, or

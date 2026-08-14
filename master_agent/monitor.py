@@ -19,8 +19,8 @@ rather than being signalled mid-revision (see EXIT_FILE / sleep_or_exit below).
 
 THIS FILE KNOWS NOTHING ABOUT WHAT IT IS TRADING, AND MUST STAY THAT WAY.
 ========================================================================
-Prices, order books, assets, issuers, threshold bands, spreads, trustlines and the
-real-money caps all live behind `DOMAIN` -- see domain.py for the contract and
+Prices, threshold bands, spreads and the real-money caps all live behind `DOMAIN` -- see
+domain.py for the contract and
 domain_sdex.py for the Stellar DEX implementation. If you are about to add one of those
 things here, it belongs in the domain module instead. `obs`, the per-cycle observation
 threaded through this file, is deliberately opaque: the loop only ever tests it for None
@@ -42,16 +42,16 @@ Where the domain went, for anything (or anyone) looking for a name that used to 
     _sanitize_assets(path, marks)             DOMAIN.sanitize_config(path, obs)
     _repair_config(path, price, name)         DOMAIN.repair_config(path, name, obs)
     _config_is_sane(cfg, price, marks, name)  DOMAIN.config_is_sane(cfg, name, obs)
-    _assets_are_sane / _thresholds_are_sane   (inside DOMAIN.config_is_sane)
-    _basis_gate_is_sane / _required_keys_...  (inside DOMAIN.config_is_sane)
-    _inject_discovered_assets/_basis_gate     DOMAIN.inject_experiments(path, obs)
+    _thresholds_are_sane / _basis_gate_...    (inside DOMAIN.config_is_sane)
+    _required_keys_are_sane                   (inside DOMAIN.config_is_sane)
+    _inject_basis_gate                        DOMAIN.inject_experiments(path, obs)
     apply_seed_thresholds / _seed_band_...    DOMAIN.seed_config(path, name, obs)
     apply_random_tweak                        DOMAIN.tweak_config(parent, new, name)
     main_py_calls_execute_trade               DOMAIN.can_execute_live(name)
     _promotion_sizing / open_trustlines_for   DOMAIN.promotion_sizing / DOMAIN.prepare_live
     MAIN_PY_IMPORTABILITY                     domain_sdex.MAIN_PY_IMPORTABILITY
     BACKTEST_GATE_DAYS                        DOMAIN.REPLAY_DAYS
-    REFLECTOR_INJECT_* / BASIS_INJECT_*       domain_sdex (inject_experiments)
+    BASIS_INJECT_*                            domain_sdex (inject_experiments)
     RECORDER_*                                domain_sdex (ensure_background_jobs)
 
 There are deliberately no back-compat aliases: several of these changed signature, and an
@@ -62,12 +62,13 @@ strat_manager.py and tools/ still say "monitor.<oldname>"; the table above is th
 translation, and they were left alone rather than churn two git repos the integrity check
 watches.
 
-Three sdex-flavoured names are knowingly still in this file, because changing them changes
-either an on-disk format or a log line, and both would spoil the diff that proves this
-refactor was inert: `trustlines` (the live_strategy.json key DOMAIN.prepare_live's result
-is stored under, which live_report.py reads back), and the "regime summary unavailable" /
-"basis edge report unavailable" messages on the reporter try/excepts. Fix them in the
-first commit after a cycle-log diff has been signed off, not before.
+Two sdex-flavoured log lines are knowingly still in this file, because changing them
+changes a log line and would spoil the diff that proves the domain refactor was inert:
+the "regime summary unavailable" / "basis edge report unavailable" messages on the
+reporter try/excepts. Fix them in the first commit after a cycle-log diff has been signed
+off, not before. The third such name, the `trustlines` key save_live_strategy wrote into
+live_strategy.json, went with the extra-asset removal on 2026-08-13 -- nothing had ever
+read it, contrary to the claim recorded here.
 """
 import ast
 import json
@@ -897,12 +898,24 @@ def _run_revision_manual(name, parent_name, score, leaderboard, obs, role):
         print(f'Manual revision prompt for {name} ({role}) errored: {e}')
         return False
 
+    # sys.executable, NOT a literal 'python3' -- the same reasoning as the revise-strategy
+    # spawn below, and for a reader this banner matters more. Whoever runs this is pasting
+    # it into a fresh shell (often `docker exec`), where 'python3' resolves to
+    # /usr/bin/python3, which has none of /opt/agents/venv's packages: master-agent.py dies
+    # on `import httpx` before it can touch the done-file, and the cycle just keeps waiting.
+    # sys.executable is absolute and is by construction the interpreter monitor itself
+    # passed _check_revision_interpreter under.
+    #
+    # The `. /opt/env.sh` is the second half of the same trap: master-agent.py sys.exits on
+    # a missing OLLAMA_API_KEY at import time, for every subcommand -- including this one,
+    # which only touches a file and never reaches the model. Sourcing it again is harmless
+    # if the caller already has it.
     print(
         f'\n=== Cycle paused for a manual revision of {name} ({role}) ===\n'
         f'In Claude Code:\n'
         f'  Read {MANUAL_REVISION_PROMPT_FILE} and follow its instructions.\n'
         f'When it has finished editing (no need to commit -- monitor.py does that), run:\n'
-        f'  python3 {MASTER_AGENT_SCRIPT} revision-done {name}\n'
+        f'  . /opt/env.sh && {sys.executable} {MASTER_AGENT_SCRIPT} revision-done {name}\n'
         f'to resume this cycle. Or touch {MANUAL_REVISION_ABORT_FILE} to give up on this '
         f'one revision and exit instead. Waiting...\n'
     )
@@ -1176,15 +1189,14 @@ def load_live_strategy():
             return None
     return None
 
-def save_live_strategy(name, sizing=None, trustlines=None):
+def save_live_strategy(name, sizing=None):
+    # This used to take DOMAIN.prepare_live()'s return and store it under a `trustlines`
+    # key, recording which of a strategy's declared extra legs could actually reach real
+    # money. Extra legs are gone, sdex's prepare_live returns {}, and nothing ever read
+    # the key back -- the claim below that live_report.py did was simply untrue.
     entry = {'name': name, 'since': time.time()}
     if sizing:
         entry['sizing'] = sizing
-    if trustlines:
-        # Which of this strategy's declared legs can actually reach real money. A leg
-        # without a trustline is paper-only for as long as it stays that way, and that is
-        # otherwise visible nowhere -- the strategy runs, logs trades and looks normal.
-        entry['trustlines'] = trustlines
     LIVE_STRATEGY_FILE.write_text(json.dumps(entry, indent=2))
 
 def set_live_flag(name, live):
@@ -1355,14 +1367,13 @@ def promote_live_strategy(current_leader, leader_score):
 
     # Between retire_live and live.flag, deliberately. See DOMAIN.prepare_live.
     print(f'Promoting {current_leader} to live')
-    trustlines = DOMAIN.prepare_live(current_leader)
+    DOMAIN.prepare_live(current_leader)
     set_live_flag(current_leader, True)
     # Deliberately not refreshed on the "already live" re-assert path above: `since` must
     # not move, and this is a snapshot of the sizing *at promotion* by definition. A caps
     # change afterwards is exactly the drift worth seeing, so live_report flags it rather
     # than it being silently overwritten here.
-    save_live_strategy(current_leader, sizing=DOMAIN.promotion_sizing(current_leader),
-                       trustlines=trustlines)
+    save_live_strategy(current_leader, sizing=DOMAIN.promotion_sizing(current_leader))
     # Optional: not every domain moves real money. Must run after save_live_strategy,
     # not before -- see DOMAIN.ensure_trading_cushion / stellar_trader's docstring.
     ensure_cushion = getattr(DOMAIN, 'ensure_trading_cushion', None)
@@ -1444,9 +1455,9 @@ def promote_strategy_manual(name, force=False):
         set_live_flag(old_name, False)
 
     lines.append(f'Promoting {name} to live')
-    trustlines = DOMAIN.prepare_live(name)
+    DOMAIN.prepare_live(name)
     set_live_flag(name, True)
-    save_live_strategy(name, sizing=DOMAIN.promotion_sizing(name), trustlines=trustlines)
+    save_live_strategy(name, sizing=DOMAIN.promotion_sizing(name))
     ensure_cushion = getattr(DOMAIN, 'ensure_trading_cushion', None)
     if ensure_cushion:
         ensure_cushion(name)

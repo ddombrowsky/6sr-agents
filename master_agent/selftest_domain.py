@@ -111,6 +111,37 @@ def same(label, old, new):
     check(label, old == new, f'baseline {old!r} != domain {new!r}')
 
 
+def differs(label, old, new, why):
+    """The opposite assertion: this behaviour was changed ON PURPOSE, so it must differ.
+
+    Added with the extra-asset removal (2026-08-13). Deleting a differential check when
+    you intend to change what it pins is the easy move and the wrong one -- it leaves no
+    record, and it stops noticing if the old behaviour ever comes back. This fails in
+    both directions: if the two agree, either the removal was undone or the baseline
+    never had the behaviour, and both deserve a red run.
+
+    Prefer comparing modulo the intended difference (see the `assets`-key comparisons
+    further down) wherever the rest of the value can still be pinned. Use this only where
+    the whole value changed shape.
+    """
+    check(f'{label} [intentionally diverges: {why}]', old != new,
+          f'baseline and domain both {old!r}, but this was supposed to change')
+
+
+def without_assets(text_or_obj):
+    """A config dict with the retired `assets` key removed. Accepts JSON text or a dict.
+
+    The extra-asset removal's whole config-side footprint is "this key is gone", so every
+    seed_config/tweak_config comparison below can still pin every OTHER key against the
+    pre-refactor baseline by normalising just this one away. That keeps the differential
+    doing its job over the mechanical mutation paths -- the control arm the revised
+    batches are measured against -- instead of dropping those checks wholesale.
+    """
+    obj = json.loads(text_or_obj) if isinstance(text_or_obj, str) else dict(text_or_obj)
+    obj.pop('assets', None)
+    return obj
+
+
 def skip(label, why):
     _skipped.append(f'{label} ({why})')
 
@@ -435,6 +466,44 @@ check('observation_line(None) is the NOT PROVIDED branch',
       'Current XLM/USD price: NOT PROVIDED for this cycle -- fetch it yourself '
       '(exec curl, or /opt/tools/price_feed.py) before setting any thresholds.\n')
 
+# ==================================== 2b. the extra-asset stack is gone and stays gone
+#
+# Removed 2026-08-13. These are cheap and they are the check that notices a well-meaning
+# emperor pass (or a revision with exec access) putting any of it back: every name below
+# was a live entry point into multi-asset trading, and a partial restoration -- an
+# injector with no verification gate, say -- is worse than either state.
+
+for _gone in ('_assets_are_sane', '_inject_discovered_assets', '_inject_reflector_assets',
+              '_next_candidate_assets', '_next_discovered_assets', '_next_reflector_assets',
+              '_record_admission', '_leg_round_trip', 'VERIFIED_ASSETS_FILE',
+              'ASSET_APPROVAL_TTL', 'REFLECTOR_INJECT_CHANCE', 'REFLECTOR_INJECT_COUNT'):
+    check(f'domain_sdex.{_gone} is gone', not hasattr(SDEX, _gone))
+
+check('sdex marks carry XLM and nothing else',
+      list(SDEX.observe_population(SDEX.Observation(price=_PRICE), {}).marks) == ['XLM'])
+check('prepare_live has nothing left to prepare',
+      SDEX.prepare_live('nonexistent_strategy') == {})
+
+import score as _score_check
+for _gone in ('ILLIQUID_HAIRCUT', 'STALE_MARK_MAX_AGE'):
+    check(f'score.{_gone} is gone', not hasattr(_score_check, _gone))
+
+# sanitize_config's whole remaining job: delete the key wherever it is inherited from.
+for _label, _payload in (('a populated list', [{'code': 'AQUA', 'issuer': 'GBNZ'}]),
+                         ('an empty list', []),
+                         ('a non-list', 'AQUA')):
+    _d = _scratch({'name': 'X', 'schema_version': 2, 'buy_below': 0.1633,
+                   'sell_above': 0.1699, 'trade_amount_usd': 10.0, 'assets': _payload})
+    try:
+        SDEX.sanitize_config(_d / 'config.json', _sdex_obs)
+        _after = json.loads((_d / 'config.json').read_text())
+        check(f'sanitize_config strips assets [{_label}]', 'assets' not in _after)
+        check(f'sanitize_config keeps every other key [{_label}]',
+              _after.get('buy_below') == 0.1633 and _after.get('trade_amount_usd') == 10.0,
+              repr(_after))
+    finally:
+        shutil.rmtree(_d, ignore_errors=True)
+
 # ================================================== 3. differential against the baseline
 
 BASE = _load_baseline_monitor()
@@ -454,9 +523,22 @@ else:
 
     # ---- the four gates, plus the composed verdict, over every fixture
     for label, cfg in _CONFIGS.items():
-        same(f'config_is_sane [{label}]',
-             BASE._config_is_sane(copy.deepcopy(cfg), _PRICE, _sdex_obs.marks, name='X'),
-             SDEX.config_is_sane(copy.deepcopy(cfg), 'X', _sdex_obs))
+        # config_is_sane lost its fourth term (_assets_are_sane) with the extra-asset
+        # removal, so it now diverges from the baseline on exactly the configs the
+        # baseline rejected FOR their assets block and on no others. Branching on the
+        # baseline's own asset verdict states that rule precisely, and keeps the check
+        # environment-independent: outside the container _assets_are_sane could not
+        # consult /opt/tools and passed everything, so there is nothing to diverge from.
+        base_assets_ok = BASE._assets_are_sane(copy.deepcopy(cfg), _sdex_obs.marks)
+        base_verdict = BASE._config_is_sane(copy.deepcopy(cfg), _PRICE,
+                                            _sdex_obs.marks, name='X')
+        new_verdict = SDEX.config_is_sane(copy.deepcopy(cfg), 'X', _sdex_obs)
+        if base_assets_ok:
+            same(f'config_is_sane [{label}]', base_verdict, new_verdict)
+        else:
+            differs(f'config_is_sane [{label}]', base_verdict, new_verdict,
+                    'an assets block is no longer a reason to reject a whole revision; '
+                    'sanitize_config deletes the key instead')
         same(f'_required_keys_are_sane [{label}]',
              BASE._required_keys_are_sane(copy.deepcopy(cfg), 'X'),
              SDEX._required_keys_are_sane(copy.deepcopy(cfg), 'X'))
@@ -466,9 +548,6 @@ else:
         same(f'_basis_gate_is_sane [{label}]',
              BASE._basis_gate_is_sane(copy.deepcopy(cfg)),
              SDEX._basis_gate_is_sane(copy.deepcopy(cfg)))
-        same(f'_assets_are_sane [{label}]',
-             BASE._assets_are_sane(copy.deepcopy(cfg), _sdex_obs.marks),
-             SDEX._assets_are_sane(copy.deepcopy(cfg), _sdex_obs.marks))
         # No price at all: repair_config and prepare_smoke_config both branch on this,
         # and a wrong answer here silently reverts every revised main.py.
         same(f'_thresholds_are_sane, no price [{label}]',
@@ -516,9 +595,13 @@ else:
             BASE.apply_seed_thresholds(old_dir / 'config.json', 'X', _PRICE)
             random.seed(4321)
             SDEX.seed_config(new_dir / 'config.json', 'X', _sdex_obs)
-            same(f'seed_config writes [{label}]',
-                 (old_dir / 'config.json').read_text(),
-                 (new_dir / 'config.json').read_text())
+            # Modulo the retired key: every other key -- the seeded band, the carried
+            # trade size, whatever knob a revision invented -- is still pinned exactly.
+            same(f'seed_config writes, less the assets key [{label}]',
+                 without_assets((old_dir / 'config.json').read_text()),
+                 without_assets((new_dir / 'config.json').read_text()))
+            check(f'seed_config writes no assets key [{label}]',
+                  'assets' not in json.loads((new_dir / 'config.json').read_text()))
         finally:
             shutil.rmtree(old_dir, ignore_errors=True)
             shutil.rmtree(new_dir, ignore_errors=True)
@@ -533,9 +616,11 @@ else:
             new_ok = SDEX.tweak_config(parent_dir / 'config.json',
                                        new_dir / 'config.json', 'X')
             same(f'tweak_config returns [{label}]', old_ok, new_ok)
-            same(f'tweak_config writes [{label}]',
-                 (old_dir / 'config.json').read_text(),
-                 (new_dir / 'config.json').read_text())
+            same(f'tweak_config writes, less the assets key [{label}]',
+                 without_assets((old_dir / 'config.json').read_text()),
+                 without_assets((new_dir / 'config.json').read_text()))
+            check(f'tweak_config writes no assets key [{label}]',
+                  'assets' not in json.loads((new_dir / 'config.json').read_text()))
         finally:
             for d in (parent_dir, old_dir, new_dir):
                 shutil.rmtree(d, ignore_errors=True)
@@ -589,21 +674,40 @@ else:
     finally:
         shutil.rmtree(empty, ignore_errors=True)
 
-    # ---- config_signature: the dedup key select_parents ranks on
+    # ---- config_signature: the dedup key select_parents ranks on.
+    # The baseline's tuple is (buy, sell, size, asset_sig, basis_min_bp); the asset
+    # element at index 3 went with the extra-asset stack, so the new tuple is the old one
+    # with that position removed. Compared that way rather than dropped, because the
+    # remaining four elements decide which parents select_parents treats as duplicates,
+    # and a silent change there costs a revision slot per cycle.
     for label, cfg in _CONFIGS.items():
         d = _scratch(cfg)
         try:
-            same(f'config_signature [{label}]',
-                 BASE._config_signature({'path': str(d)}),
-                 SDEX.config_signature({'path': str(d)}))
+            old_sig = BASE._config_signature({'path': str(d)})
+            new_sig = SDEX.config_signature({'path': str(d)})
+            same(f'config_signature, less the asset element [{label}]',
+                 None if old_sig is None else old_sig[:3] + old_sig[4:], new_sig)
         finally:
             shutil.rmtree(d, ignore_errors=True)
     same('config_signature on a missing dir',
          BASE._config_signature({'path': '/nonexistent'}),
          SDEX.config_signature({'path': '/nonexistent'}))
 
-    # ---- caps and the replay/importability gates
-    same('caps', BASE._stellar_caps(), SDEX.caps())
+    # ---- caps and the replay/importability gates.
+    # caps() now records only the two XLM caps; the five non-base ones described legs
+    # that no longer exist. stellar_trader still defines and enforces all seven -- it is
+    # the money boundary and was deliberately not touched -- so the baseline still reads
+    # them and the two XLM values must still agree exactly.
+    _old_caps, _new_caps = BASE._stellar_caps(), SDEX.caps()
+    if _old_caps is None or _new_caps is None:
+        same('caps (both unavailable)', _old_caps, _new_caps)
+    else:
+        same('caps, the XLM pair that survived',
+             {k: _old_caps[k] for k in ('max_trade_usd', 'max_daily_usd')}, _new_caps)
+        check('caps no longer records the non-base caps',
+              not any(k.endswith('_nonbase') or 'per_asset' in k or 'stuck' in k
+                      for k in _new_caps),
+              repr(sorted(_new_caps)))
     same('importability of a good main.py',
          BASE._importability_check('def decide(price, history, state, config):\n    return None\n'),
          SDEX.importability('def decide(price, history, state, config):\n    return None\n'))
@@ -670,12 +774,27 @@ else:
                 continue
             if not isinstance(cfg, dict):
                 continue
-            same(f'live config_is_sane [{name}]',
-                 BASE._config_is_sane(copy.deepcopy(cfg), _PRICE, _sdex_obs.marks,
-                                      name=name),
-                 SDEX.config_is_sane(copy.deepcopy(cfg), name, _sdex_obs))
-            same(f'live config_signature [{name}]',
-                 BASE._config_signature(entry), SDEX.config_signature(entry))
+            # Same two allowances as the fixture loop above, for the same reasons: the
+            # baseline's asset verdict decides whether config_is_sane may diverge, and
+            # config_signature is compared with the baseline's asset element removed.
+            # This loop runs over the REAL population, so it is the check that would
+            # actually have caught a lineage still carrying a declared leg -- roughly a
+            # dozen did at removal time.
+            if BASE._assets_are_sane(copy.deepcopy(cfg), _sdex_obs.marks):
+                same(f'live config_is_sane [{name}]',
+                     BASE._config_is_sane(copy.deepcopy(cfg), _PRICE, _sdex_obs.marks,
+                                          name=name),
+                     SDEX.config_is_sane(copy.deepcopy(cfg), name, _sdex_obs))
+            else:
+                differs(f'live config_is_sane [{name}]',
+                        BASE._config_is_sane(copy.deepcopy(cfg), _PRICE, _sdex_obs.marks,
+                                             name=name),
+                        SDEX.config_is_sane(copy.deepcopy(cfg), name, _sdex_obs),
+                        'an assets block no longer rejects a config')
+            _old_sig = BASE._config_signature(entry)
+            same(f'live config_signature, less the asset element [{name}]',
+                 None if _old_sig is None else _old_sig[:3] + _old_sig[4:],
+                 SDEX.config_signature(entry))
             same(f'live score [{name}]',
                  BASE.score_from_strategy_path(entry['path'], _PRICE, _sdex_obs.marks),
                  SDEX.score_path(entry['path'], _sdex_obs))
@@ -717,11 +836,13 @@ else:
     facts = CUR_MA._FACTS
     same('prompt haircut', BASE_MA.score.UNREALIZED_HAIRCUT, facts['unrealized_haircut'])
     same('prompt XLM round trip', BASE_MA._XLM_RT_BP, facts['xlm_round_trip_bp'])
-    same('prompt non-base round trip', BASE_MA._NONBASE_RT_BP,
-         facts['nonbase_round_trip_bp'])
     same('prompt max trade', BASE_MA._MAX_TRADE_USD, facts['max_trade_usd'])
-    same('prompt max non-base trade', BASE_MA._MAX_TRADE_USD_NONBASE,
-         facts['max_trade_usd_nonbase'])
+    # The baseline also stated a non-base round trip and a non-base per-trade cap. Both
+    # described the extra-asset legs and went with them; the prompt no longer mentions
+    # either, so prompt_facts must not still be computing them.
+    check('prompt_facts no longer states the non-base numbers',
+          'nonbase_round_trip_bp' not in facts and 'max_trade_usd_nonbase' not in facts,
+          repr(sorted(facts)))
     check('ROLE_* are no longer hand-duplicated',
           CUR_MA.ROLE_REFINE is domain.ROLE_REFINE
           and CUR_MA.ROLE_EXPLORE is domain.ROLE_EXPLORE)
@@ -731,8 +852,8 @@ else:
 # ============================== 5. the loop, driven against a domain with no money in it
 #
 # The assertion nothing else can make: monitor.py's real smoke-test harness, over a domain
-# that has no price, no assets, no order book and no caps. If an sdex assumption is left
-# in the loop, this is what finds it.
+# that has no price, no order book and no caps. If an sdex assumption is left in the loop,
+# this is what finds it.
 
 import monitor
 
