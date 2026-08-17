@@ -195,6 +195,51 @@ def backtest_forecast_strategy(strategy_path: str, n: int = 2000) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def backtest_maker_strategy(strategy_path: str, days: float = 7) -> str:
+    """Replay a market-making strategy over recorded order book and executed tape.
+
+    The maker-domain analogue of backtest_strategy. Read `spread_captured_usd` and
+    `adverse_selection_usd` TOGETHER -- gross spread capture alone makes every width look
+    profitable, and `net_edge_usd` is their difference and what beats_null is decided on.
+    `trades` counts FILLS, so a strategy that quotes diligently at a price the tape never
+    crosses reports zero here, which is exactly the failure this tool exists to surface.
+
+    Imported lazily for the same reason backtest_strategy is: a broken or missing
+    /opt/tools module must never stop the agent from starting.
+    """
+    try:
+        from maker_backtest import replay
+        result = replay(strategy_path, days=float(days))
+        if isinstance(result, dict) and result.get('decide_source') not in (None, 'main.py:quote'):
+            result['WARNING'] = (
+                f"decide_source is {result.get('decide_source')!r}: the backtester could "
+                f"NOT import quote() from main.py, so every number here describes the "
+                f"mechanical config-genome fallback, NOT this strategy's code. Fix the "
+                f"structure first: main.py's top level may contain only imports, "
+                f"assignments, defs, the docstring and an `if __name__ == '__main__'` "
+                f"guard, with the logic in a top-level quote(book, state, config). Then "
+                f"re-run this tool and check that decide_source is 'main.py:quote' "
+                f"before trusting any result.")
+        return json.dumps(result)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
+def get_tape_stats(hours: int = 24) -> str:
+    """Executed-trade statistics for XLM/USDC by size bucket, as JSON.
+
+    What a maker needs for sizing and cannot get from the order book: how much actually
+    trades per hour at or above the size you would quote, how one-sided the aggressing
+    flow has been, and what share of volume was liquidity-pool flow that no resting offer
+    could have captured.
+    """
+    try:
+        import dex_trades
+        return json.dumps(dex_trades.tape_stats(hours=int(hours)), indent=2)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 def get_news_sentiment(asset: str = 'XLM', limit: int = 10) -> str:
     """Current headlines and their keyword sentiment score, as JSON."""
     try:
@@ -366,6 +411,8 @@ TOOLS = {
     'get_asset_price_history': get_asset_price_history,
     'backtest_strategy': backtest_strategy,
     'backtest_forecast_strategy': backtest_forecast_strategy,
+    'backtest_maker_strategy': backtest_maker_strategy,
+    'get_tape_stats': get_tape_stats,
     'get_price_history': get_price_history,
     'calculate': calculate,
     'get_current_time': get_current_time,

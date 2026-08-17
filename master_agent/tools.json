@@ -422,5 +422,45 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "backtest_maker_strategy",
+      "description": "Replay a market-making strategy over recorded order book snapshots joined to the executed trade tape, and report what its resting quotes would have earned. Use this on every maker revision before committing it. Returns trades (FILLS, not requotes), fill_rate, quote_uptime_pct, spread_captured_usd, adverse_selection_usd and their difference net_edge_usd, inventory_max_usd, return_pct, null_pct and beats_null. Read spread_captured_usd and adverse_selection_usd together -- gross spread capture alone makes every width look profitable. Check decide_source is 'main.py:quote' before trusting any number: anything else means quote() could not be imported and the result describes a fallback, not your code.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {
+            "type": "string",
+            "description": "Absolute path to the strategy directory."
+          },
+          "days": {
+            "type": "number",
+            "description": "Days of recorded book and tape to replay. Default 7."
+          }
+        },
+        "required": [
+          "strategy_path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_tape_stats",
+      "description": "Executed-trade statistics for XLM/USDC over the last N hours, bucketed by trade size. Answers the sizing questions the order book cannot: how many trades per hour print at or above the size you would quote, how much volume that is, how one-sided the aggressing flow has been (taker_buy_pct), and what share was liquidity-pool flow no resting offer could have captured. Note the flow is roughly balanced over a week but wildly one-sided over any single hour, so do not calibrate an inventory rule on a short window.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "hours": {
+            "type": "integer",
+            "description": "Lookback window in hours. Default 24."
+          }
+        },
+        "required": []
+      }
+    }
   }
 ]

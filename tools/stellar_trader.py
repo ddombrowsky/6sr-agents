@@ -79,6 +79,36 @@ MIN_XLM_OPERATING_BUFFER = 1.0         # spendable XLM that must survive a new t
 MAX_STUCK_USD = 2.0                    # total unsellable notional before a full halt
 _VERIFY_TTL = 900                      # re-verification cache in the hot path
 
+# --- maker caps (MAKER.md phase 2) -------------------------------------------------
+# Same rules as the block above: module-level, never caller-supplied, never readable from
+# a config.json, only changeable by a human edit that check_boundary_integrity will halt
+# over. They are a SEPARATE set from the caps above and not a rename of them, because a
+# resting offer and a fill are different kinds of risk:
+#
+#   a resting offer is an EXPOSURE question -- how much am I promising the market right
+#   now, and how much of the account is encumbered by that promise
+#   a fill is a SPEND question -- how much money actually moved
+#
+# The per-trade and daily caps above still apply to whatever fills. These bound what may
+# be resting before anything fills at all, which the existing caps cannot express.
+MAX_OPEN_OFFERS = 4                    # subentry reserve: 0.5 XLM each, see below
+MAX_RESTING_USD_PER_SIDE = 4.0         # matches MAX_TRADE_USD; one quote, one cap
+MAX_RESTING_USD_TOTAL = 8.0            # both sides, every offer, at once
+MAX_INVENTORY_SKEW_USD = 8.0           # |long - short| before quotes go one-sided
+MIN_QUOTE_WIDTH_BP = 2.0               # never quote inside the fee/rounding floor
+
+# A safety cap, NOT a strategy knob, and the distinction is the whole reason it lives
+# here. A maker process that dies with quotes resting is the one failure mode this system
+# has never had: a path-payment either completes or does not, but an abandoned offer keeps
+# trading on behalf of a strategy that no longer exists, and loses money while nothing at
+# all is running. Bounding it must not be something the agent can widen.
+MAX_OFFER_AGE_S = 900
+
+# Denominator bound when converting a decimal price to the rational Stellar wants. Large
+# enough that the rounding is far inside MIN_QUOTE_WIDTH_BP, small enough that the n:d the
+# CLI receives stays legible in a log line.
+_PRICE_DENOMINATOR = 10_000_000
+
 # Target sellable-XLM headroom (in USD, above MIN_TRUSTLINE_RESERVE_XLM) a freshly
 # promoted leader should have before its own trading starts. See
 # ensure_trading_cushion's docstring for the incident this exists to prevent.
@@ -103,7 +133,17 @@ _MAX_WIND_DOWN_CHUNKS_PER_CALL = 20  # safety bound; remainder retried next moni
 #
 # Renamed from WIND_DOWN_RESERVE_XLM on 2026-08-03 when it stopped being wind_down-only;
 # see _sellable_xlm's docstring for why the ordinary sell path now honours it too.
-MIN_TRUSTLINE_RESERVE_XLM = MIN_XLM_OPERATING_BUFFER + MAX_OPEN_NONBASE_ASSETS * _BASE_RESERVE_XLM
+#
+# MAX_OPEN_OFFERS joins the same arithmetic, and must: an offer is a subentry exactly as a
+# trustline is, costing the same 0.5 XLM of base reserve and raising the account's minimum
+# balance the same way. Leave it out and a maker with four quotes open pushes the account
+# under its own reserve, at which point EVERY operation fails -- not just the next offer,
+# but the sell that would have unwound the position and the fee on the transaction that
+# would have cancelled the offers. The cost of including it is 2.0 XLM (~$0.32) of
+# headroom that ordinary trading may not spend, which is the correct trade.
+MIN_TRUSTLINE_RESERVE_XLM = (MIN_XLM_OPERATING_BUFFER
+                             + MAX_OPEN_NONBASE_ASSETS * _BASE_RESERVE_XLM
+                             + MAX_OPEN_OFFERS * _BASE_RESERVE_XLM)
 
 # Real, pre-funded XLM set aside to back short-sells (SHORTING_PLAN.md). Not part of any
 # strategy's ordinary trading capital: _sellable_xlm floors above it whenever a buffer has
@@ -293,13 +333,64 @@ def _has_trustline(account_json, code, issuer):
     return _asset_balance(account_json, code, issuer) is not None
 
 
+def _selling_liabilities(account_json, code, issuer=None):
+    """Balance of `code` already committed to resting offers, in units of that asset.
+
+    Stellar does NOT deduct a resting sell offer from `balance`; it raises
+    `selling_liabilities` on the same balance entry and enforces
+    `balance - selling_liabilities >= reserve` at submission time. So an account with
+    320 XLM and a 100 XLM sell offer open still reports 320, and every caller that sizes
+    against `balance` is sizing against XLM it has already promised to somebody else.
+
+    This was harmless for as long as this system only ever took liquidity -- a
+    path-payment either completes or does not, and leaves no liability behind -- and both
+    fields read 0.0000000 on claudio for that whole period. The moment place_offer exists
+    it stops being harmless, and it stops being harmless for the TAKER paths too: an
+    ordinary sell sized against phantom balance fails on submission with Underfunded, and
+    wind_down's "liquidated" verdict is computed from the same number.
+    """
+    if code == "XLM":
+        for b in account_json["balances"]:
+            if b["asset_type"] == "native":
+                return float(b.get("selling_liabilities") or 0.0)
+        return 0.0
+    if issuer is None:
+        issuer = _USDC_ISSUER if code == _USDC_CODE else None
+    for b in account_json["balances"]:
+        if b.get("asset_code") == code and b.get("asset_issuer") == issuer:
+            return float(b.get("selling_liabilities") or 0.0)
+    return 0.0
+
+
+def _free_balance(account_json, code, issuer=None):
+    """Balance of a non-native asset that is not already committed to a resting offer.
+
+    The counterpart to _spendable_xlm for the settlement asset: a resting BID commits
+    USDC exactly as a resting ask commits XLM. None (no trustline) passes through
+    unchanged, because "no trustline" is a different fact from "zero free balance" and
+    submit_trade distinguishes them.
+    """
+    held = _asset_balance(account_json, code, issuer)
+    if held is None:
+        return None
+    return max(0.0, held - _selling_liabilities(account_json, code, issuer))
+
+
 def _spendable_xlm(account_json):
-    """XLM balance minus the account's minimum reserve and a small fee buffer, so a
-    sell/wind_down chunk never tries to spend down to a balance the network will
-    reject once its own transaction fee is deducted."""
+    """XLM balance minus resting-offer liabilities, the account's minimum reserve, and a
+    small fee buffer, so a sell/wind_down chunk never tries to spend down to a balance the
+    network will reject once its own transaction fee is deducted.
+
+    `selling_liabilities` is subtracted FIRST and unconditionally -- see
+    _selling_liabilities for why a resting offer is invisible in `balance`. Every caller
+    below this (_sellable_xlm, _short_sellable_xlm, ensure_trustline's headroom check,
+    ensure_trading_cushion, wind_down) inherits the correction from here rather than
+    repeating it, which is deliberate: this is the one place the number is defined.
+    """
     balance = _asset_balance(account_json, "XLM")
+    committed = _selling_liabilities(account_json, "XLM")
     reserve = (2.5 + account_json.get("subentry_count", 0)) * _BASE_RESERVE_XLM
-    return max(0.0, balance - reserve - _FEE_BUFFER_XLM)
+    return max(0.0, balance - committed - reserve - _FEE_BUFFER_XLM)
 
 
 def _short_buffer_funded():
@@ -892,7 +983,10 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM', short=False) -> d
             held = _asset_balance(account, code, issuer)
             available_usd = (held or 0.0) * price
     else:
-        usdc_balance = _asset_balance(account, _USDC_CODE, _USDC_ISSUER)
+        # _free_balance, not _asset_balance: a resting BID commits USDC via
+        # selling_liabilities exactly as a resting ask commits XLM, and a buy sized
+        # against the gross balance would be spending the same dollars twice.
+        usdc_balance = _free_balance(account, _USDC_CODE, _USDC_ISSUER)
         if usdc_balance is None:
             return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
                     "reason": "no USDC trustline"}
@@ -1166,6 +1260,384 @@ def wind_down() -> dict:
     return {"liquidated": True, "remaining_xlm": remaining_xlm, "chunks": chunks,
             "reason": f'{len(stuck)} leg(s) stuck' if stuck else None,
             "legs": legs, "stuck": stuck}
+
+
+# =====================================================================================
+# Offer lifecycle -- MAKER.md phase 2
+# =====================================================================================
+#
+# Everything above takes liquidity. Everything below POSTS it, and the difference is not
+# a parameter: a path-payment resolves inside one transaction and leaves nothing behind,
+# while an offer keeps standing in the market after the process that placed it has gone.
+# That is a failure mode this system has never had, so three things exist purely to bound
+# it, and all three sit here rather than in a strategy or a domain: MAX_OFFER_AGE_S,
+# reconcile_offers(), and cancel_all_offers().
+#
+# The requote primitive is `--offer-id` on an existing offer, which Stellar treats as an
+# atomic cancel/replace. There is deliberately no place_then_cancel path: a two-transaction
+# requote leaves a window in which the strategy is either unquoted or double-quoted, and
+# the double-quoted half of that window is real money resting at a stale price.
+
+def _price_rational(price):
+    """A decimal price as the (n, d) Stellar wants, with a bounded denominator.
+
+    Returned rather than formatted so the caller can log the rational ACTUALLY submitted:
+    the offer rests at n/d, not at the float that was asked for, and the difference --
+    tiny, but real -- is the sort of thing that turns up later as an unexplained basis
+    point. At _PRICE_DENOMINATOR the error on a $0.158 price is under 0.00007 bp, three
+    orders of magnitude inside MIN_QUOTE_WIDTH_BP.
+    """
+    if not price or price <= 0:
+        raise ValueError(f'price must be positive, got {price!r}')
+    d = _PRICE_DENOMINATOR
+    n = max(1, round(price * d))
+    return n, d
+
+
+def open_offers(ours_only=True):
+    """Every offer claudio currently has resting, straight from Horizon.
+
+    ON-CHAIN TRUTH, never a local ledger. The local view of what is resting can be wrong
+    in both directions -- a submission that timed out may have landed, and an offer we
+    think is resting may have filled -- and every safety decision below is made against
+    this, not against what we believe.
+
+    `ours_only` filters to the XLM/USDC pair this system trades; anything else on the
+    account was not put there by this code and must not be cancelled by it.
+
+    Returns [{'id', 'side', 'price', 'amount_xlm', 'usd', 'selling', 'buying'}] with
+    `side` normalised to the maker's own vocabulary: 'ask' when we are selling XLM,
+    'bid' when we are buying it. Returns [] on any failure, which callers must treat as
+    "unknown", not as "none" -- reconcile_offers is what distinguishes them.
+    """
+    try:
+        address = _source_address()
+        resp = requests.get(f'{_HORIZON}/accounts/{address}/offers',
+                            params={'limit': 200}, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        records = resp.json().get('_embedded', {}).get('records') or []
+    except Exception as e:
+        print(f'[stellar_trader] could not read open offers: {e}')
+        return []
+
+    out = []
+    for record in records:
+        selling, buying = record.get('selling') or {}, record.get('buying') or {}
+        sell_native = selling.get('asset_type') == 'native'
+        buy_native = buying.get('asset_type') == 'native'
+        other = buying if sell_native else selling
+        is_usdc = (other.get('asset_code') == _USDC_CODE
+                   and other.get('asset_issuer') == _USDC_ISSUER)
+        if ours_only and not ((sell_native or buy_native) and is_usdc):
+            continue
+        try:
+            amount = float(record.get('amount') or 0.0)
+            price = float(record.get('price') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if sell_native:
+            side, amount_xlm, usd = 'ask', amount, amount * price
+        else:
+            # Selling USDC to buy XLM: `amount` is USDC and `price` is XLM per USDC.
+            side, amount_xlm, usd = 'bid', (amount * price if price else 0.0), amount
+        out.append({
+            'id': str(record.get('id')),
+            'side': side,
+            'price': (price if sell_native else (1.0 / price if price else 0.0)),
+            'amount_xlm': amount_xlm,
+            'usd': usd,
+            'selling': selling, 'buying': buying,
+        })
+    return out
+
+
+def _resting_usd(offers=None):
+    """(per_side_usd_dict, total_usd) across everything currently resting."""
+    offers = open_offers() if offers is None else offers
+    per_side = {'bid': 0.0, 'ask': 0.0}
+    for offer in offers:
+        per_side[offer['side']] = per_side.get(offer['side'], 0.0) + offer['usd']
+    return per_side, sum(per_side.values())
+
+
+def place_offer(side, usd_amount, price, *, asset='XLM', offer_id=0):
+    """Rest an offer on the XLM/USDC book. Signs and submits a real pubnet transaction.
+
+    side: 'bid' (buy XLM with USDC) or 'ask' (sell XLM for USDC). `price` is USD per XLM
+    for both, which is the quoting convention everywhere else in this system -- the CLI's
+    two operations express price differently (manage-sell-offer wants it per unit sold,
+    manage-buy-offer per unit bought) and normalising here is what keeps a strategy from
+    having to know that.
+
+    `offer_id` non-zero REPLACES that offer atomically. Pass the id you already have
+    rather than cancelling and re-placing.
+
+    Every cap is applied here and none of them are arguments: MAX_RESTING_USD_PER_SIDE,
+    MAX_RESTING_USD_TOTAL and MAX_OPEN_OFFERS are checked against Horizon's view of what
+    is already resting, and MIN_QUOTE_WIDTH_BP against the live book. The caller's
+    `usd_amount` is a request that gets clamped, exactly as submit_trade treats its own.
+
+    Returns {'submitted', 'offer_id', 'tx_hash', 'price', 'price_rational', 'usd', 'reason'}.
+    """
+    if _paper_only():
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': 'PAPER_ONLY is set; refusing to rest a real offer'}
+    if _halted():
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': 'live trading halted'}
+    if side not in ('bid', 'ask'):
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': f'side must be bid or ask, got {side!r}'}
+    if asset != 'XLM':
+        # Multi-asset making was explicitly ruled out of scope; the caps below are all
+        # sized for one pair and would have to be re-reasoned per asset.
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': 'only XLM/USDC may be quoted'}
+    try:
+        price = float(price)
+        usd_amount = float(usd_amount)
+    except (TypeError, ValueError):
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': 'price and usd_amount must be numeric'}
+
+    # --- width floor, against the live book ---------------------------------------
+    try:
+        import dex_price
+        book = dex_price.get_orderbook('XLM') or {}
+        mid = book.get('mid')
+    except Exception:
+        mid = None
+    if mid:
+        width_bp = abs(price - mid) / mid * 10000.0
+        if width_bp < MIN_QUOTE_WIDTH_BP:
+            return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                    'reason': f'quote {width_bp:.2f} bp from mid is inside '
+                              f'MIN_QUOTE_WIDTH_BP ({MIN_QUOTE_WIDTH_BP})'}
+        # A "maker" quote on the wrong side of the mid is a taker order in disguise, and
+        # would cross on submission -- spending through submit_trade's caps without
+        # passing any of them.
+        if (side == 'bid' and price >= mid) or (side == 'ask' and price <= mid):
+            return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                    'reason': f'{side} at {price:.7f} would cross the mid {mid:.7f}'}
+
+    # --- exposure caps, against on-chain truth ------------------------------------
+    resting = open_offers()
+    replacing = next((o for o in resting if o['id'] == str(offer_id)), None) if offer_id else None
+    if not replacing and len(resting) >= MAX_OPEN_OFFERS:
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': f'{len(resting)} offers already open (max {MAX_OPEN_OFFERS})'}
+    per_side, total = _resting_usd(resting)
+    # A replace frees its own notional before it re-books it.
+    if replacing:
+        per_side[replacing['side']] -= replacing['usd']
+        total -= replacing['usd']
+    room_side = max(0.0, MAX_RESTING_USD_PER_SIDE - per_side.get(side, 0.0))
+    room_total = max(0.0, MAX_RESTING_USD_TOTAL - total)
+    capped_usd = min(usd_amount, room_side, room_total)
+
+    # --- settle-ability, against the real balance ---------------------------------
+    try:
+        account = _account(_source_address())
+    except Exception as e:
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': f'could not read account: {e}'}
+    if side == 'ask':
+        # _sellable_xlm already nets out selling_liabilities, so the XLM this very
+        # function has previously committed is not counted as available twice.
+        available_usd = _sellable_xlm(account) * price
+    else:
+        free_usdc = _free_balance(account, _USDC_CODE, _USDC_ISSUER)
+        if free_usdc is None:
+            return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                    'reason': 'no USDC trustline'}
+        available_usd = free_usdc
+    capped_usd = min(capped_usd, available_usd)
+    if capped_usd <= 0:
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': 'no room under the resting caps or no free balance'}
+
+    try:
+        n, d = _price_rational(price)
+    except ValueError as e:
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': str(e)}
+    amount_xlm = capped_usd / price
+
+    if side == 'ask':
+        argv = ['stellar', 'tx', 'new', 'manage-sell-offer',
+                '--source', _IDENTITY, '--network', _NETWORK,
+                '--selling', _sep11('XLM'), '--buying', _USDC_ASSET,
+                '--amount', str(_to_stroops(amount_xlm)),
+                '--price', f'{n}:{d}', '--offer-id', str(offer_id)]
+    else:
+        # manage-buy-offer: --amount is the BUYING asset (XLM) and --price is the price of
+        # one unit of the buying asset in the selling asset, i.e. USD per XLM. Same
+        # rational as the ask, which is exactly why this is normalised here.
+        argv = ['stellar', 'tx', 'new', 'manage-buy-offer',
+                '--source', _IDENTITY, '--network', _NETWORK,
+                '--selling', _USDC_ASSET, '--buying', _sep11('XLM'),
+                '--amount', str(_to_stroops(amount_xlm)),
+                '--price', f'{n}:{d}', '--offer-id', str(offer_id)]
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=_TX_TIMEOUT)
+    except Exception as e:
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': str(e)}
+    if result.returncode != 0:
+        return {'submitted': False, 'offer_id': None, 'tx_hash': None, 'usd': 0.0,
+                'reason': (result.stderr or '').strip() or 'manage-offer failed'}
+
+    combined = f'{result.stdout}\n{result.stderr}'
+    match = re.search(r'\b[0-9a-fA-F]{64}\b', combined)
+    tx_hash = match.group(0) if match else _most_recent_tx_hash(_source_address())
+
+    # The id of what is now resting, read back from Horizon rather than parsed out of CLI
+    # output -- the same reason _swap cross-references Horizon for its hash. A replace
+    # keeps its id; a create gets a new one, and matching on (side, price) is the only
+    # way to name it without trusting a format that has already differed between CLI
+    # versions in this project.
+    new_id = str(offer_id) if offer_id else None
+    if not new_id:
+        for offer in open_offers():
+            if offer['side'] == side and abs(offer['price'] - price) / price < 1e-6:
+                new_id = offer['id']
+                break
+
+    _log_pubnet_trade(f'offer_{side}', round(capped_usd, 7), round(amount_xlm, 7),
+                      tx_hash, reason=f'rest @ {n}:{d} (id {new_id})')
+    return {'submitted': True, 'offer_id': new_id, 'tx_hash': tx_hash,
+            'price': price, 'price_rational': f'{n}:{d}',
+            'usd': capped_usd, 'reason': None}
+
+
+def cancel_offer(offer_id, side=None, *, asset='XLM'):
+    """Delete one resting offer. An amount of 0 is Stellar's cancel.
+
+    `side` is optional and only used to pick the operation when the offer is no longer on
+    chain (already filled): the id is enough otherwise, because open_offers() knows which
+    side it is. An id that is not resting is reported as already gone rather than as a
+    failure -- a cancel racing a fill is normal, not an error, and treating it as one is
+    how a shutdown path gets stuck retrying.
+    """
+    if _paper_only():
+        return {'cancelled': False, 'reason': 'PAPER_ONLY is set'}
+    resting = {o['id']: o for o in open_offers()}
+    offer = resting.get(str(offer_id))
+    if offer is None:
+        return {'cancelled': True, 'offer_id': str(offer_id),
+                'reason': 'not resting (already filled or cancelled)'}
+    if offer['side'] == 'ask':
+        argv = ['stellar', 'tx', 'new', 'manage-sell-offer',
+                '--source', _IDENTITY, '--network', _NETWORK,
+                '--selling', _sep11('XLM'), '--buying', _USDC_ASSET,
+                '--amount', '0', '--price', '1:1', '--offer-id', str(offer_id)]
+    else:
+        argv = ['stellar', 'tx', 'new', 'manage-buy-offer',
+                '--source', _IDENTITY, '--network', _NETWORK,
+                '--selling', _USDC_ASSET, '--buying', _sep11('XLM'),
+                '--amount', '0', '--price', '1:1', '--offer-id', str(offer_id)]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=_TX_TIMEOUT)
+    except Exception as e:
+        return {'cancelled': False, 'offer_id': str(offer_id), 'reason': str(e)}
+    if result.returncode != 0:
+        return {'cancelled': False, 'offer_id': str(offer_id),
+                'reason': (result.stderr or '').strip() or 'cancel failed'}
+    _log_pubnet_trade('offer_cancel', 0.0, 0.0, '', reason=f'id {offer_id}')
+    return {'cancelled': True, 'offer_id': str(offer_id), 'reason': None}
+
+
+def cancel_all_offers():
+    """The maker's wind_down: leave nothing resting. Called before wind_down(), not after.
+
+    ORDER MATTERS AND IS NOT A STYLE CHOICE. wind_down sizes its chunks against
+    _sellable_xlm, which now nets out selling_liabilities -- so with asks still resting it
+    would under-sell or fail outright and report the position as un-liquidated. Worse, any
+    offer left resting can fill AFTER the handover, opening a position on behalf of a
+    strategy that is no longer live and that nothing in the system is watching.
+
+    Returns {'ok', 'cancelled', 'remaining', 'failures'}. `ok` is False while anything is
+    still resting, so a caller can loop, and `remaining` is re-read from Horizon rather
+    than inferred from what we think we cancelled.
+    """
+    if _paper_only():
+        return {'ok': True, 'cancelled': 0, 'remaining': 0, 'failures': [],
+                'reason': 'PAPER_ONLY is set; nothing can be resting'}
+    cancelled, failures = 0, []
+    for offer in open_offers():
+        result = cancel_offer(offer['id'], offer['side'])
+        if result.get('cancelled'):
+            cancelled += 1
+        else:
+            failures.append({'id': offer['id'], 'reason': result.get('reason')})
+    remaining = len(open_offers())
+    return {'ok': remaining == 0, 'cancelled': cancelled, 'remaining': remaining,
+            'failures': failures}
+
+
+def reconcile_offers(expected):
+    """Compare what we believe is resting against what Horizon says, and report fills.
+
+    `expected` is {offer_id: {'side', 'price', 'usd', 'placed_ts'}} -- whatever the caller
+    last placed. This is the function that makes polling safe. Fill detection by polling
+    is lossy at the edges by construction: between two polls an offer can fill partially,
+    fill fully, or fill and be replaced, and the poll sees only the endpoints. What makes
+    that acceptable is not a faster poll, it is reconciling against on-chain truth and
+    treating every disagreement as something to be acted on rather than logged.
+
+    Returns:
+        {'fills':    [{'offer_id', 'side', 'price', 'filled_usd'}]   shrank or vanished
+         'unknown':  [{'id', ...}]                  resting but we did not place it
+         'stale':    [{'offer_id', 'age_s', ...}]   older than MAX_OFFER_AGE_S
+         'resting':  [...]                          the current on-chain view
+         'ok':       bool}                          nothing unknown and nothing stale
+
+    A vanished offer is reported as a fill for its whole remaining size. It might instead
+    have been a cancel we issued, which is why the caller must drop an offer from
+    `expected` when it cancels it -- and why this returns the raw disagreement rather than
+    trying to guess. Cross-check against /accounts/<addr>/trades, which attributes trades
+    to offer ids, before treating a fill number as settled.
+    """
+    resting = open_offers()
+    by_id = {o['id']: o for o in resting}
+    now = time.time()
+    fills, stale = [], []
+    for offer_id, record in (expected or {}).items():
+        offer_id = str(offer_id)
+        was = float(record.get('usd') or 0.0)
+        still = by_id.get(offer_id)
+        now_usd = float(still['usd']) if still else 0.0
+        if now_usd < was - 1e-9:
+            fills.append({'offer_id': offer_id, 'side': record.get('side'),
+                          'price': record.get('price'),
+                          'filled_usd': round(was - now_usd, 7),
+                          'fully': still is None})
+        if still and record.get('placed_ts'):
+            age = now - float(record['placed_ts'])
+            if age > MAX_OFFER_AGE_S:
+                stale.append({'offer_id': offer_id, 'age_s': round(age, 1),
+                              'side': still['side'], 'price': still['price']})
+    unknown = [o for o in resting if o['id'] not in {str(k) for k in (expected or {})}]
+    return {'fills': fills, 'unknown': unknown, 'stale': stale, 'resting': resting,
+            'ok': not unknown and not stale}
+
+
+def offer_status():
+    """Read-only summary of the resting book, for the operator surface and live_report."""
+    resting = open_offers()
+    per_side, total = _resting_usd(resting)
+    return {
+        'open': len(resting),
+        'max_open': MAX_OPEN_OFFERS,
+        'resting_usd': {k: round(v, 4) for k, v in per_side.items()},
+        'resting_usd_total': round(total, 4),
+        'caps': {'per_side': MAX_RESTING_USD_PER_SIDE,
+                 'total': MAX_RESTING_USD_TOTAL,
+                 'max_offer_age_s': MAX_OFFER_AGE_S,
+                 'min_quote_width_bp': MIN_QUOTE_WIDTH_BP},
+        'offers': resting,
+    }
 
 
 if __name__ == "__main__":

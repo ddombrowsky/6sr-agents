@@ -359,8 +359,9 @@ def _scratch(cfg):
 SDEX = domain.get('sdex')
 NULL = domain.get('null')
 FORECAST = domain.get('forecast')
+MAKER = domain.get('sdex_maker')
 
-for mod in (SDEX, NULL, FORECAST):
+for mod in (SDEX, NULL, FORECAST, MAKER):
     problems = domain.check(mod)
     check(f'{mod.NAME} satisfies the contract', not problems, '; '.join(problems))
 
@@ -374,8 +375,19 @@ check('the registry is cached', domain.get('sdex') is SDEX)
 _sdex_obs = SDEX.Observation(price=_PRICE, marks={'XLM': _PRICE})
 _null_obs = NULL.Observation(tick=0)
 _forecast_obs = FORECAST.Observation(tick=0)
-check('the three domains have pairwise-unrelated observation types',
-      len({type(_sdex_obs), type(_null_obs), type(_forecast_obs)}) == 3)
+# The maker observes a BOOK, not a scalar -- which is why re-exporting sdex's Observation
+# would both fail the check below and be wrong. A taker needs one price to compare a
+# threshold against; a maker needs to know what is already resting where, because that is
+# its queue position.
+_maker_obs = MAKER.Observation(mid=_PRICE, bid=_PRICE * 0.9995, ask=_PRICE * 1.0005,
+                               spread_bp=10.0, bid_depth_usd=1000.0,
+                               ask_depth_usd=1000.0, cex_mid=_PRICE,
+                               bids=[{'p': _PRICE * 0.9995, 'usd': 5.0}],
+                               asks=[{'p': _PRICE * 1.0005, 'usd': 5.0}],
+                               marks={'XLM': _PRICE})
+check('the four domains have pairwise-unrelated observation types',
+      len({type(_sdex_obs), type(_null_obs), type(_forecast_obs),
+           type(_maker_obs)}) == 4)
 
 # ============================================== 2. observation encode/decode round trip
 #
@@ -385,7 +397,8 @@ check('the three domains have pairwise-unrelated observation types',
 # that hid the dead revision layer for weeks.
 
 for label, mod, obs in (('sdex', SDEX, _sdex_obs), ('null', NULL, _null_obs),
-                        ('forecast', FORECAST, _forecast_obs)):
+                        ('forecast', FORECAST, _forecast_obs),
+                        ('sdex_maker', MAKER, _maker_obs)):
     encoded = mod.encode_observation(obs)
     # A str is the whole requirement: monitor passes argv as a list, so no shell sees it
     # and spaces are harmless. What is NOT allowed is returning a dict or a tuple, which

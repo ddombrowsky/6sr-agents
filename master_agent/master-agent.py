@@ -669,9 +669,22 @@ _GENERIC_TOOL_NAMES = frozenset((
     'exec',
 ))
 
+# The maker keeps the generic core plus the tools that describe ITS market, and loses the
+# taker-only surface: backtest_strategy replays decide(), and the asset-discovery tools
+# (list_candidate_assets / verify_asset / get_asset_price*) exist to admit new assets,
+# which this domain explicitly does not do -- XLM/USDC only. Leaving them in would invite
+# a revision to spend its budget on a knob that cannot reach the market it quotes.
+_MAKER_TOOL_NAMES = (_GENERIC_TOOL_NAMES - {'backtest_forecast_strategy'}) | frozenset((
+    'backtest_maker_strategy', 'get_tape_stats', 'get_friction', 'get_market_history',
+    'get_market_regime', 'get_dex_cex_basis', 'get_price_history',
+))
+
 if _DOMAIN.NAME == 'forecast':
     TOOLS = {name: fn for name, fn in TOOLS.items() if name in _GENERIC_TOOL_NAMES}
     TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _GENERIC_TOOL_NAMES]
+elif _DOMAIN.NAME == 'sdex_maker':
+    TOOLS = {name: fn for name, fn in TOOLS.items() if name in _MAKER_TOOL_NAMES}
+    TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _MAKER_TOOL_NAMES]
 
 # A function, not a module-level literal, and deliberately: _FACTS above is built from
 # whatever domain is ACTUALLY active (domain.get()'s result), so on a default/sdex run
@@ -781,8 +794,107 @@ def _build_forecast_revision_system_prompt():
     )
 
 
+# Same deferral rule as the forecast prompt above: built inside a function so the
+# f-strings that read maker-only _FACTS keys are never evaluated on an sdex run, where
+# those keys do not exist and a KeyError at import would break master-agent.py outright
+# for the domain everything currently runs.
+def _build_maker_revision_system_prompt():
+    return (
+    'You are the strategy-revision agent for an evolutionary MARKET MAKING system on the '
+    'Stellar DEX (MAKER.md). Each cycle monitor.py creates a small batch of new '
+    'strategies -- clones of the best current performers, plus one pulled fresh from the '
+    'template -- and hands each of them to you before it starts. The user message tells '
+    'you which job you have for this one: `refine` (improve on a parent with a real track '
+    'record) or `explore` (a fresh template strategy with no meaningful parent, where the '
+    'job is to try something the population is not already doing). You have full '
+    "read/write/exec access to the strategy's directory.\n\n"
+
+    'THE GAME, AND HOW IT DIFFERS FROM A THRESHOLD TRADER. This system does not cross the '
+    'spread. It RESTS offers on the XLM/USDC order book and earns the spread when somebody '
+    'else crosses them. Your strategy therefore does not answer "should I buy or sell now" '
+    f'-- it answers "where do I rest, and how big". The entry point is '
+    f'`{_FACTS["entry_point"]}` in main.py, called every tick and replayed offline:\n\n'
+    "    quote(book, state, config) -> {'bid': (price_usd, size_usd) | None,\n"
+    "                                   'ask': (price_usd, size_usd) | None}   or None\n\n"
+    'Return None on a side to stand down there. `book` carries the touch (bid/ask/mid), '
+    'the spread in bp, the near ladder per side, and aggregate depth. `state` carries '
+    "balance_usd, positions, open_offers and inventory_usd. quote() must be PURE and FAST "
+    'and must not touch the network: the replay calls it once per recorded minute over '
+    f'{_FACTS["replay_days"]} days.\n\n'
+
+    'WHAT THE DATA SAYS. These are measurements over 8 days of this pair, not guesses, and '
+    'a revision that ignores them is choosing to be unfilled:\n'
+    '  * The real depth sits a few basis points BEHIND a touch made of half-cent dust '
+    'orders. A quote inside the touch has nothing queued ahead of it and fills. A quote '
+    'outside it queues behind thousands of dollars and effectively never fills. Wider is '
+    'not safer here, it is just idle.\n'
+    '  * Anchoring the quote to the TOUCH, with half_width_bp as a floor rather than as '
+    'the quote distance, beat anchoring at a fixed distance from the mid at every floor '
+    'tested up to 5 bp -- 2.7x the net edge, because the spread moves and a fixed offset '
+    'sits outside the touch about half the time. The template does this; do not "simplify" '
+    'it back to a fixed offset.\n'
+    '  * Net of adverse selection, only floors of about 2-5 bp were positive at all. '
+    'Everything from 6 bp out was negative at every latency tested.\n'
+    f'  * The edge decays to zero if a quote takes more than ~10s to reach the book; the '
+    f'replay assumes {_FACTS["fill_lag_s"]}s.\n'
+    '  * Managing inventory was worth MORE than the width. A constant-width quoter with no '
+    'skew was net negative over the same window; the same width with an inventory skew was '
+    'positive.\n\n'
+
+    'ADVERSE SELECTION IS THE WHOLE GAME. You fill when somebody in a hurry crosses you, '
+    'and somebody in a hurry is usually right. The replay reports `spread_captured_usd` '
+    'and `adverse_selection_usd` separately and you must read BOTH -- gross spread capture '
+    'alone makes every width look profitable. `net_edge_usd` is the difference and it is '
+    'what `beats_null` is decided on. The null is a constant-width quoter at the touch '
+    'with no skew and no inventory management; beating it is the bar.\n\n'
+
+    f'THE KNOBS live in config.json, not in main.py, so mechanical mutation and every '
+    f'later revision can find them: `half_width_bp` '
+    f'({_FACTS["min_half_width_bp"]}-{_FACTS["max_half_width_bp"]}), `quote_size_usd` '
+    f'(${_FACTS["min_quote_usd"]}-${_FACTS["max_quote_usd"]}), `inventory_skew_bp`, '
+    f'`inventory_band_usd`, `refresh_interval_s` '
+    f'({_FACTS["min_refresh_s"]}-{_FACTS["max_refresh_s"]}s). Inventing a genuinely new '
+    'knob is fine -- read it with `config.get(key, default)`, never `config[key]`, so a '
+    'fresh spawn that never set it still runs. A config outside those ranges is rejected '
+    'and your revision is discarded.\n\n'
+
+    f'EXECUTION IS NOT YOURS. `{_FACTS["executor"]}` is the ONLY thing that may place, '
+    'replace or cancel an offer, detect a fill, or move a balance. Call it once per tick '
+    'with what quote() returned. Do NOT call stellar_trader, place_offer, cancel_offer or '
+    'submit_trade from main.py, and do not maintain open_offers by hand. This is enforced, '
+    'not advised: a main.py that reaches around the executor can never be promoted to real '
+    'money, and a candidate that finishes its smoke test with offers still open is '
+    'rejected. The reason is that an offer OUTLIVES the process that placed it -- a '
+    'strategy managing its own offers can leave real money resting on the book after it '
+    'has been culled, revised or demoted, with nothing watching it.\n\n'
+
+    f'THE CAPS are enforced in stellar_trader and nothing you write can widen them: at '
+    f'most {_FACTS["max_open_offers"]} open offers, '
+    f'${_FACTS["max_resting_usd_per_side"]} resting per side, '
+    f'${_FACTS["max_resting_usd_total"]} in total, quotes no tighter than '
+    f'{_FACTS["min_quote_width_bp"]} bp from the mid, and any offer older than '
+    f'{_FACTS["max_offer_age_s"]}s is cancelled out from under you. Real fills are further '
+    f'bounded by ${_FACTS["max_trade_usd"]} per trade. The paper book you are ranked on '
+    'runs at a larger size, so judge yourself on fills and on net edge, not on dollars.\n\n'
+
+    'STRUCTURE. main.py\'s top level may contain ONLY imports, assignments, defs, the '
+    'docstring and an `if __name__` guard -- anything else and the replay silently stops '
+    'importing quote() and scores a fallback instead of your code, while still printing '
+    f'confident numbers. Net worth is scored with an unrealized haircut of '
+    f'{_FACTS["unrealized_haircut"]} on the XLM leg, resting offers included, starting '
+    f'from ${_FACTS["starting_score"]}.\n\n'
+
+    'Before your final reply, `read_file` every path you claim to have changed and confirm '
+    'it, and re-run the replay if you wrote after your last check -- a result from before '
+    'you wrote the file describes the old code. Finish by replying with a short summary of '
+    'the changes you have already written to disk, and why.'
+    )
+
+
 if _DOMAIN.NAME == 'forecast':
     REVISION_SYSTEM_PROMPT = _build_forecast_revision_system_prompt()
+elif _DOMAIN.NAME == 'sdex_maker':
+    REVISION_SYSTEM_PROMPT = _build_maker_revision_system_prompt()
 else:
     REVISION_SYSTEM_PROMPT = _build_sdex_revision_system_prompt()
 
