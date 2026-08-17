@@ -26,6 +26,34 @@ say_cp() {
     fi
 }
 
+# copy_files SRC... DEST -- like `cp SRC... DEST` but only for plain files.
+#
+# Two things a bare `cp dir/*` gets wrong here, both of which used to be counted as
+# copy failures or silently produced junk:
+#
+#   - Subdirectories. /opt/tools and /opt/master_agent are live git repos that grow a
+#     __pycache__ (and v/agents/ has its bak.XXXXX/ and venv/), which the glob matches
+#     and cp refuses without -r. That is a hard error, not a real problem, and it made
+#     the script exit 1 on a perfectly good deploy.
+#   - Symlinks. v/ holds monitor.py, strat_manager.py &c as links into master_agent/
+#     (created at the bottom of the --to branch). cp DEREFERENCES them, so the reverse
+#     direction turned each link into a second, real copy of the module inside scripts/
+#     -- duplicates that then drift from the originals they were meant to point at.
+#
+# Skipping both is right in every direction: the synced dirs are flat by design (see
+# the note about flat globs in CLAUDE.md), and nothing that is a symlink in v/ wants
+# to become a file on the host.
+copy_files() {
+    local dest="${!#}"
+    local src
+    for src in "${@:1:$#-1}" ; do
+        [ -e "$src" ] || continue   # unmatched glob left literal
+        [ -L "$src" ] && continue   # symlink into master_agent/
+        [ -d "$src" ] && continue   # __pycache__, .git, bak.XXXXX, venv
+        say_cp "$src" "$dest"
+    done
+}
+
 if [ "$1" = "--to" ] ; then
     tf=`mktemp -d ./v/agents/bak.XXXXX`
     mv -v ./v/agents/agent-bootstrap.py ./v/agents/sr_agent_tools.py \
@@ -35,11 +63,11 @@ if [ "$1" = "--to" ] ; then
     for d in $SYNCED_DIRS ; do
         [ -d "./$d" ] || continue
         mkdir -p "./v/$d"
-        say_cp ./$d/* "./v/$d/"
+        copy_files ./$d/* "./v/$d/"
         [ -e "./$d/.gitignore" ] && say_cp "./$d/.gitignore" "./v/$d/"
     done
     rm -f ./scripts/env.sh
-    cp -v ./scripts/*.{sh,py} ./v/
+    copy_files ./scripts/*.{sh,py} ./v/
 
     # monitor.py subprocesses `/opt/strat_manager.py` by absolute path at every call
     # site, and once.sh/st.sh run `python3 monitor.py` from /opt -- but the files live in
@@ -53,14 +81,14 @@ if [ "$1" = "--to" ] ; then
         ln -sfn "master_agent/$f" "./v/$f" && echo "symlink ./v/$f -> master_agent/$f"
     done
 else
-    cp -v ./v/agents/* ./ 2>/dev/null
+    copy_files ./v/agents/* ./
     for d in $SYNCED_DIRS ; do
         [ -d "./v/$d" ] || continue
         mkdir -p "./$d"
-        say_cp ./v/$d/* "./$d/"
+        copy_files ./v/$d/* "./$d/"
         [ -e "./v/$d/.gitignore" ] && say_cp "./v/$d/.gitignore" "./$d/"
     done
-    say_cp ./v/*.{sh,py} ./scripts/
+    copy_files ./v/*.{sh,py} ./scripts/
 fi
 
 if [ "$_copy_failures" -gt 0 ] ; then
