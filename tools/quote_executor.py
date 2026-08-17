@@ -323,9 +323,16 @@ def _live_sync(state, agent_name, targets, row):
     for fill in report.get('fills') or []:
         record = expected.get(str(fill['offer_id'])) or {}
         price = float(record.get('price') or fill.get('price') or 0.0)
-        state = _apply_fill(state, agent_name, record.get('side') or fill.get('side'),
+        side = record.get('side') or fill.get('side')
+        state = _apply_fill(state, agent_name, side,
                             price, float(fill['filled_usd']), mid,
                             live_result={'submitted': True, 'detected': 'reconcile'})
+        # Book it against the daily spend budget. Without this the cap is unwired on the
+        # maker path entirely -- _record_spend is only reached from submit_trade.
+        try:
+            st.record_fill_spend(float(fill['filled_usd']), side)
+        except Exception as e:
+            print(f'[quote_executor] could not record spend: {e}')
         filled += 1
 
     # On-chain truth replaces our belief, every tick. Anything resting that we did not

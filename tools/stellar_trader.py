@@ -1435,6 +1435,19 @@ def place_offer(side, usd_amount, price, *, asset='XLM', offer_id=0):
     room_total = max(0.0, MAX_RESTING_USD_TOTAL - total)
     capped_usd = min(usd_amount, room_side, room_total)
 
+    # The daily spend cap binds the BID side, at placement. A resting offer is not a spend
+    # until it fills -- record_fill_spend below is what books it -- but resting more than
+    # the remaining daily budget means the budget can be blown by a fill we have already
+    # committed to and cannot refuse. Sizing the offer to the remaining budget is the only
+    # point at which this cap can still be enforced.
+    #
+    # This wiring is the whole reason MAX_DAILY_USD did not bound a maker at all:
+    # _record_spend is called from submit_trade and from nowhere else, so before this
+    # every offer fill was invisible to _daily_spent() and the cap read as satisfied no
+    # matter how much traded.
+    if side == 'bid':
+        capped_usd = min(capped_usd, max(0.0, MAX_DAILY_USD - _daily_spent()))
+
     # --- settle-ability, against the real balance ---------------------------------
     try:
         account = _account(_source_address())
@@ -1509,6 +1522,45 @@ def place_offer(side, usd_amount, price, *, asset='XLM', offer_id=0):
     return {'submitted': True, 'offer_id': new_id, 'tx_hash': tx_hash,
             'price': price, 'price_rational': f'{n}:{d}',
             'usd': capped_usd, 'reason': None}
+
+
+def record_fill_spend(usd_amount, side, *, asset='XLM'):
+    """Book a detected offer fill against the daily spend budget.
+
+    Called by quote_executor when reconciliation finds a bid that shrank. Buys only, for
+    the same reason submit_trade records buys only: a sell is not a spend, and counting it
+    as one meant an exit consumed the very budget the next entry needed.
+
+    Separate from placement because the two are separated in time by design -- an offer
+    may rest for MAX_OFFER_AGE_S and never fill, and charging the budget at placement
+    would let an unfilled quote exhaust a day.
+    """
+    if side != 'bid':
+        return 0.0
+    try:
+        usd_amount = float(usd_amount)
+    except (TypeError, ValueError):
+        return 0.0
+    if usd_amount <= 0 or _paper_only():
+        return 0.0
+    _record_spend(usd_amount, _spec_of_asset(asset))
+    return usd_amount
+
+
+def _spec_of_asset(asset):
+    """'XLM' or a canonical spec, for the daily-spend ledger's per-asset key."""
+    try:
+        import assets
+        return assets.normalize(asset)
+    except Exception:
+        return 'XLM'
+
+
+def daily_spend_status():
+    """{'spent_usd', 'cap_usd', 'remaining_usd'} over the trailing 24h, all assets."""
+    spent = _daily_spent()
+    return {'spent_usd': round(spent, 4), 'cap_usd': MAX_DAILY_USD,
+            'remaining_usd': round(max(0.0, MAX_DAILY_USD - spent), 4)}
 
 
 def cancel_offer(offer_id, side=None, *, asset='XLM'):

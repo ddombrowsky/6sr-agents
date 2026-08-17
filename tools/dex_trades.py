@@ -34,6 +34,7 @@ Typical use:
     trades = dex_trades.get_trades(start_ts=..., end_ts=...)
     print(dex_trades.tape_stats(hours=24))
 """
+import bisect
 import calendar
 import json
 import time
@@ -68,6 +69,26 @@ DUST_USD = 0.01
 # this is what keeps a backfill from becoming a rate-limit incident on the same host the
 # live trader shares.
 _PAGE_SLEEP = 0.12
+
+
+class _TsKey:
+    """A read-only `ts` view of the row list, so bisect can search it without a key=.
+
+    bisect gained a `key` parameter in 3.10 and this codebase has run on older
+    interpreters; a two-method shim is cheaper than a version check at the call site and
+    allocates nothing.
+    """
+
+    __slots__ = ('rows',)
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        return self.rows[i].get('t') or 0
 
 
 def _norm(spec):
@@ -291,6 +312,48 @@ def _append(spec, quote, rows):
             f.write(json.dumps(row, separators=(',', ':')) + '\n')
 
 
+# The tape runs ~65k rows a day including dust, so it grows ~8 MB a day and never stops.
+# This bounds it at roughly 30 days, comfortably past REPLAY_DAYS, and is the same guard
+# market_recorder.MAX_ROWS applies for the same reason. Trimming is by TIME rather than by
+# row count: the row count per day varies by an order of magnitude with activity, and a
+# replay asks for days.
+MAX_TAPE_DAYS = 30
+_TRIM_BYTES = 12 * 1024 * 1024      # only pay for a rewrite once the file is plausibly over
+
+
+def trim(spec='XLM', quote='USDC', days=MAX_TAPE_DAYS):
+    """Drop rows older than `days`. Rewrites via a temp file, so a reader mid-trim sees
+    either the old file or the new one and never a truncated one.
+
+    Cheap-guarded on file size, for the reason market_recorder._ROW_BYTES documents: an
+    unguarded trim reads and rewrites the whole file on every append, forever.
+    """
+    path = _cache_path(spec, quote)
+    try:
+        if not path.exists() or path.stat().st_size < _TRIM_BYTES:
+            return 0
+        cutoff = time.time() - float(days) * 86400
+        kept = [r for r in read_cache(spec, quote) if (r.get('t') or 0) >= cutoff]
+        if len(kept) == len(_PARSED.get(str(path), {}).get('rows', [])):
+            return 0
+        tmp = path.with_suffix('.trim')
+        with tmp.open('w') as f:
+            for row in kept:
+                f.write(json.dumps(row, separators=(',', ':')) + '\n')
+        tmp.replace(path)
+        _PARSED.pop(str(path), None)
+        # The covered-token range must shrink with the file, or a resumed backfill would
+        # believe it still had the rows it just deleted and never re-fetch them.
+        if kept:
+            _save_meta(spec, quote, {'min_token': kept[0].get('k'),
+                                     'max_token': kept[-1].get('k')})
+        print(f'[dex_trades] trimmed to {len(kept)} rows ({days}d)', flush=True)
+        return len(kept)
+    except Exception as e:
+        print(f'[dex_trades] trim failed ({e})')
+        return 0
+
+
 def _page_loop(spec, quote, cursor, order, stop, label):
     """Page until `stop(row)` is true, appending everything outside the covered range.
 
@@ -383,31 +446,83 @@ def sync(spec='XLM', quote='USDC'):
                       lambda row: False, 'sync')
 
 
+# Parsed tape, per process, keyed by cache path. Holds the sorted rows and how many bytes
+# of the file they came from, so a second call only parses what was appended since.
+#
+# NOT a micro-optimisation. Every strategy calls get_trades once per 30s tick, and a naive
+# re-read parsed and sorted the whole file each time: measured at 3.06s for 545k rows, so
+# ten strategies on a 30s loop would spend more than the tick doing nothing but re-reading
+# a file that grew by 30 lines. It is the same shape as the problem market_recorder.tail
+# exists to solve, and it gets worse every day the tape grows.
+_PARSED = {}
+
+
 def read_cache(spec='XLM', quote='USDC'):
     """Every cached row, oldest first, as raw compact rows.
 
-    Sorted on read because a backfill appends newest-first and a sync appends
+    Sorted on read because a backfill appends newest-first while a sync appends
     oldest-first, so the file is not in time order and never will be. Malformed lines are
-    skipped for the reason market_recorder.read_history skips them.
+    skipped for the reason market_recorder.read_history skips them: a daemon appends here,
+    so a torn final line is a normal state rather than corruption.
+
+    Incremental: only the bytes appended since the last call are parsed, and the file is
+    re-read from scratch only if it SHRANK (a trim, or a fresh cache). The last line of a
+    read is dropped unless it ends in a newline, because a sync daemon may be halfway
+    through writing it -- it will be picked up whole on the next call.
     """
     path = _cache_path(spec, quote)
+    key = str(path)
     if not path.exists():
+        _PARSED.pop(key, None)
         return []
-    out = []
     try:
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except Exception:
-                    continue
+        size = path.stat().st_size
     except Exception:
-        pass
-    out.sort(key=lambda r: (r.get('t') or 0, _token_key(r.get('k'))))
-    return out
+        return _PARSED.get(key, {}).get('rows', [])
+
+    cached = _PARSED.get(key)
+    if cached and cached['size'] == size:
+        return cached['rows']
+    start = cached['size'] if cached and size > cached['size'] else 0
+    rows = list(cached['rows']) if start else []
+
+    try:
+        with path.open('rb') as f:
+            f.seek(start)
+            chunk = f.read()
+    except Exception:
+        return rows
+
+    text = chunk.decode('utf-8', 'replace')
+    consumed = start + len(chunk)
+    if not text.endswith('\n'):
+        cut = text.rfind('\n')
+        if cut < 0:
+            return rows                      # nothing complete yet; try again next call
+        consumed = start + len(text[:cut + 1].encode('utf-8'))
+        text = text[:cut + 1]
+
+    fresh = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            fresh.append(json.loads(line))
+        except Exception:
+            continue
+    # A sync appends in ascending time, so in the steady state the new rows already sort
+    # after everything cached and the merge is a plain extend. Only pay for the sort when
+    # they do not -- a backfill block is descending, and re-sorting half a million rows on
+    # every 30-second tick is most of the cost this cache was added to remove.
+    ordered = all(fresh[i]['t'] <= fresh[i + 1]['t'] for i in range(len(fresh) - 1))
+    if rows and fresh and ordered and fresh[0]['t'] < (rows[-1].get('t') or 0):
+        ordered = False
+    rows.extend(fresh)
+    if not ordered:
+        rows.sort(key=lambda r: (r.get('t') or 0, _token_key(r.get('k'))))
+    _PARSED[key] = {'size': consumed, 'rows': rows}
+    return rows
 
 
 def get_trades(spec='XLM', quote='USDC', start_ts=None, end_ts=None,
@@ -425,14 +540,15 @@ def get_trades(spec='XLM', quote='USDC', start_ts=None, end_ts=None,
     total does not. `orderbook_only` (the default) drops liquidity-pool trades, which no
     resting offer could ever have filled.
     """
+    rows = read_cache(spec, quote)
+    # Bisect rather than scan. A live tick asks for the last 30 seconds of an 8-day tape,
+    # and walking half a million rows to find thirty of them is the same waste _PARSED
+    # exists to remove -- rows are sorted by ts, so the window is a slice.
+    lo = bisect.bisect_left(_TsKey(rows), start_ts) if start_ts is not None else 0
+    hi = bisect.bisect_left(_TsKey(rows), end_ts) if end_ts is not None else len(rows)
     out = []
-    for row in read_cache(spec, quote):
-        ts = row.get('t') or 0
+    for row in rows[lo:hi]:
         if orderbook_only and row.get('x'):
-            continue
-        if start_ts is not None and ts < start_ts:
-            continue
-        if end_ts is not None and ts >= end_ts:
             continue
         if (row.get('c') or 0) < min_usd:
             continue
@@ -508,6 +624,7 @@ def sync_daemon(interval=30, spec='XLM', quote='USDC'):
     while True:
         try:
             written = sync(spec, quote)
+            trim(spec, quote)
             covered = span(spec, quote)
             print(f'{time.time():.0f} +{written} rows, {covered["rows"]} cached, '
                   f'{covered["days"]}d', flush=True)
