@@ -67,6 +67,12 @@ True cross-venue arb needs inventory on both sides and is a separate, larger pro
 
 ### 2. Stop being a taker
 
+**Planned in detail in `MAKER.md` (2026-08-16).** That document supersedes the sketch below
+on two points: it argues for a **new domain** (`domain_maker.py`) rather than the
+"strategy-class change" this section assumed, and it measures the venue — ~195 trades/hour
+at or above $4, 100% order book, on a 10–16 bp spread — which makes this the item that
+actually fixes criterion 5.
+
 Every real trade is a `path-payment-strict-send` — a market-order-like take that crosses
 the spread on every fill. Against the 12bp XLM book and 151–186bp extra-leg books, that
 is the whole edge and then some. Resting offers (`manage_sell_offer`) are a *different
@@ -161,5 +167,12 @@ failure mode `TEMPLATE_SPAWNS_PER_CYCLE` exists to prevent within a single domai
 4. **Prediction markets as a new domain**.  Use the kalshi public API to get
    real prediction markets.  See "#3. Prediction markets (Kalshi or Polymarket)" above.
 
-5. Market making (#2 "Stop Being A Taker" above) whenever the queue-position backtest looks tractable.
+5. Market making (#2 "Stop Being A Taker" above) whenever the queue-position backtest looks
+   tractable. **See `MAKER.md`** for the implementation plan, including the fill model that
+   settles "tractable" and the kill criterion for abandoning the item.
+
+   Its phase 0 (record the order-book ladder in `market_recorder.py`; add
+   `tools/dex_trades.py` to backfill the Horizon trade tape) is cheap, sits outside the
+   money boundary, and only accrues in wall-clock time — worth landing *before* item 4 even
+   though the rest of the item comes after it.
 
