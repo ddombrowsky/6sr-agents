@@ -996,9 +996,17 @@ def cleanup_scratch(scratch_name):
 # --------------------------------------------------------------------------------------
 
 def _fill_stats(name, hours=24):
-    """(fills, volume_usd, buys, sells) from the activity log over `hours`."""
+    """Live edge from the activity log: (fills, volume, buys, sells, spread_usd).
+
+    `spread_usd` is measured the same way maker_backtest measures it -- per fill, the
+    distance between the reference mid recorded on the line and the price it actually
+    transacted at -- so a live number and a replay number mean the same thing and can be
+    compared. record_trade writes `price` as the reference mid and `fill_price` as the
+    resting price, which is what makes this recoverable from the log at all.
+    """
     cutoff = time.time() - hours * 3600
     fills = volume = buys = sells = 0
+    spread = 0.0
     try:
         with open(activity_log_path(name)) as f:
             for line in f:
@@ -1009,40 +1017,84 @@ def _fill_stats(name, hours=24):
                 if (entry.get('timestamp') or 0) < cutoff:
                     continue
                 fills += 1
-                volume += abs(entry.get('amount_usd') or 0.0)
+                usd = abs(entry.get('amount_usd') or 0.0)
+                volume += usd
+                mid, fill = entry.get('price'), entry.get('fill_price')
                 if entry.get('action') == 'maker_buy':
                     buys += 1
+                    if mid and fill:
+                        spread += usd * (mid - fill) / mid
                 else:
                     sells += 1
+                    if mid and fill:
+                        spread += usd * (fill - mid) / mid
     except Exception:
         pass
-    return fills, volume, buys, sells
+    return fills, volume, buys, sells, spread
+
+
+def _live_net(name, mid):
+    """Net worth change against STARTING_SCORE, at `mid`. The live bottom line."""
+    raw = _read_json(STRATEGIES_DIR / name / 'state.json')
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return (float(raw.get('balance_usd') or 0.0)
+                + float(raw.get('balance_xlm') or 0.0) * (mid or 0.0) * _haircut()
+                - STARTING_SCORE)
+    except Exception:
+        return None
 
 
 def report_activity(performances, limit=None):
-    """Turnover against edge. Prints fills, volume and the two halves of the edge.
+    """Turnover against edge -- LIVE, with the replay's verdict alongside it.
 
-    Gross spread capture and adverse selection are printed SEPARATELY and never only
-    netted, because a maker that reports gross capture alone always looks profitable --
-    MAKER.md §1.1. The two halves come from the replay, which is the only place adverse
-    selection is measured at all.
+    Every column left of `bt_net$` is measured from this strategy's own fill log and its
+    own state.json; `bt_net$` is the only one that comes from replay(), and it is labelled
+    because it describes an 8-day historical window rather than anything that just
+    happened. An earlier version of this function printed live fill counts and REPLAY edge
+    numbers in the same row with no marking, which reads as a live edge and is not one --
+    the live and replayed numbers diverged by about 1.3 bp of volume the first time they
+    were compared, which is the whole reason this table exists.
+
+    Gross capture and the residual are printed SEPARATELY and never only netted: a maker
+    that reports gross capture alone always looks profitable (MAKER.md 1.1). `resid$` is
+    net minus captured -- what the mid did to the inventory each fill left behind, plus
+    whatever the XLM price did on its own.
     """
     rows = list(performances or [])[:limit or 8]
     if not rows:
         return
-    print('Maker activity (24h):')
-    print(f"  {'strategy':<26} {'fills':>6} {'volume$':>10} {'buy/sell':>10} "
-          f"{'spread$':>9} {'adverse$':>9} {'net$':>8}")
+    obs_mid = None
+    recorder = _tool('market_recorder')
+    if recorder is not None:
+        try:
+            tail = recorder.tail(1)
+            obs_mid = tail[-1].get('dex_mid') if tail else None
+        except Exception:
+            obs_mid = None
+    print('Maker activity (24h live; bt_net$ is the 8-day replay, not live):')
+    print(f"  {'strategy':<26} {'fills':>6} {'buy/sell':>10} {'volume$':>9} "
+          f"{'gross$':>8} {'resid$':>8} {'net$':>8} {'bt_net$':>8}")
+    total_vol = total_gross = total_net = 0.0
     for name, _score in rows:
-        fills, volume, buys, sells = _fill_stats(name)
-        raw = {}
+        fills, volume, buys, sells, gross = _fill_stats(name)
+        net = _live_net(name, obs_mid)
         result = replay(STRATEGIES_DIR / name)
-        if result:
-            raw = result.get('raw') or {}
-        print(f"  {name:<26} {fills:>6} {volume:>10.2f} {f'{buys}/{sells}':>10} "
-              f"{raw.get('spread_captured_usd', float('nan')):>9.3f} "
-              f"{raw.get('adverse_selection_usd', float('nan')):>9.3f} "
-              f"{raw.get('net_edge_usd', float('nan')):>8.3f}")
+        bt = (result or {}).get('raw', {}).get('net_edge_usd')
+        total_vol += volume
+        total_gross += gross
+        if net is not None:
+            total_net += net
+        print(f"  {name:<26} {fills:>6} {f'{buys}/{sells}':>10} {volume:>9.0f} "
+              f"{gross:>8.3f} {(net - gross) if net is not None else float('nan'):>8.3f} "
+              f"{net if net is not None else float('nan'):>8.3f} "
+              f"{bt if bt is not None else float('nan'):>8.3f}")
+    if total_vol > 0:
+        print(f"  {'TOTAL':<26} {'':>6} {'':>10} {total_vol:>9.0f} "
+              f"{total_gross:>8.3f} {total_net - total_gross:>8.3f} {total_net:>8.3f}")
+        print(f"  per unit volume: gross {1e4 * total_gross / total_vol:+.2f} bp, "
+              f"net {1e4 * total_net / total_vol:+.2f} bp")
 
 
 def stuck_report(performances, state, obs):
@@ -1058,7 +1110,7 @@ def stuck_report(performances, state, obs):
         raw_state = _read_json(STRATEGIES_DIR / name / 'state.json')
         if not isinstance(raw_state, dict):
             continue
-        fills, _volume, _buys, _sells = _fill_stats(name, hours=6)
+        fills, _volume, _buys, _sells, _gross = _fill_stats(name, hours=6)
         quoted = int(raw_state.get('quoted_sides') or 0)
         if quoted > 0 and fills == 0:
             config = _read_json(STRATEGIES_DIR / name / 'config.json', {}) or {}
@@ -1115,7 +1167,7 @@ def report_experiments():
         for path in sorted(STRATEGIES_DIR.glob('*/config.json')):
             config = _read_json(path, {}) or {}
             name = path.parent.name
-            fills, volume, _b, _s = _fill_stats(name, hours=24)
+            fills, volume, _b, _s, _g = _fill_stats(name, hours=24)
             bucket = with_skew if float(config.get('inventory_skew_bp') or 0.0) > 0 else without
             bucket.append((name, fills, volume))
     except Exception as e:
