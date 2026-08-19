@@ -39,39 +39,18 @@ except Exception:      # pragma: no cover - keeps the XLM-only path working stan
 # 909.55 -- 7th, below three never-traded clones sitting in cash at exactly 1000.00.
 # The evolutionary loop was again cloning strategies that don't trade.
 #
-# Do not "harmonize" this with ILLIQUID_HAIRCUT. They are different kinds of number:
-# this one is a hurdle rate on an asset the strategy is *expected* to hold and must stay
-# near 1.0; that one is a slippage estimate on a thin order book and is supposed to bias
-# against exotic legs. The prompt interpolates this value rather than restating it, so
-# the two cannot drift apart again.
+# The prompt interpolates this value rather than restating it, so the two cannot drift
+# apart again.
+#
+# ILLIQUID_HAIRCUT (0.99) used to sit here beside it, a residual slippage nudge on a
+# non-XLM leg whose value had already been depth-capped against the real bid ladder. It
+# went with the extra-asset stack on 2026-08-13, along with a STALE_MARK_MAX_AGE that
+# turned out to have had no readers at all. The distinction the removed comment was at
+# pains to draw -- a hurdle rate on an expected holding is not a slippage estimate on a
+# thin book -- is worth keeping in mind if a second asset ever comes back: both constants
+# were originally set an order of magnitude too punitive, and both times the effect was
+# the loop culling the behaviour it had just been extended to explore.
 UNREALIZED_HAIRCUT = 0.999
-
-# Residual nudge on a non-XLM leg AFTER its value has already been depth-capped against
-# the real bid ladder. It covers only the gap between "these bids exist right now" and
-# "these bids survive contact" -- so, like UNREALIZED_HAIRCUT, it must stay near 1.0.
-#
-# This was 0.90, and that was the same mistake as the original 0.899 UNREALIZED_HAIRCUT
-# in miniature: a flat 10% charge is a hurdle rate, not a slippage estimate, and it made
-# a multi-asset strategy uncompetitive by construction. Measured against the live book on
-# 2026-08-02, seed_multiasset_1785700731 held 308,151 AQUA marked at $105.01 whose real
-# depth-capped exit value was $104.35 -- 0.6% of genuine slippage, against which the flat
-# haircut charged $10.50, overstating it roughly sixteenfold. The strategy scored 988.88,
-# ranked last of twelve, and would have been culled on the next cycle: the loop deleting
-# precisely the behaviour it was extended to explore.
-#
-# Real illiquidity is now measured rather than guessed. compute_score_multi walks the
-# asset's actual bid ladder (fetched once per asset per cycle by
-# monitor.fetch_marks_for_cycle) and values the position at what it could really be sold
-# into, with quantity beyond available depth counting as zero. A genuinely thin asset is
-# still penalised -- severely, if its book is shallow -- but by evidence, not by fiat.
-ILLIQUID_HAIRCUT = 0.99
-
-# How long a last-known-good mark may be reused before the leg is valued at zero.
-# Deliberately finite: an asset that suddenly cannot be priced is what a rug looks like,
-# and carrying its last good mark indefinitely would rank holding a rug above holding
-# cash. Six hours is long enough to ride out a Horizon outage and short enough that a
-# dead asset stops flattering its strategy within the same day.
-STALE_MARK_MAX_AGE = 6 * 3600
 
 
 def compute_score(balance_usd, balance_xlm, price):
@@ -81,14 +60,22 @@ def compute_score(balance_usd, balance_xlm, price):
 
 
 def compute_score_multi(state, marks):
-    """Score a multi-asset state. Returns (score, unpriced_specs).
+    """Score a state's XLM leg and cash. Returns (score, unpriced_specs).
 
-    `marks` maps spec -> USD unit price (see dex_price.get_marks). USD is counted at
-    face, the XLM leg takes UNREALIZED_HAIRCUT, and every other leg takes both its mark
-    and ILLIQUID_HAIRCUT.
+    `marks` maps spec -> USD unit price, or the depth-carrying dict portfolio understands.
+    USD is counted at face and the XLM leg takes UNREALIZED_HAIRCUT.
 
     A leg with no usable mark contributes **zero** and is reported in `unpriced_specs`
     so callers can surface it as an outage rather than as a mysterious score drop.
+
+    The `_multi` in the name is now historical -- XLM is the only leg this domain trades.
+    It is kept because domain_sdex.score, selftest_domain and score_from_strategy_path all
+    call it by that name, and because a non-XLM position surviving in some old state.json
+    still has to be handled rather than silently valued. Such a position is skipped and
+    reported unpriced: nothing can open one any more (trade_logger refuses an undeclared
+    asset and no config can declare one), so counting it would be marking a balance the
+    strategy has no way to have acquired legitimately. Three stopped strategies held one
+    at removal time -- two in AQUA, one in USDC -- and each drops to its cash balance.
     """
     if _portfolio is None:
         usd, xlm = float(state.get('balance_usd', 0.0)), float(state.get('balance_xlm', 0.0))
@@ -104,7 +91,7 @@ def compute_score_multi(state, marks):
         amount = float(position.get('amount') or 0.0)
         if amount <= 0:
             continue
-        mark = marks.get(spec)
+        mark = marks.get(spec) if spec == _assets.NATIVE else None
         if mark is None:
             unpriced.append(spec)
             continue
@@ -115,15 +102,12 @@ def compute_score_multi(state, marks):
         if value is None:
             unpriced.append(spec)
             continue
-        haircut = UNREALIZED_HAIRCUT if spec == _assets.NATIVE else ILLIQUID_HAIRCUT
-        total += value * haircut
+        total += value * UNREALIZED_HAIRCUT
 
     # Short liability (SHORTING_PLAN.md): borrowed_xlm is a debt, not a position, so it
     # never appears in `positions` -- it must be subtracted separately or a strategy that
-    # never covers would look like it kept the sale proceeds for free. Deliberately NOT
-    # ILLIQUID_HAIRCUT -- that's a mark-realism discount on thin non-XLM books, a
-    # different kind of number (see this file's own commentary above). The buy-back
-    # costs slightly *more*, not less, hence dividing by UNREALIZED_HAIRCUT rather than
+    # never covers would look like it kept the sale proceeds for free. The buy-back costs
+    # slightly *more*, not less, hence dividing by UNREALIZED_HAIRCUT rather than
     # multiplying.
     borrowed = state.get('borrowed_xlm', 0.0)
     if borrowed > 0:

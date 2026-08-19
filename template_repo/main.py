@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Threshold trading strategy: XLM plus up to two additional Stellar assets.
+"""Threshold trading strategy for XLM.
+
+XLM is the only asset this domain trades. Until 2026-08-13 a strategy could also declare
+up to two additional Stellar DEX assets in `config.json`'s `assets` array and trade them
+through a `decide_asset()` hook; that whole channel was removed, along with the array, the
+hook, and the injection/verification machinery behind it. Do not reintroduce a second leg
+by reaching around `execute_trade` -- it refuses an undeclared asset, and the revision
+smoke test fails any candidate whose state.json comes back holding one.
 
 ## Structure matters here -- read before editing
 
@@ -21,10 +28,9 @@ Two consequences that are easy to trip over:
 
 ## Where to put strategy logic
 
-`decide()` is the XLM leg and is what `backtest_strategy` replays; `decide_asset()` is
-called once per extra asset per tick. Both return `(side, action, requested_usd)` or
-None. Return a 3-tuple, not a 4-tuple: backtest's `_normalize` accepts anything of
-length >= 3 and would silently drop a fourth element.
+`decide()` is the whole of it, and is what `backtest_strategy` replays. It returns
+`(side, action, requested_usd)` or None. Return a 3-tuple, not a 4-tuple: backtest's
+`_normalize` accepts anything of length >= 3 and would silently drop a fourth element.
 
 Execution -- balance mutation, overdraft/oversell clamping, trade logging, and live
 submission -- belongs to `trade_logger.execute_trade`. Do not reimplement any of it here.
@@ -78,7 +84,6 @@ sys.path = sys.path + ['/opt/tools']
 import basis
 import news_feed
 import portfolio
-from dex_price import get_mark
 from price_feed import get_price
 from trade_logger import execute_trade
 
@@ -215,45 +220,20 @@ def decide(price, history, state, config):
     return None
 
 
-def decide_asset(asset, price, history, state, config):
-    """One extra (non-XLM) leg. Returns (side, action, requested_usd) or None.
-
-    `asset` is a dict from portfolio.assets_from_config: code, issuer, spec, and that
-    leg's own buy_below / sell_above / trade_amount_usd. `history` is that asset's own
-    price history, not XLM's.
-
-    The default is the same threshold rule applied per leg, so a strategy gets working
-    multi-asset behavior from config.json alone. Extra assets are DEX-only: thinner
-    books, wider spreads, and far less history than XLM -- size them smaller.
-    """
-    buy_below = asset.get('buy_below')
-    sell_above = asset.get('sell_above')
-    size = asset.get('trade_amount_usd', config.get('trade_amount_usd', 10))
-
-    if buy_below and price <= buy_below:
-        return ('buy', 'buy', size)
-    if sell_above and price >= sell_above:
-        return ('sell', 'sell', size)
-    return None
-
-
 def main():
     config = load_config()
     agent_name = config.get('name', 'unnamed')
     state = load_state()
-    extra_assets = portfolio.assets_from_config(config)
 
     print(f"Agent {agent_name} starting with USD {state['balance_usd']:.2f}, "
-          f"XLM {state['balance_xlm']:.4f}"
-          + (f", extra assets: {[a['code'] for a in extra_assets]}" if extra_assets else ''))
+          f"XLM {state['balance_xlm']:.4f}")
 
     # Persist once before the first tick. monitor.py's smoke test reverts any revision
     # that hasn't written a readable state.json within SMOKE_TEST_SECONDS, and a first
-    # tick can outlast that: a price fetch per leg plus a 30s sleep.
+    # tick can outlast that: a price fetch plus a 30s sleep.
     save_state(state)
 
     history = []
-    leg_history = {a['spec']: [] for a in extra_assets}
 
     while True:
         price = get_price()
@@ -297,20 +277,6 @@ def main():
             side, action, requested_usd = decision
             state = execute_trade(agent_name, action, side, price, requested_usd, state,
                                   allow_shorting=config.get('allow_shorting', False))
-
-        for asset in extra_assets:
-            leg_price = get_mark(asset['spec'])
-            if leg_price is None or leg_price <= 0:
-                continue      # never trade a leg we cannot price
-            hist = leg_history[asset['spec']]
-            hist.append(leg_price)
-            del hist[:-MAX_HISTORY]
-
-            decision = decide_asset(asset, leg_price, hist, state, config)
-            if decision:
-                side, action, requested_usd = decision
-                state = execute_trade(agent_name, action, side, leg_price, requested_usd,
-                                      state, asset=asset['spec'])
 
         save_state(state)
         time.sleep(TICK_SECONDS)

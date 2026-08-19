@@ -5,3 +5,4 @@ emperor-claude.txt
 .containername
 selftest-logs
 scripts/env.sh
+env.sh

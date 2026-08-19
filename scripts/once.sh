@@ -13,7 +13,7 @@ LOG=/opt/emperor_logs/monitor-once-$DSTR.log
 echo starting market recorder...
 python3 monitor.py --ensure-recorder
 
-export CYCLE_SLEEP=14400
+export CYCLE_SLEEP=28800
 # comment this out to use ollama if you have any credits left -- irrelevant while
 # REVISION_MODE=manual below, since that path never calls the model, but left set so
 # switching back to auto mode doesn't silently start spending Ollama cloud credits again
@@ -23,7 +23,7 @@ export MASTER_AGENT_MODEL=gpt
 # revision prompt to /opt/emperor_logs/pending_revision.md and blocks the whole cycle
 # until `master-agent.py revision-done <name>` is run. See v/strategies/CLAUDE.md for
 # the human-side workflow. Comment out to go back to the local Ollama model.
-#export REVISION_MODE=manual
+export REVISION_MODE=manual
 
 date > $LOG
 touch /opt/.monitor.py.exit

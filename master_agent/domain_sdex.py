@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """The Stellar DEX domain: paper-and-live XLM trading, scored on mark-to-market net worth.
 
-Everything in here used to live in monitor.py. It is domain knowledge -- prices, order
-books, asset issuers, threshold bands, spreads, trustlines, the real-money caps -- and
-monitor.py is the domain-agnostic evolutionary loop. See domain.py for the contract this
-implements and for which of FUTURE.md's criteria each member answers.
+Everything in here used to live in monitor.py. It is domain knowledge -- prices, threshold
+bands, spreads, the real-money caps -- and monitor.py is the domain-agnostic evolutionary
+loop. See domain.py for the contract this implements and for which of FUTURE.md's criteria
+each member answers.
+
+XLM ONLY, since 2026-08-13. This domain used to trade XLM plus up to two discovered
+Stellar DEX assets per strategy, and roughly a third of this file was the machinery for
+that: an injection channel, an admission registry, per-leg threshold bands, trustline
+opening at promotion, and a config `assets` array carried down every lineage. It was
+removed because the population had stopped using it -- 13 of 79 tracked strategies still
+declared a leg, 1 running, and the last non-XLM fill of any kind was seven days before
+the removal, 621 of 18,151 lifetime fills. The verification stack it fed
+(tools/asset_discovery.py, tools/dex_price.py, and stellar_trader's non-base caps and
+trustline handling) was deliberately left in place: it is the money boundary, its refusal
+paths are now simply unreachable, and deleting them would buy nothing.
 
 This is a MOVE, not a rewrite. The docstrings and comments came across verbatim because
 they are the record of specific past failures (a haircut two orders of magnitude off the
@@ -80,9 +91,10 @@ OBSERVE_FAILURE_NOTE = f'Could not fetch price after {PRICE_FETCH_ATTEMPTS} atte
 class Observation:
     """What this domain knows at the top of a cycle.
 
-    `price` is XLM/USD from price_feed. `marks` maps asset spec -> USD unit price, or the
-    depth-carrying dict dex_price.get_mark_with_depth returns, for every asset any tracked
-    strategy declares or holds.
+    `price` is XLM/USD from price_feed. `marks` maps spec -> USD unit price and now only
+    ever holds the one XLM entry; it stays a mapping because score.py, portfolio.net_worth
+    and check_smoke_state all take that shape, and because collapsing it would be a
+    signature change across four modules to save one dict.
 
     Opaque to monitor.py by design: the loop only ever tests `is None` and passes it back.
     A domain with no prices returns whatever shape it likes from observe().
@@ -118,45 +130,15 @@ def observe():
 
 
 def observe_population(obs, state):
-    """One batch of USD marks for every asset any strategy declares or holds.
+    """The cycle's marks. XLM only -- this domain trades nothing else.
 
-    Fetched once per cycle, before scoring. Scoring touches every tracked strategy, so
-    doing network I/O per strategy would turn a ~40-strategy ranking pass into hundreds
-    of blocking Horizon calls and earn a rate-limit.
+    Kept as a contract member (and `marks` kept as a dict rather than collapsed into
+    `price`) because score.py, check_smoke_state and the harness all take a spec->mark
+    mapping, and because a future domain may well need a real batch here. It no longer
+    does any network I/O: with the extra-asset stack gone the only mark that exists is
+    the XLM price observe() already fetched.
     """
-    marks = {'XLM': obs.price}
-    tools = _tools()
-    if tools is None:
-        obs.marks = marks
-        return obs
-    portfolio, dex_price, _ = tools
-
-    specs = set()
-    for name, entry in state.items():
-        path = Path(entry.get('path', ''))
-        try:
-            cfg = json.load(open(path / 'config.json'))
-            specs.update(a['spec'] for a in portfolio.assets_from_config(cfg))
-        except Exception:
-            pass
-        try:
-            st = portfolio.normalize_state(json.load(open(path / 'state.json')))
-            specs.update(s for s, p in st['positions'].items()
-                         if float(p.get('amount') or 0) > 0)
-        except Exception:
-            pass
-    specs.discard('XLM')
-
-    # One order book per asset per cycle, carrying the bid ladder so scoring can
-    # depth-cap each strategy's position without any further network calls.
-    for spec in sorted(specs):
-        mark = dex_price.get_mark_with_depth(spec)
-        if mark and mark.get('price'):
-            marks[spec] = mark
-    missing = sorted(specs - set(marks))
-    if missing:
-        print(f'  no mark for {len(missing)} asset(s): {", ".join(missing)}')
-    obs.marks = marks
+    obs.marks = {'XLM': obs.price}
     return obs
 
 
@@ -327,22 +309,13 @@ def config_signature(state_entry):
         cfg = json.load(open(Path(state_entry['path']) / 'config.json'))
     except Exception:
         return None
-    assets = cfg.get('assets') or []
-    if not isinstance(assets, list):
-        assets = []
-    # Assets are part of what defines a strategy. Without them two clones differing
-    # ONLY in which assets they picked look identical here, select_parents discards one
-    # as a duplicate, and a revision slot is wasted -- killing exactly the diversity
-    # multi-asset support exists to create.
-    asset_sig = tuple(sorted(
-        (a.get('code'), a.get('issuer'), a.get('buy_below'), a.get('sell_above'))
-        for a in assets if isinstance(a, dict)))
-    # basis_min_bp for the same reason assets are here: it is the entire difference
-    # between the gated arm and the control arm, and without it two spawns that differ
-    # only in whether they trade on the basis look identical, select_parents drops one
-    # as a duplicate, and the experiment loses half its population to a dedup rule.
+    # basis_min_bp is here because it is the entire difference between the gated arm and
+    # the control arm: without it two spawns that differ only in whether they trade on
+    # the basis look identical, select_parents drops one as a duplicate, and the
+    # experiment loses half its population to a dedup rule. It is now the only such knob
+    # -- the `assets` tuple that used to sit beside it went with the extra-asset stack.
     return (cfg.get('buy_below'), cfg.get('sell_above'),
-            cfg.get('trade_amount_usd'), asset_sig, cfg.get('basis_min_bp'))
+            cfg.get('trade_amount_usd'), cfg.get('basis_min_bp'))
 
 
 # --------------------------------------------------------------------------------------
@@ -350,20 +323,20 @@ def config_signature(state_entry):
 # --------------------------------------------------------------------------------------
 
 def _tools():
-    """Lazy handle on the /opt/tools modules, or None if unavailable.
+    """Lazy handle on /opt/tools' portfolio module, or None if unavailable.
 
-    Imported lazily and defensively so that a problem in the asset stack degrades
-    monitor to XLM-only behavior instead of taking down the whole culling loop.
+    Imported lazily and defensively so that a problem in the shared tools degrades the
+    one caller left (check_smoke_state) to its own reduced check instead of taking down
+    the whole culling loop. It used to return dex_price and asset_discovery alongside
+    this; both went with the extra-asset stack.
     """
     try:
         if '/opt/tools' not in sys.path:
             sys.path.append('/opt/tools')
-        import asset_discovery
-        import dex_price
         import portfolio
-        return portfolio, dex_price, asset_discovery
+        return portfolio
     except Exception as e:
-        print(f'asset tooling unavailable ({e}); running XLM-only this cycle')
+        print(f'portfolio tooling unavailable ({e}); using reduced checks this cycle')
         return None
 
 
@@ -380,23 +353,17 @@ def caps():
     these, and the two numbers are not the same. Failing to read them must degrade that
     record, never block a promotion.
 
-    The non-base caps are included because they now bind: a non-XLM leg trades real money
-    and is clamped to MAX_TRADE_USD_NONBASE, an eighth of the XLM per-trade cap. Recording
-    only the XLM caps made every extra leg's sizing look 8x larger than it can be, and
-    left live_report unable to see drift in the caps that actually govern it.
+    Only the two XLM caps. stellar_trader still defines the non-base ones and still
+    enforces them -- that module is the money boundary and was deliberately left alone --
+    but with no strategy able to declare an extra asset they can no longer bind on
+    anything, and recording them here put dead numbers into every live_strategy.json.
     """
     try:
         if '/opt/tools' not in sys.path:
             sys.path.append('/opt/tools')
         import stellar_trader
         return {'max_trade_usd': float(stellar_trader.MAX_TRADE_USD),
-                'max_daily_usd': float(stellar_trader.MAX_DAILY_USD),
-                'max_trade_usd_nonbase': float(stellar_trader.MAX_TRADE_USD_NONBASE),
-                'max_daily_usd_per_asset': float(stellar_trader.MAX_DAILY_USD_PER_ASSET),
-                'max_position_usd_per_asset': float(stellar_trader.MAX_POSITION_USD_PER_ASSET),
-                'max_total_nonbase_exposure_usd': float(
-                    stellar_trader.MAX_TOTAL_NONBASE_EXPOSURE_USD),
-                'max_stuck_usd': float(stellar_trader.MAX_STUCK_USD)}
+                'max_daily_usd': float(stellar_trader.MAX_DAILY_USD)}
     except Exception as e:
         print(f'could not read stellar_trader caps ({e}); recording sizing without them')
         return None
@@ -500,23 +467,6 @@ def promotion_sizing(name):
             if sizing['trade_amount_usd'] > 0 and limits['max_trade_usd'] > 0:
                 sizing['implied_ratio'] = round(
                     min(1.0, limits['max_trade_usd'] / sizing['trade_amount_usd']), 6)
-        # Per-leg, because extra legs DO trade live now and are clamped by a different,
-        # much smaller cap. Recording one ratio against MAX_TRADE_USD described the XLM
-        # leg and misdescribed every other by 8x.
-        legs = {}
-        for a in (cfg.get('assets') or []):
-            try:
-                spec = f"{a['code']}:{a['issuer']}"
-                want = float(a.get('trade_amount_usd') or 0.0)
-            except Exception:
-                continue
-            leg = {'trade_amount_usd': want}
-            cap = (limits or {}).get('max_trade_usd_nonbase')
-            if want > 0 and cap:
-                leg['implied_ratio'] = round(min(1.0, cap / want), 6)
-            legs[spec] = leg
-        if legs:
-            sizing['legs'] = legs
         return sizing
     except Exception as e:
         print(f'could not record promotion sizing for {name} ({e})')
@@ -524,67 +474,20 @@ def promotion_sizing(name):
 
 
 def prepare_live(name):
-    """Open a trustline per declared extra asset. Returns {spec: {ok, created, reason}}.
+    """Nothing to prepare in this domain any more. Always {}.
 
-    Called once at promotion, between the outgoing strategy's wind_down and the incoming
-    one's live.flag: after, so the reserve refunds from any closed leg have landed and the
-    XLM floor is measured against reality; before, so a strategy is never live and trading
-    into an asset whose trustline is still being opened.
+    This used to open one Stellar trustline per declared extra asset, called at promotion
+    between the outgoing strategy's wind_down and the incoming one's live.flag. A strategy
+    can no longer declare an extra asset, so there is never a trustline to open: every
+    live strategy trades the native XLM leg, which needs none.
 
-    A failure is NOT fatal and must never block a promotion. ensure_trustline refuses for
-    environmental reasons far more often than for unsafe ones -- Horizon unreachable,
-    insufficient XLM reserve, MAX_SYSTEM_TRUSTLINES reached -- and blocking would convert
-    a per-asset problem into a whole-system stall, since the cull exempts only the live
-    strategy and an unpromotable leader leaves the inferior incumbent live indefinitely.
-    The strategy goes live XLM-only instead, submit_trade refuses that leg per-trade with
-    a reason that reaches the trade log, and the verdict is recorded in live_strategy.json.
+    Kept rather than deleted because it is a DOMAIN contract member (domain.check pins the
+    name and arity) and because the ordering it occupies in monitor's promotion sequence is
+    load-bearing for any domain that does need setup there. stellar_trader.ensure_trustline
+    survives untouched on the other side of the money boundary and is once again callerless,
+    which is what it was before this loop existed.
     """
-    results = {}
-    try:
-        cfg = json.load(open(STRATEGIES_DIR / name / 'config.json'))
-    except Exception as e:
-        print(f'could not read {name} config for trustlines ({e}); live XLM-only')
-        return results
-
-    tools = _tools()
-    try:
-        if '/opt/tools' not in sys.path:
-            sys.path.append('/opt/tools')
-        import stellar_trader
-    except Exception as e:
-        print(f'stellar_trader unavailable ({e}); {name} goes live XLM-only')
-        return results
-
-    # assets_from_config, not the raw list: it dedupes by spec AND code and caps at
-    # MAX_EXTRA_ASSETS, so this opens trustlines for exactly what the strategy can trade.
-    if tools:
-        portfolio = tools[0]
-        try:
-            declared = portfolio.assets_from_config(cfg)
-        except Exception as e:
-            print(f'could not read {name} assets ({e}); live XLM-only')
-            return results
-    else:
-        declared = cfg.get('assets') or []
-
-    for a in declared:
-        code, issuer = a.get('code'), a.get('issuer')
-        if not code or not issuer:
-            continue
-        spec = a.get('spec') or f'{code}:{issuer}'
-        try:
-            r = stellar_trader.ensure_trustline(code, issuer)
-        except Exception as e:
-            r = {'ok': False, 'created': False, 'reason': str(e)}
-        results[spec] = r
-        if r.get('created'):
-            print(f'  trustline opened for {spec}')
-        elif r.get('ok'):
-            print(f'  trustline for {spec} already present')
-        else:
-            print(f'  NO trustline for {spec}: {r.get("reason")} '
-                  f'-- that leg stays paper-only')
-    return results
+    return {}
 
 
 def ensure_trading_cushion(name):
@@ -592,8 +495,8 @@ def ensure_trading_cushion(name):
 
     Called once at promotion, after live.flag and live_strategy.json both already point
     at `name` -- ordering matters here, see stellar_trader.ensure_trading_cushion's
-    docstring for why. Not gated on declared assets the way prepare_live's trustline loop
-    is: this is about the native XLM leg every strategy trades, not about any one leg.
+    docstring for why. This is about the native XLM leg every strategy trades, which is
+    now the only leg there is.
 
     A failure is NOT fatal, same contract as prepare_live: a strategy that goes live with
     a thin real balance just means more early sell refusals against
@@ -728,8 +631,7 @@ def replay(strategy_dir):
         if '/opt/tools' not in sys.path:
             sys.path.append('/opt/tools')
         import backtest
-        result = backtest.backtest(str(strategy_dir), days=REPLAY_DAYS,
-                                   interval=60, legs=False)
+        result = backtest.backtest(str(strategy_dir), days=REPLAY_DAYS, interval=60)
         return {'trades': int(result.get('trades', 0)),
                 'beats_null': result.get('beats_buy_hold'),
                 'null_pct': result.get('buy_hold_pct'),
@@ -954,20 +856,11 @@ def report_live(live_name):
 # Criterion 6: synthesizing, repairing and judging a genome.
 # --------------------------------------------------------------------------------------
 
-ASSET_APPROVAL_TTL = 7 * 86400
-VERIFIED_ASSETS_FILE = TRADES_DIR / '.verified_assets.json'
-
-# Odds that a freshly bootstrapped strategy which ended up with no assets is handed the
-# next assets from the discovered/oracle candidate list. A coin flip rather than always:
-# the point is to introduce non-XLM legs into a population that otherwise cannot invent
-# one, while keeping XLM-only seeds in the mix as the control group to rank them against.
-REFLECTOR_INJECT_CHANCE = 0.5
-REFLECTOR_INJECT_COUNT = 2
-
 # Odds that a template spawn is seeded with a `basis_min_bp` gate, and the percentile of
-# the recorded tradeable_bp distribution used as its threshold. A coin flip for the same
-# reason REFLECTOR_INJECT_CHANCE is one: the un-seeded spawns are the control arm that
-# basis_report.py compares the seeded ones against. See _inject_basis_gate.
+# the recorded tradeable_bp distribution used as its threshold. A coin flip rather than
+# always: the un-seeded spawns are the control arm that basis_report.py compares the
+# seeded ones against. See _inject_basis_gate. Since the extra-asset channel was removed
+# this is the only mechanical source of novelty the population cannot invent for itself.
 BASIS_INJECT_CHANCE = 0.5
 BASIS_INJECT_PERCENTILE = 0.25
 BASIS_MIN_RECORDED_HOURS = 6
@@ -975,49 +868,6 @@ BASIS_MIN_RECORDED_HOURS = 6
 BASIS_GATE_MAX_PERCENTILE = 0.95
 
 SEED_BAND_FALLBACK_HALF_BP = 200.0   # the old hardcoded price*0.98 / price*1.02
-
-
-def _record_admission(code, issuer, verdict):
-    """Write an admitted asset into the registry stellar_trader enforces against.
-
-    This is the handoff between the second and third verification gates: monitor decides
-    what is admissible, stellar_trader._verified_asset confirms nothing has changed
-    before real money moves. Without this file being written, the enforcement gate finds
-    no record and refuses every non-XLM trade -- safe, but it would mean the live path
-    could never be enabled at all.
-
-    Entries expire after ASSET_APPROVAL_TTL so an asset nobody has re-checked in a week
-    stops being tradeable on its own. A `denied` record is never overwritten here:
-    denials are permanent and are set by stellar_trader when a leg proves unsellable.
-    """
-    try:
-        spec = __import__('assets').canonical(code, issuer)
-    except Exception:
-        return
-    registry = {}
-    if VERIFIED_ASSETS_FILE.exists():
-        try:
-            registry = json.loads(VERIFIED_ASSETS_FILE.read_text())
-        except Exception:
-            registry = {}
-
-    if registry.get(spec, {}).get('denied'):
-        return
-
-    registry[spec] = {
-        'code': code, 'issuer': issuer,
-        'approved_at': time.time(),
-        'approved_by': 'monitor',
-        'expires_at': time.time() + ASSET_APPROVAL_TTL,
-        'evidence': verdict.get('evidence', {}),
-        'denied': False, 'deny_reason': None,
-    }
-    try:
-        tmp = VERIFIED_ASSETS_FILE.with_suffix('.tmp')
-        tmp.write_text(json.dumps(registry, indent=2))
-        tmp.replace(VERIFIED_ASSETS_FILE)
-    except Exception as e:
-        print(f'  could not record admission for {spec}: {e}')
 
 
 def normalize_config(cfg_path, name):
@@ -1068,233 +918,39 @@ def normalize_config(cfg_path, name):
 
 
 def sanitize_config(cfg_path, obs=None):
-    """Re-verify every extra asset a config declares and delete the ones that fail.
+    """Strip the retired `assets` key off a config. Returns [] always.
 
-    Runs on every clone, INCLUDING when the revision made no changes. The `assets` list
-    is committed to git, so it propagates through `git clone` down the entire lineage
-    and tweak_config copies it verbatim -- without re-verification here, an asset denied
-    in one generation keeps trading five generations later. Re-checking is also the only
-    thing that catches an asset that was fine when admitted and has since been rugged,
-    delisted, or drained of liquidity.
+    This used to re-verify every declared extra asset against asset_discovery and delete
+    the ones that failed. Extra assets are gone, so the only job left is migration: the
+    key is committed to git, so it propagates through `git clone` down an entire lineage
+    and would otherwise sit in config.json forever looking meaningful. Roughly a dozen
+    strategies in the population still carry one; each gets cleaned the next time it is
+    provisioned.
 
-    Returns the surviving asset list. Rewrites config.json only if something changed.
+    Still called unconditionally on every clone, revised or not, for exactly the reason it
+    always was -- an inherited key has to be removed where it is inherited, not where it
+    was written. Returns a list because DOMAIN.sanitize_config's contract says so and
+    monitor discards the value; there is nothing left for it to describe.
     """
-    tools = _tools()
-    if tools is None:
-        return []
-    portfolio, _, asset_discovery = tools
-
     try:
         cfg = json.load(open(cfg_path))
     except Exception:
         return []
-
-    # Iterate the RAW list, not portfolio.assets_from_config(). That helper dedupes by
-    # asset code and caps the list, which is right for a *running* strategy but wrong
-    # here: a second entry sharing a code with a good one would be silently skipped and
-    # therefore never verified, and would stay in config.json on disk looking admitted.
-    # Anything written into the file has to be examined here or physically removed.
-    raw = cfg.get('assets')
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(cfg, dict) or 'assets' not in cfg:
         return []
-
-    kept, seen_codes = [], set()
-    changed = False
-    for entry in raw:
-        if not isinstance(entry, dict):
-            print('  dropping malformed asset entry (not an object)')
-            changed = True
-            continue
-        code, issuer = entry.get('code'), entry.get('issuer')
-        try:
-            assets_mod = sys.modules.get('assets') or __import__('assets')
-            spec = assets_mod.canonical(code, issuer)
-        except Exception as e:
-            print(f'  dropping asset {code!r}: {e}')
-            changed = True
-            continue
-        # canonical('XLM', None) succeeds -- XLM is a valid asset, just never a valid
-        # *extra* one. It is the permanent base leg carried by the top-level thresholds,
-        # so listing it here would double-count the position.
-        if assets_mod.is_native(spec):
-            print('  dropping XLM from assets: it is the base leg, not an extra asset')
-            changed = True
-            continue
-        if code.upper() in seen_codes:
-            print(f'  dropping duplicate asset code {assets_mod.display(spec)}')
-            changed = True
-            continue
-        if len(kept) >= portfolio.MAX_EXTRA_ASSETS:
-            print(f'  dropping {code}: more than {portfolio.MAX_EXTRA_ASSETS} extra assets')
-            changed = True
-            continue
-
-        verdict = asset_discovery.verify_asset(code, issuer)
-        if not verdict['ok']:
-            reason = verdict['vetoes'][0] if verdict['vetoes'] else \
-                f"only {verdict['score']} evidence points from " \
-                f"{verdict['sources_consulted']} sources"
-            print(f'  dropping unverified asset {assets_mod.display(spec)} -- {reason}')
-            changed = True
-            continue
-
-        seen_codes.add(code.upper())
-        kept.append(entry)
-        _record_admission(code, issuer, verdict)
-
-    if changed:
-        cfg['assets'] = kept
-        try:
-            json.dump(cfg, open(cfg_path, 'w'), indent=2)
-        except Exception as e:
-            print(f'  could not rewrite config after dropping assets: {e}')
-    return portfolio.assets_from_config(cfg)
-
-
-# Cursor over the Reflector oracle's tracked-asset list, used to hand freshly
-# bootstrapped strategies something to trade besides XLM. In memory only: losing it on
-# restart just means starting the walk over, and persisting it would be one more file to
-# keep consistent for no benefit.
-#
-# This exists because nothing else in monitor can introduce an asset. sanitize_config
-# only removes, seed_config only clears, and tweak_config only copies the parent's -- so
-# with the revision model unresponsive, every clone falls through to the tweak fallback
-# and the population can never discover a non-XLM leg on its own.
-_reflector_pool = {'assets': [], 'index': 0}
-
-# Codes that are never worth injecting as a *tradeable extra leg*, whatever their
-# liquidity. USDC and the other dollar anchors are the quote asset: "buying" one with USD
-# at ~$1.00 opens a position that cannot appreciate, consumes one of the two
-# MAX_EXTRA_ASSETS slots, and pays the spread twice for the privilege. They rank near the
-# top of discover_candidates precisely because they are the most liquid things on the
-# network, so without this the liquidity-first pool below would hand out USDC first,
-# every time.
-_UNTRADEABLE_CODES = {'USDC', 'USDT', 'USD', 'DAI', 'BUSD', 'TUSD', 'USDX', 'YUSDC'}
-
-# An injected leg's threshold band must be at least this many times its round-trip
-# trading cost, or the band is mostly toll. See _inject_discovered_assets.
-BAND_COST_MULTIPLE = 4.0
-
-
-def _leg_round_trip(spec):
-    """Round-trip cost for `spec` as a fraction, or 0.0 if friction can't be consulted.
-
-    Fails open, unlike friction.py's own default: this only widens a threshold band, and
-    a tools outage should leave the band at the historical +/-2% rather than silently
-    widening every injected leg to the non-base floor.
-    """
+    dropped = cfg.pop('assets')
     try:
-        if '/opt/tools' not in sys.path:
-            sys.path.append('/opt/tools')
-        import friction
-        return friction.half_spread(spec) * 2
-    except Exception:
-        return 0.0
-
-# Same cursor shape as _reflector_pool, over asset_discovery.discover_candidates() --
-# stellar.expert's liquidity/rating-ranked universe. This is the primary source now; see
-# _next_candidate_assets.
-_discovered_pool = {'assets': [], 'index': 0}
-
-
-def _next_discovered_assets(count=2):
-    """The next `count` liquidity-ranked candidates, cycling and refreshing when spent.
-
-    Why this exists alongside the Reflector pool: on 2026-08-03 the Reflector channel had
-    a 0% admission rate. Every single asset it proposed was rejected by sanitize_config
-    moments later -- apUSDT (113 trustlines, needs 200), asUSDC (80.7% spread), KES (200%
-    spread), VEUR (no mark at all). That is not bad luck. reflector_oracle tracks a price
-    feed, and most of what it feeds prices for is fiat forex anchors that barely trade on
-    the Stellar DEX, so the one mechanism that can introduce a non-XLM leg into the
-    population was structurally incapable of introducing one.
-
-    asset_discovery.discover_candidates() was already here, already ranked by
-    stellar.expert's composite rating and trustline count, and returned exactly the
-    assets that DO pass -- AQUA, XRP, BTCLN, ZARZ. It was reachable only from the
-    revision LLM's tool surface, which was itself dead (see _check_revision_interpreter),
-    so nothing mechanical had ever used it.
-
-    Same contract as _next_reflector_assets: [] on failure, shuffled on refresh so a
-    restart doesn't re-propose the alphabetical/ranked head forever, and every pick is a
-    PROPOSAL that sanitize_config re-verifies independently.
-    """
-    pool = _discovered_pool
-    if pool['index'] >= len(pool['assets']):
-        try:
-            if '/opt/tools' not in sys.path:
-                sys.path.append('/opt/tools')
-            import asset_discovery
-            found = asset_discovery.discover_candidates(limit=50) or []
-        except Exception as e:
-            print(f'  could not refresh the discovered asset pool: {e}')
-            found = []
-        pool['assets'] = [a for a in found
-                          if (a.get('code') or '').upper() not in _UNTRADEABLE_CODES]
-        random.shuffle(pool['assets'])
-        pool['index'] = 0
-        if not pool['assets']:
-            return []
-        print(f"  refreshed discovered asset pool: {len(pool['assets'])} ranked assets "
-              f"(shuffled; first few: {', '.join(a['code'] for a in pool['assets'][:4])})")
-
-    picks = pool['assets'][pool['index']:pool['index'] + count]
-    pool['index'] += len(picks)
-    return picks
-
-
-def _next_candidate_assets(count=2):
-    """Assets to propose to a fresh strategy: liquidity-ranked first, oracle as backup.
-
-    Kept as two separate pools rather than one merged list so the fallback is legible in
-    the logs: if discover_candidates is down (stellar.expert unreachable), the cycle
-    still proposes *something* rather than proposing nothing, and the log line says which
-    source it came from.
-    """
-    picks = _next_discovered_assets(count)
-    if picks:
-        return picks
-    print('  discovered pool empty; falling back to the Reflector oracle list')
-    return _next_reflector_assets(count)
-
-
-def _next_reflector_assets(count=2):
-    """The next `count` oracle-tracked assets, cycling and refreshing when exhausted.
-
-    Returns [] if the oracle is unreachable, so injection simply doesn't happen that
-    round -- the same fail-safe degradation to XLM-only the rest of the asset stack uses.
-
-    A short tail (one left when two are wanted) yields just that one rather than
-    refreshing mid-call to top up a single slot: a refresh costs 1-2 minutes of CLI
-    invocations, and the caller is happy with fewer candidates.
-
-    The pool is shuffled on every refresh. reflector_oracle.get_tracked_assets() returns
-    its assets sorted by spec, and this walks them in order, so an unshuffled pool hands
-    out the alphabetical head first every single time the process restarts -- AQUA and ARS
-    to whoever injects first, and the tail end of the alphabet only to a monitor that
-    stays up long enough to walk ~38 assets at two per injection. Restarts are frequent
-    (emperor.sh ends a window every EMPEROR_RUN_HOURS), so in practice the same handful of
-    codes were being proposed over and over and most of the oracle's list never got tried.
-    """
-    pool = _reflector_pool
-    if pool['index'] >= len(pool['assets']):
-        try:
-            if '/opt/tools' not in sys.path:
-                sys.path.append('/opt/tools')
-            import reflector_oracle
-            pool['assets'] = reflector_oracle.get_tracked_assets()
-        except Exception as e:
-            print(f'  could not refresh the Reflector asset pool: {e}')
-            pool['assets'] = []
-        random.shuffle(pool['assets'])
-        pool['index'] = 0
-        if not pool['assets']:
-            return []
-        print(f"  refreshed Reflector asset pool: {len(pool['assets'])} tracked assets "
-              f"(shuffled; first few: {', '.join(a['code'] for a in pool['assets'][:4])})")
-
-    picks = pool['assets'][pool['index']:pool['index'] + count]
-    pool['index'] += len(picks)
-    return picks
+        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+    except Exception as e:
+        print(f'  could not rewrite config after dropping assets: {e}')
+        return []
+    if isinstance(dropped, list) and dropped:
+        codes = ', '.join(str(a.get('code')) for a in dropped if isinstance(a, dict))
+        print(f'  dropped retired `assets` key ({codes or len(dropped)}): '
+              f'this domain trades XLM only')
+    else:
+        print('  dropped retired `assets` key (empty)')
+    return []
 
 
 def _tradeable_bp_values(hours=72):
@@ -1415,11 +1071,12 @@ def repair_config(cfg_path, name, obs):
 def _inject_basis_gate(cfg_path):
     """Give a template spawn a coin flip at trading on the DEX/CEX basis.
 
-    Returns True if config.json was written. Same shape and the same reasoning as
-    _inject_discovered_assets below: the population cannot invent this on its own, since
-    tweak_config only scales existing thresholds and seed_config only rebuilds the price
-    band, so without a mechanical channel `basis_min_bp` would enter the population only
-    if the revision model happened to write it. A coin flip rather than always, because
+    Returns True if config.json was written. The population cannot invent this on its own,
+    since tweak_config only scales existing thresholds and seed_config only rebuilds the
+    price band, so without a mechanical channel `basis_min_bp` would enter the population
+    only if the revision model happened to write it. It is now the only such channel --
+    the discovered-asset injector that used to sit beside it, and share this reasoning,
+    went with the rest of the extra-asset stack. A coin flip rather than always, because
     the un-gated spawns ARE the control arm -- basis_report.py's whole output is the
     comparison between the two, and seeding every spawn would leave nothing to compare
     against.
@@ -1479,147 +1136,19 @@ def _inject_basis_gate(cfg_path):
     return True
 
 
-def _inject_discovered_assets(cfg_path, marks=None, count=2):
-    """Give a still-XLM-only bootstrapped strategy a coin flip at two discovered assets.
-
-    Returns True if config.json was written. The picks are *proposals*, exactly like an
-    LLM-chosen asset: the caller runs sanitize_config straight afterwards, so every
-    normal verification rule (clawback, auth_required, trustlines, age, spread, bid
-    depth, pinned issuers) still decides what actually survives. "Next two" therefore
-    routinely yields one or zero.
-
-    Any pick with no mark is skipped -- a leg with no price cannot be given sane
-    thresholds, would never trade, and would fail _assets_are_sane if a mark appeared
-    later. Marks that are fetched get folded into `marks` so the cycle's sanity checks
-    validate the new legs rather than skipping them as unpriced.
-    """
-    tools = _tools()
-    if tools is None:
-        return False
-    portfolio, dex_price, _ = tools
-
-    try:
-        cfg = json.load(open(cfg_path))
-    except Exception:
-        return False
-    if portfolio.assets_from_config(cfg):
-        return False  # already has assets; nothing to seed
-
-    if random.random() >= REFLECTOR_INJECT_CHANCE:
-        return False
-
-    candidates = _next_candidate_assets(count)
-    if not candidates:
-        return False
-
-    base_size = float(cfg.get('trade_amount_usd') or 10.0)
-    injected = []
-    for candidate in candidates:
-        mark = dex_price.get_mark(candidate['spec'])
-        if not mark or mark <= 0:
-            print(f"  skipping {candidate['spec']}: no mark")
-            continue
-        # The band starts at the +/-2% seed_config gives the XLM leg, but is widened if
-        # this asset's own book is wide enough to eat it. A round trip inside the band
-        # earns (band - round_trip_cost); on the XLM book (8.7 bp) a 4% band keeps
-        # essentially all of it, but AQUA's book measured 151 bp round trip and ARS's 186
-        # bp, so a 4% band on those hands back a third to a half of every winning trade
-        # before anything else happens. BAND_COST_MULTIPLE keeps the round trip at most
-        # 1/N of the band, which on a thin asset simply means it trades less often and
-        # only on moves actually worth crossing for.
-        # Rounded to 9dp to match tweak_config's per-leg precision -- which is why the
-        # result has to be re-checked: several tracked assets mark below 1e-3, and one
-        # below ~5e-10 would round its band flat to 0.0 (or to buy == sell), failing
-        # _assets_are_sane and dragging the whole config into the fallback.
-        half_band = max(0.02, _leg_round_trip(candidate['spec']) * BAND_COST_MULTIPLE / 2)
-        buy_below = round(mark * (1 - half_band), 9)
-        sell_above = round(mark * (1 + half_band), 9)
-        if buy_below <= 0 or buy_below >= sell_above:
-            print(f"  skipping {candidate['spec']}: mark {mark!r} is too small to give "
-                  f"a representable threshold band")
-            continue
-        injected.append({
-            'code': candidate['code'],
-            'issuer': candidate['issuer'],
-            'buy_below': buy_below,
-            'sell_above': sell_above,
-            # Deliberately smaller than the XLM leg: these books are thin, which is
-            # what the revision prompt tells the model about extra assets too.
-            'trade_amount_usd': round(base_size / 4, 2),
-        })
-        if marks is not None:
-            marks[candidate['spec']] = mark
-
-    if not injected:
-        return False
-
-    cfg['assets'] = injected
-    try:
-        json.dump(cfg, open(cfg_path, 'w'), indent=2)
-    except Exception as e:
-        print(f'  could not write injected assets: {e}')
-        return False
-    print(f"  seeded {len(injected)} discovered asset(s): "
-          f"{', '.join(a['code'] for a in injected)}")
-    return True
-
-
-# The old name, kept because it is referenced in CLAUDE.md, default-assets.md and several
-# emperor_logs, and a future pass reading those should not find a NameError.
-_inject_reflector_assets = _inject_discovered_assets
-
-
 def inject_experiments(cfg_path, obs):
-    """The mechanical channels that introduce novelty a config could not invent. -> bool
+    """The mechanical channel that introduces novelty a config could not invent. -> bool
 
-    Two of them, and both must run: a spawn can legitimately get discovered assets and a
-    basis gate in the same cycle. `or` order therefore matters only for the return value,
-    which is "did anything change".
+    One of them now. This used to run two -- discovered extra assets and the basis gate --
+    and the asset half was removed with the rest of the extra-asset stack, so this is a
+    thin wrapper over _inject_basis_gate kept because DOMAIN.inject_experiments is a
+    contract member and because a second channel may well come back.
 
-    Only ever called for template-derived spawns. Clones inherit their parent's assets and
-    basis gate or absence of one, which is what makes a lineage stay in the arm it was
-    born into -- and that is the whole basis of basis_report.py's gated-vs-control read.
-
-    Before sanitize_config, so the picks go through the exact same verification gate an
-    LLM-chosen asset does.
+    Only ever called for template-derived spawns. Clones inherit their parent's basis gate
+    or absence of one, which is what makes a lineage stay in the arm it was born into --
+    and that is the whole basis of basis_report.py's gated-vs-control read.
     """
-    marks = obs.marks if obs is not None else None
-    injected = _inject_discovered_assets(cfg_path, marks, REFLECTOR_INJECT_COUNT)
-    return _inject_basis_gate(cfg_path) or injected
-
-
-def _assets_are_sane(cfg, marks):
-    """Validate the `assets` block. A missing mark is NOT a failure.
-
-    Failing the whole config over a transient Horizon blip would send the revision to
-    the random-tweak fallback and discard the model's work; sanitize_config drops
-    unpriceable legs instead.
-    """
-    tools = _tools()
-    if tools is None:
-        return True
-    portfolio = tools[0]
-
-    raw = cfg.get('assets')
-    if raw in (None, []):
-        return True
-    if not isinstance(raw, list) or len(raw) > portfolio.MAX_EXTRA_ASSETS:
-        return False
-
-    parsed = portfolio.assets_from_config(cfg)
-    if len(parsed) != len(raw):
-        return False       # something was malformed, duplicated, or was XLM
-
-    for asset in parsed:
-        mark = portfolio.mark_price((marks or {}).get(asset['spec']))
-        if not mark:
-            continue       # unpriceable right now; sanitize_config handles it
-        buy, sell = asset['buy_below'], asset['sell_above']
-        if buy <= 0 or sell <= 0 or buy >= sell:
-            return False
-        if buy < mark * 0.5 or sell > mark * 1.5:
-            return False
-    return True
+    return _inject_basis_gate(cfg_path)
 
 
 def _required_keys_are_sane(cfg, name=None):
@@ -1725,15 +1254,16 @@ def _basis_gate_is_sane(cfg):
 
 
 def config_is_sane(cfg, name, obs):
-    # Split into four so the smoke-test prep in prepare_smoke_config can ask the narrower
+    # Split apart so the smoke-test prep in prepare_smoke_config can ask the narrower
     # question it actually means (are the thresholds usable?) without a missing
     # schema_version causing it to overwrite thresholds the model deliberately chose.
+    # Three checks, not four: _assets_are_sane went with the extra-asset stack, and an
+    # `assets` key surviving on an inherited config is now sanitize_config's job to
+    # delete rather than a reason to reject an entire revision.
     price = obs.price if obs is not None else None
-    marks = obs.marks if obs is not None else None
     return (_required_keys_are_sane(cfg, name)
             and _thresholds_are_sane(cfg, price)
-            and _basis_gate_is_sane(cfg)
-            and _assets_are_sane(cfg, marks))
+            and _basis_gate_is_sane(cfg))
 
 
 # --------------------------------------------------------------------------------------
@@ -1798,9 +1328,7 @@ def prepare_smoke_config(cfg, obs):
     """Make `cfg` runnable for a 120s smoke run without masking a real config defect.
 
     Thresholds are validated separately; don't let a bad config mask a main.py that would
-    run fine once the fallback fixes them. The `assets` list is deliberately preserved
-    here -- stripping it would mean the smoke test never exercises the multi-asset path it
-    is supposed to be checking.
+    run fine once the fallback fixes them.
     """
     price = obs.price if obs is not None else None
     if price and not _thresholds_are_sane(cfg, price):
@@ -1816,9 +1344,11 @@ def check_smoke_state(raw, cfg, obs):
     as a clause and not a sentence.
 
     Negative balances and a non-positive net worth are the obvious failures. The third
-    one is not: a position in something the config does not declare means the strategy
-    traded an asset that was never admitted -- exactly what the asset gate exists to
-    prevent, so it fails the revision rather than being tidied away.
+    one is not: a position in anything the config does not declare. Since a config can no
+    longer declare anything but the XLM base leg, that check now reads "the strategy
+    opened a non-XLM position", which is precisely what a revision reaching around
+    execute_trade to reintroduce multi-asset trading would look like. Worth keeping for
+    that reason -- it is the gate that notices the removal being undone.
     """
     price = obs.price if obs is not None else None
     marks = obs.marks if obs is not None else None
@@ -1832,7 +1362,7 @@ def check_smoke_state(raw, cfg, obs):
             return False, f'main.py wrote a zero/negative net worth (usd={usd}, xlm={xlm})'
         return True, f'net worth {usd + xlm * price:.2f}'
 
-    portfolio = tools[0]
+    portfolio = tools
     st = portfolio.normalize_state(raw)
     usd = st['balance_usd']
     if usd < 0:
@@ -1846,7 +1376,8 @@ def check_smoke_state(raw, cfg, obs):
     undeclared = {s for s in undeclared
                   if float(st['positions'][s].get('amount') or 0) > 0}
     if undeclared:
-        return False, f'main.py holds undeclared asset(s): {", ".join(sorted(undeclared))}'
+        return False, (f'main.py holds non-XLM position(s): '
+                       f'{", ".join(sorted(undeclared))}; this domain trades XLM only')
 
     marks_for_check = dict(marks or {})
     marks_for_check.setdefault('XLM', price)
@@ -1936,7 +1467,6 @@ def seed_config(cfg_path, name, obs):
         except Exception:
             pass
     trade_amount_usd = existing.get('trade_amount_usd', 10.0)
-    existing_assets = existing.get('assets') or []
     # Start from whatever is already in the file rather than a fresh literal -- see the
     # same change in tweak_config for why. A template spawn reaching this fallback
     # has usually had a revision fail a gate, and any config knob that revision invented
@@ -1949,14 +1479,12 @@ def seed_config(cfg_path, name, obs):
         'buy_below': round(price * (1 - half_bp / 10000.0), 6),
         'sell_above': round(price * (1 + half_bp / 10000.0), 6),
         'trade_amount_usd': trade_amount_usd,
-        # Carried across explicitly rather than left to the dict copy above, because it
-        # used to hard-write [] -- which was fine while seeds were always XLM-only, but
-        # this runs in the `not revised` branch, exactly the case inject_experiments
-        # targets, so clearing it here would wipe every injected leg moments after it was
-        # written. Only the XLM thresholds are seeded; the extra legs already carry their
-        # own, derived from their marks.
-        'assets': existing_assets if isinstance(existing_assets, list) else [],
     })
+    # The dict copy above carries every key the file already had, which for an old
+    # lineage can include the retired `assets` list. sanitize_config removes it too, but
+    # this path writes the file afterwards in some orderings, so drop it here as well
+    # rather than depending on which of the two ran last.
+    new_cfg_data.pop('assets', None)
     json.dump(new_cfg_data, open(cfg_path, 'w'), indent=2)
 
 
@@ -2003,29 +1531,12 @@ def tweak_config(parent_cfg_path, new_cfg_path, new_name):
         'trade_amount_usd': parent.get('trade_amount_usd', 10.0)
     })
 
-    # Carry the parent's extra assets across, nudging each leg by its OWN factor so the
-    # fallback explores per-leg thresholds rather than moving every leg in lockstep.
-    # Never invents an asset: only assets the parent already had (and which
-    # sanitize_config re-verifies afterwards) can appear here.
-    inherited = []
-    for asset in (parent.get('assets') or []):
-        if not isinstance(asset, dict):
-            continue
-        leg_tweak = random.uniform(0.95, 1.05)
-        leg = dict(asset)
-        for key in ('buy_below', 'sell_above'):
-            try:
-                leg[key] = round(float(asset[key]) * leg_tweak, 9)
-            except (KeyError, TypeError, ValueError):
-                pass
-        inherited.append(leg)
-    # Explicit both ways, so the dict copy above cannot change what `assets` means: a
-    # parent whose assets value is empty or malformed produced a child with no `assets`
-    # key before this function copied the parent wholesale, and still does.
-    if inherited:
-        new_cfg_data['assets'] = inherited
-    else:
-        new_cfg_data.pop('assets', None)
+    # The `dict(parent)` above is what makes this the migration point for the retired
+    # `assets` key: a parent config written before the extra-asset stack was removed still
+    # carries one, and copying the parent wholesale is exactly how it would otherwise ride
+    # down the lineage forever. This used to carry the legs across with a per-leg random
+    # nudge; now it drops them.
+    new_cfg_data.pop('assets', None)
 
     json.dump(new_cfg_data, open(new_cfg_path, 'w'), indent=2)
     return True
@@ -2055,17 +1566,13 @@ def prompt_facts():
             sys.path.append('/opt/tools')
         import friction
         facts['xlm_round_trip_bp'] = friction.round_trip_bp('XLM')
-        facts['nonbase_round_trip_bp'] = round(friction.NONBASE_FLOOR * 2 * 10000, 1)
     except Exception:
         facts['xlm_round_trip_bp'] = 12.0
-        facts['nonbase_round_trip_bp'] = 100.0
     try:
         if '/opt/tools' not in sys.path:
             sys.path.append('/opt/tools')
         import stellar_trader
         facts['max_trade_usd'] = stellar_trader.MAX_TRADE_USD
-        facts['max_trade_usd_nonbase'] = stellar_trader.MAX_TRADE_USD_NONBASE
     except Exception:
         facts['max_trade_usd'] = 4.0
-        facts['max_trade_usd_nonbase'] = 0.50
     return facts

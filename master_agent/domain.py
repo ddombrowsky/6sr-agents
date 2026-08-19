@@ -45,7 +45,7 @@ sixth is one the list omits.
 
    `config_signature` is here because the loop dedupes the parents it clones, and "these
    two strategies are the same strategy" is a question only the domain can answer -- for
-   sdex it is the threshold band, the size, the assets and the basis gate. Ranking on a
+   sdex it is the threshold band, the size and the basis gate. Ranking on a
    signature the loop invented would silently spend both revision slots on one point.
 
    `obs` is whatever the domain wants -- the loop only ever tests `obs is None` and hands
