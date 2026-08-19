@@ -262,6 +262,24 @@ def _paper_fills(state, agent_name, row, since_ts, now_ts):
     filter and the "volume through our price" bound are all subtle enough that a second
     implementation would drift, and the whole value of the paper book is that it is
     comparable to the replay.
+
+    THE OBSERVE->REST LAG IS CHARGED HERE, and it has to be charged somewhere. The
+    backtest applies it in `maker_backtest._bucket_tape`, which drops every trade printed
+    within FILL_LAG_S of the book row a quote was priced from; `_fill_usd` itself takes a
+    tape and a price and knows nothing about when the quote appeared. So sharing the
+    matcher is not enough to share the model -- a paper book that hands `_fill_usd` the
+    raw window is running at lag 0, which is the one thing MAKER_PHASE1.md says a maker
+    backtest must not do. Over the phase-1 sample a 5 bp half-width is +$5.08 at lag 0 and
+    +$2.02 at lag 5: the difference is 60% of the entire measured edge, and it is the
+    difference between a comfortable result and a sliver.
+
+    Anchored on each offer's own `placed_ts`, not on `since_ts`. `since_ts` is the TAPE
+    watermark, which trails wall clock by however long ago the sync daemon last paged
+    Horizon, so a window starting there begins BEFORE the quote existed -- the paper book
+    was crediting fills to trades that printed while it was still deciding what to quote,
+    on top of not charging the lag at all. Per-offer rather than per-window because the
+    two sides are replaced independently and a partially filled offer keeps its original
+    placement time.
     """
     dex_trades, mbt, _ = _tools()
     if dex_trades is None or not row:
@@ -275,13 +293,24 @@ def _paper_fills(state, agent_name, row, since_ts, now_ts):
         return state, 0
     mid = row.get('dex_mid')
     filled = 0
+    # Read off maker_backtest so the two cannot drift apart silently; 0.0 only if that
+    # module ever drops the constant, in which case the old lag-0 behaviour is at least
+    # explicit rather than accidental.
+    lag_s = float(getattr(mbt, 'FILL_LAG_S', 0.0) or 0.0)
     for offer in list(state.get('open_offers') or []):
         side, price = offer.get('side'), float(offer.get('price') or 0.0)
         remaining = float(offer.get('usd') or 0.0)
         if side not in ('bid', 'ask') or price <= 0 or remaining <= 0:
             continue
+        # An offer written before this field existed falls back to the window start, which
+        # still charges the lag -- never to "no floor", which would restore the bug.
+        placed = float(offer.get('placed_ts') or 0.0)
+        floor = (placed if placed > 0 else since_ts) + lag_s
+        eligible = [t for t in tape if (t.get('ts') or 0.0) >= floor]
+        if not eligible:
+            continue
         ahead, _exact = mbt._queue_ahead(row, side, price, None)
-        got = mbt._fill_usd(side, price, remaining, ahead, tape)
+        got = mbt._fill_usd(side, price, remaining, ahead, eligible)
         if got <= 0:
             continue
         if side == 'bid':

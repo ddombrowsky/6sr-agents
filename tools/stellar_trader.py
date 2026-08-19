@@ -68,7 +68,7 @@ _USDC_SPEC = _USDC_ASSET
 # only by a human editing this file, which monitor.check_boundary_integrity() will
 # notice and halt live trading over until it is reviewed and re-baselined.
 MAX_TRADE_USD = 4.0                    # per trade, any asset
-MAX_DAILY_USD = 99999.0                # per 24h across ALL assets combined
+MAX_DAILY_USD = 2000.0                 # per 24h across ALL assets combined; see below
 MAX_TRADE_USD_NONBASE = 0.50           # per trade, non-XLM only
 MAX_DAILY_USD_PER_ASSET = 4.0          # per 24h per (code, issuer)
 MAX_POSITION_USD_PER_ASSET = 4.0       # mark-to-market cap on any one non-XLM leg
@@ -78,6 +78,32 @@ MAX_SYSTEM_TRUSTLINES = 3              # USDC + 2 discovered. BLND predates this
 MIN_XLM_OPERATING_BUFFER = 1.0         # spendable XLM that must survive a new trustline
 MAX_STUCK_USD = 2.0                    # total unsellable notional before a full halt
 _VERIFY_TTL = 900                      # re-verification cache in the hot path
+
+# MAX_DAILY_USD was 99999.0 from `72fc3f4 TEMP: max-daily isn't working` until 2026-08-18,
+# and MAKER.md's risk list asks for it to be a real number before phase 4: a maker books
+# far more fills per day than a taker, so this cap goes from dormant to load-bearing.
+#
+# Sized from the 48h paper run, not chosen for roundness. Each seed's BUY volume, scaled
+# from the paper quote size it actually ran to the live MAX_RESTING_USD_PER_SIDE of $4:
+#
+#   seed_maker04  $442/day      seed_maker02  $656/day
+#   seed_maker03  $543/day      seed_maker05  $748/day
+#   seed_maker00  $590/day      seed_maker01  $949/day
+#
+# So a live maker under the caps in this file transacts roughly $450-$950 of buys a day,
+# and 2000.0 is a little over twice the busiest of them. That is the intent: this is not
+# a position limit and must not be set as if it were one. Exposure is already bounded by
+# MAX_RESTING_USD_TOTAL ($8) and MAX_INVENTORY_SKEW_USD ($8), and a maker's buys are
+# matched by sells, so gross daily buy volume is turnover, not money at risk. What this
+# cap is for is the runaway: a requote loop that crosses the spread, or a fill-detection
+# bug that books the same bid over and over. Those hit $2000 in hours, and the bid stops.
+#
+# Consequence of picking a number at all: place_offer sizes a bid against the REMAINING
+# budget, so once the day's buys reach the cap the bid goes to zero and the strategy
+# quotes one-sided until the trailing 24h window rolls. That is a real behaviour change
+# from 99999.0, and it is the intended one -- but it means a cap set too tight looks like
+# a strategy that mysteriously stopped bidding, not like an alarm. Check
+# daily_spend_status() before concluding a quoter is broken.
 
 # --- maker caps (MAKER.md phase 2) -------------------------------------------------
 # Same rules as the block above: module-level, never caller-supplied, never readable from

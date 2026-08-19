@@ -234,6 +234,85 @@ check('null never quotes inside the arithmetic floor',
       mb.constant_width_quoter({'half_width_bp': 0.0})(
           {'mid': 0.1583}, {}, {})['bid'][0] < 0.1583)
 
+# -------------------------------------------------- the paper book charges the fill lag
+# Fourth member of the silent-failure family in the module docstring, and the one that
+# went unnoticed longest. quote_executor._paper_fills shares maker_backtest's MATCHER
+# (_fill_usd) but the lag lives one level up, in _bucket_tape, which _paper_fills does not
+# call. So the paper book ran at lag 0 while every backtest number it was compared against
+# was charged 5 s -- and per MAKER_PHASE1.md's lag table that is 60% of the edge at a 5 bp
+# half-width (+$5.08 vs +$2.02). Nothing crashed; the leaderboard simply reported an edge
+# that a live account would not have earned.
+#
+# The window is [placed_ts + FILL_LAG_S, ...) per offer, so the fixtures below straddle
+# that boundary at 4.9 s and 5.1 s rather than testing a comfortable midpoint.
+
+import types
+
+import quote_executor as _qe
+
+_LAG_ROW = {'dex_mid': 0.155, 'dex_bid': 0.1549, 'dex_ask': 0.1551,
+            'bid_cum': [[1, 0.0]], 'ask_cum': [[1, 0.0]]}
+_LAG_T = 1_000_000.0
+
+
+def _lag_fills(trade_offsets, placed_ts=_LAG_T):
+    """Fills booked when the only tape is aggressor sells at these offsets from _LAG_T.
+
+    Each trade is a $50 sell through a $20 bid resting at 0.1549 with an empty ladder in
+    front of it, so absent the lag every one of them fills the quote outright -- the only
+    thing that can hold a fill back here is the lag floor.
+    """
+    tape = [{'ts': _LAG_T + off, 'price': 0.1548, 'usd': 50.0, 'taker_side': 'sell'}
+            for off in trade_offsets]
+    real_tools, real_log = _qe._tools, _qe.record_trade
+    _qe._tools = lambda: (types.SimpleNamespace(get_trades=lambda **kw: tape), mb, None)
+    _qe.record_trade = lambda *a, **k: None   # keep the selftest out of /opt/trades
+    try:
+        state = _qe._normalize({'balance_usd': 1000.0, 'positions': {}, 'open_offers': [
+            {'offer_id': None, 'side': 'bid', 'price': 0.1549, 'usd': 20.0,
+             'amount_xlm': 129.1, 'placed_ts': placed_ts}]})
+        state, n = _qe._paper_fills(state, '_selftest', _LAG_ROW, _LAG_T, _LAG_T + 30)
+        return n, round(1000.0 - float(state['balance_usd']), 4)
+    finally:
+        _qe._tools, _qe.record_trade = real_tools, real_log
+
+
+check('the paper book reads its lag from maker_backtest', mb.FILL_LAG_S == 5.0,
+      str(mb.FILL_LAG_S))
+check('a trade 1s after the quote was placed does not fill it',
+      _lag_fills([1.0]) == (0, 0.0), str(_lag_fills([1.0])))
+check('a trade just inside the lag (4.9s) does not fill',
+      _lag_fills([4.9]) == (0, 0.0), str(_lag_fills([4.9])))
+check('a trade just outside the lag (5.1s) does fill',
+      _lag_fills([5.1]) == (1, 20.0), str(_lag_fills([5.1])))
+# The pair matters on its own: _fill_usd sums volume_total across the tape it is handed,
+# so a lag that filtered nothing would let the 1s trade help consume the queue ahead even
+# if it could not fill directly. Both trades excluded means the tape itself was filtered.
+check('a trade inside the lag is excluded from the tape, not just from the fill',
+      _lag_fills([1.0, 20.0]) == (1, 20.0), str(_lag_fills([1.0, 20.0])))
+check('an offer with no placed_ts still gets the lag charged from the window start',
+      _lag_fills([2.0], placed_ts=0.0) == (0, 0.0),
+      str(_lag_fills([2.0], placed_ts=0.0)))
+check('an offer with no placed_ts fills past the window start plus the lag',
+      _lag_fills([8.0], placed_ts=0.0) == (1, 20.0),
+      str(_lag_fills([8.0], placed_ts=0.0)))
+
+# ------------------------------------------------------- the daily cap is a real number
+# MAKER.md's risk list: MAX_DAILY_USD sat at 99999.0 from `72fc3f4 TEMP` and a maker books
+# far more fills per day than a taker. Pinned as "not the TEMP value" rather than as an
+# exact figure -- the number is a human sizing decision (see the note beside it in
+# stellar_trader.py) and should be re-sized as the caps move, but it must never go back to
+# a value that means "no cap".
+import stellar_trader as _st
+
+check('MAX_DAILY_USD is not the TEMP placeholder', _st.MAX_DAILY_USD < 99999.0,
+      str(_st.MAX_DAILY_USD))
+check('MAX_DAILY_USD leaves room for a day of maker turnover at the resting cap',
+      _st.MAX_DAILY_USD >= 100 * _st.MAX_RESTING_USD_PER_SIDE,
+      f'{_st.MAX_DAILY_USD} vs {_st.MAX_RESTING_USD_PER_SIDE}')
+check('the daily budget is reported against the same cap it enforces',
+      _st.daily_spend_status()['cap_usd'] == _st.MAX_DAILY_USD)
+
 # ------------------------------------------------------------------------------ done
 
 if _failures:
