@@ -121,6 +121,21 @@ SCORE_SCALE = 1000.0
 # weeks. These are round numbers scaled down for that reason, not fit to a real run --
 # revisit exactly like domain_forecast.py's own comment says to, once Phase 1 has run
 # long enough to know the real resolved-forecast rate.
+#
+# THE UNIT THESE COUNT CHANGED. kalshi_recorder.cumulative_brier() used to return a count
+# of resolved forecast ROWS; it now returns resolved (ticker, hour) BUCKETS. Both
+# constants are denominated in whatever that count is, so the same numbers are much
+# stricter than they were -- measured on Phase 1's logs at the time of the change, the
+# population's counts fell ~14x (e.g. 1790 rows -> 124 bucket-hours over 73 settled
+# markets; the ceiling is 24 buckets per market-day, but a strategy rotating
+# markets_per_tick spends only a couple of hours on each). Consequences: the prior now
+# actually shrinks a thin record (it was getting ~1% weight against inflated counts,
+# versus the ~20% it was written for), CONFIDENCE_CAP is no longer saturated by every
+# strategy older than two days, and scores compressed from a ~1500 top end to ~1060.
+# That is the intended direction, but it has not been tuned against a full run under the
+# new unit -- when revisiting, note that a count of 300 bucket-hours is on the order of
+# 150 resolved markets, not 300 of anything independent (see cumulative_brier()'s closing
+# note on clustering).
 CONFIDENCE_PRIOR_N = 20.0
 CONFIDENCE_CAP = 300.0
 
@@ -129,12 +144,30 @@ CONFIDENCE_CAP = 300.0
 # a real order.
 SMOKE_ENV = {}
 
-OBSERVE_FAILURE_NOTE = 'Could not reach the Kalshi API, or no open markets in DEFAULT_CATEGORY right now'
+OBSERVE_FAILURE_NOTE = 'Could not reach the Kalshi API'
 
 REPLAY_WINDOW = 'a fixed set of already-resolved Kalshi markets (see kalshi_backtest.N_MARKETS)'
 # Not literally "days" -- kept positive and truthy for the same reason
 # domain_forecast.REPLAY_DAYS is. The real window size lives in kalshi_backtest.N_MARKETS.
 REPLAY_DAYS = 1
+
+# How many series observe() looks at when counting what is open. NOT a reachability
+# knob -- reachability is kalshi_api.ping() now -- purely how representative
+# Observation.market_count is.
+#
+# This was 3, and that was a bug worth remembering: DEFAULT_CATEGORY resolves to ~111
+# daily series, there is no server-side "every open market in category X" call (see
+# kalshi_api's module docstring), and list_open_markets therefore walks series in the
+# API's own fixed order. The first three it returns -- KXHIGHTWSSS, KXLOWTZBAA,
+# KXLOWTEHAM -- happen to have nothing open; the first series that does sits at index 3,
+# one past the old cutoff. Because list_series is cached for 6h that ordering is frozen,
+# so the miss was not intermittent: a live run logged 20 observation failures in 20
+# cycles (2026-08-18), i.e. the loop scored, culled and cloned nothing for hours while
+# kalshi_recorder.py -- which happens to use max_series=8 and so reaches live series --
+# kept writing 32 rows every 5 minutes. Widening the scan is the fix; 25 covers a real
+# sample of the category at ~4s per cycle under kalshi_api's 0.15s rate limit, which is
+# nothing against a 300s cycle.
+OBSERVE_MAX_SERIES = 25
 
 MAX_MARKETS_PER_TICK = 20
 MAX_CONFIDENCE_GAIN = 3.0
@@ -224,14 +257,27 @@ def observe():
     make the very first cycle after a restart fail with 'no observation' every time,
     the same trap this would fall into if domain_sdex.observe() read market_recorder's
     log instead of calling price_feed.get_price() directly. kalshi_api itself has its
-    own short cache (30s) and doesn't depend on the recorder daemon's timing at all."""
+    own short cache (30s) and doesn't depend on the recorder daemon's timing at all.
+
+    REACHABILITY AND ACTIVITY ARE TWO DIFFERENT QUESTIONS -- do not re-merge them.
+    Returning None halts the whole cycle, so it must mean exactly one thing: the API
+    could not be reached, and nothing this cycle would compute can be trusted. It must
+    NOT mean "no market is open right now." Those were the same test until 2026-08-18
+    (see OBSERVE_MAX_SERIES for how that failed), but they are not the same fact, and an
+    empty category is not a reason to skip a cycle: score_path() reads resolved outcomes
+    out of kalshi_recorder's append-only log, so ranking, culling, revision and promotion
+    are all perfectly computable on a quiet market. A quiet DEFAULT_CATEGORY now yields a
+    real Observation with market_count == 0 and the loop runs normally.
+
+    ping() is the reachability half deliberately, rather than list_series(), whose answer
+    is cached 6h and so cannot distinguish a live API from a stale copy of one."""
     api = _kalshi_api()
     if api is None:
         return None
-    markets = api.list_open_markets(category=DEFAULT_CATEGORY, frequency='daily',
-                                    max_series=3, limit_per_series=10)
-    if not markets:
+    if not api.ping():
         return None
+    markets = api.list_open_markets(category=DEFAULT_CATEGORY, frequency='daily',
+                                    max_series=OBSERVE_MAX_SERIES, limit_per_series=10)
     return Observation(ts=time.time(), market_count=len(markets))
 
 
@@ -257,7 +303,7 @@ def decode_observation(text):
 
 def observation_line(obs):
     if obs is None:
-        return 'No observation for this cycle (Kalshi API unreachable, or nothing open).\n'
+        return 'No observation for this cycle (Kalshi API unreachable).\n'
     return (f'Kalshi API reachable: {obs.market_count} open, liquid market(s) in '
             f'{DEFAULT_CATEGORY!r} right now.\n')
 
@@ -690,13 +736,19 @@ def report_activity(performances, limit=None):
         if not made:
             continue
         count, mean_brier, mean_market_brier = rec.cumulative_brier(name)
-        rows.append((name, made, count, mean_brier, mean_market_brier))
+        # Distinct settled markets, printed alongside the bucket count because it is the
+        # number that says how much this track record is actually worth -- a strategy
+        # with 300 scored hours over 12 markets has seen 12 outcomes. getattr for the
+        # case where a deployed recorder predates resolved_markets().
+        markets = getattr(rec, 'resolved_markets', lambda _n: 0)(name)
+        rows.append((name, made, count, markets, mean_brier, mean_market_brier))
     if not rows:
         return
     print('Kalshi forecasts (resolved mean Brier vs. the market it saw, lower is better):')
-    for name, made, count, mean_brier, mean_market_brier in rows:
+    for name, made, count, markets, mean_brier, mean_market_brier in rows:
         if count:
-            print(f'  {name}: {made} forecast(s), {count} resolved, '
+            print(f'  {name}: {made} forecast(s), {count} scored hour(s) over '
+                  f'{markets} settled market(s), '
                   f'brier={mean_brier:.4f} vs market={mean_market_brier:.4f}')
         else:
             print(f'  {name}: {made} forecast(s), none resolved yet')

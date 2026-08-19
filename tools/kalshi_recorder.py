@@ -76,9 +76,17 @@ market_recorder.py's docstring) -- so a forecast entry is never mutated in place
 its outcome becomes known. Instead kalshi_reconcile.py appends a SEPARATE 'resolution'
 row once Kalshi settles a ticker, and cumulative_brier() joins the two row types by
 ticker in memory. One resolution row settles every forecast row ever logged against that
-ticker, including a strategy that forecast the same market more than once across ticks --
-each such bet is independently judged against the p_market it saw at the time, which is
-the point.
+ticker, including a strategy that forecast the same market more than once across ticks.
+
+Those repeat rows are NOT independent bets, and cumulative_brier() no longer scores them
+as if they were -- it collapses them to one observation per (ticker, wall-clock hour)
+first. This paragraph used to claim the opposite ("each such bet is independently judged
+against the p_market it saw at the time, which is the point"); that was wrong, and it was
+wrong in the direction that quietly inflates score. Every row does still record the
+p_market it saw at the time, which is what makes the frozen-price comparison honest --
+but a market that settles once is one outcome no matter how many times it was forecast.
+See cumulative_brier()'s docstring for what the inflation cost in practice and why the
+bucket is an hour rather than a whole market.
 """
 import json
 import os
@@ -96,6 +104,14 @@ FORECAST_LOG_DIR = Path('/opt/trades')   # per-strategy <name>.log, same dir dom
                                           # and domain_forecast.py already use
 
 RECORD_INTERVAL = 300   # 5 min -- daily-cadence markets don't need 60s granularity
+
+# Scoring granularity: cumulative_brier() collapses a strategy's forecast rows to one
+# observation per (ticker, wall-clock hour) before scoring them. Read that function's
+# docstring before changing this -- it is not a display setting, it is the unit of
+# evidence domain_kalshi._shrunk_edge weights, and both an hour-sized bucket and the
+# mean-within-bucket are chosen for stated reasons. Absolute epoch hours, not hours since
+# a strategy's first forecast, so two strategies' buckets line up with each other.
+BUCKET_SECONDS = 3600
 
 DEFAULT_CATEGORY = 'Climate and Weather'
 DEFAULT_FREQUENCY = 'daily'
@@ -316,14 +332,60 @@ def submit_forecast(name, ticker, p_hat):
 
 
 def cumulative_brier(name):
-    """(resolved_count, mean_strategy_brier, mean_market_brier) over every forecast
-    `name` has logged whose ticker has since been resolved by kalshi_reconcile.py.
+    """(resolved_bucket_count, mean_strategy_brier, mean_market_brier) over `name`'s
+    forecasts whose ticker has since been resolved by kalshi_reconcile.py, collapsed to
+    one observation per (ticker, wall-clock hour) -- see BUCKET_SECONDS.
 
     (0, None, None) if none are resolved yet -- forecasts made but not yet settled are
     NOT zero evidence, they are no evidence, the same distinction
-    forecast_engine.cumulative_brier draws. Deliberately the same return shape as that
-    function so domain_kalshi.score_path can be a near-literal copy of
-    domain_forecast.score_path.
+    forecast_engine.cumulative_brier draws. Deliberately the same 3-tuple return shape as
+    that function, so domain_kalshi.score_path stays a near-literal copy of
+    domain_forecast.score_path -- but the first element does NOT mean the same thing in
+    the two domains, and domain_kalshi's CONFIDENCE_PRIOR_N/CONFIDENCE_CAP are set
+    against THIS meaning. forecast_engine's questions resolve instantly, one outcome per
+    forecast, so there a count of forecasts IS a count of independent evidence. Here it
+    is not, and that is what the bucketing fixes.
+
+    WHY THE BUCKET, AND WHY THE MEAN INSIDE IT
+    ==========================================
+    A strategy on a 60s tick loop re-forecasts the same open market until it settles, and
+    kalshi_reconcile.py's single resolution row settles every one of those rows at once.
+    Scored per row, a single daily weather market contributes ~1440 observations that all
+    resolve against the SAME outcome. That is not 1440 pieces of evidence, and treating
+    it as such does not merely inflate a display number: `count` is what
+    domain_kalshi._shrunk_edge uses both as the denominator of its shrink-toward-the-
+    market prior and as its volume weight, so the inflation buys real score. Observed in
+    Phase 1's first long run: the top strategy's 1790 "resolved forecasts" were 73
+    resolved markets, its shrinkage prior got 1.1% weight instead of the intended ~21%,
+    and every strategy older than a couple of days sat pinned at CONFIDENCE_CAP, where
+    the cap can no longer discriminate between them.
+
+    The bucket is one hour rather than one market on purpose. Collapsing a whole market
+    to a single mean p_hat integrates over its entire life, and for squared error
+    `mean_i (p_i - o)^2 == (p_bar - o)^2 + Var(p_i)` -- so a whole-market collapse drops
+    the variance term from both sides, and with it every trace of WHEN a forecast was
+    made. This domain's template strategy is a drift-follower: leading the market by an
+    hour and lagging it by an hour produce nearly the same whole-market mean, so a
+    whole-market collapse would integrate out the exact signal the population exists to
+    express. An hour is short enough to keep that visible and long enough to remove the
+    tick-rate inflation (24 observations per market-day, not 1440) -- and it stops
+    `markets_per_tick`/TICK_SECONDS, which are config knobs rather than skill, from
+    buying score.
+
+    Averaging p_hat and p_market WITHIN the bucket (rather than sampling one row) keeps
+    the pairing intact: both sides are summarized over the same rows, so the comparison
+    stays like-for-like. Do not "simplify" this to first-row-in-bucket or last-row-in-
+    bucket; measured on the Phase 1 logs, first-reading scoring is positive for every
+    strategy and last-reading scoring is negative for every strategy (t ~ -2.2 across the
+    board), because the market has converged toward the outcome by settlement and a
+    drift-follower extrapolates past it. Those schemes measure where you sampled the
+    convergence curve, not who forecast better.
+
+    NOT a significance test. Buckets within one ticker are still correlated -- they share
+    an outcome -- so 24 buckets are not 24 independent draws either. Anything that needs
+    a real standard error (a Phase 2 promotion gate, above all) must cluster on distinct
+    resolved tickers, which is a smaller number than this one and is not what this
+    function returns.
     """
     log_path = FORECAST_LOG_DIR / f'{name}.log'
     if not log_path.exists():
@@ -340,27 +402,69 @@ def cumulative_brier(name):
                 except Exception:
                     continue
                 if row.get('type') == 'resolution' and row.get('ticker'):
-                    outcomes[row['ticker']] = row.get('outcome')
+                    try:
+                        outcomes[row['ticker']] = float(row.get('outcome'))
+                    except (TypeError, ValueError):
+                        continue
                 elif row.get('type') == 'forecast':
                     forecasts.append(row)
     except Exception:
         return 0, None, None
-    count = 0
-    s_sum = m_sum = 0.0
+    # (ticker, hour) -> [rows, sum p_hat, sum p_market, outcome]
+    buckets = {}
     for row in forecasts:
         outcome = outcomes.get(row.get('ticker'))
         if outcome is None:
             continue
         try:
-            outcome = float(outcome)
-            s_sum += (float(row['p_hat']) - outcome) ** 2
-            m_sum += (float(row['p_market']) - outcome) ** 2
+            ts = float(row['timestamp'])
+            p_hat = float(row['p_hat'])
+            p_market = float(row['p_market'])
         except (TypeError, ValueError, KeyError):
             continue
-        count += 1
-    if count == 0:
+        acc = buckets.setdefault((row['ticker'], int(ts // BUCKET_SECONDS)),
+                                 [0, 0.0, 0.0, outcome])
+        acc[0] += 1
+        acc[1] += p_hat
+        acc[2] += p_market
+    if not buckets:
         return 0, None, None
+    s_sum = m_sum = 0.0
+    for rows, hat_sum, market_sum, outcome in buckets.values():
+        s_sum += (hat_sum / rows - outcome) ** 2
+        m_sum += (market_sum / rows - outcome) ** 2
+    count = len(buckets)
     return count, s_sum / count, m_sum / count
+
+
+def resolved_markets(name):
+    """Distinct resolved tickers behind cumulative_brier()'s count -- the honest
+    denominator for any standard error, per that function's closing note. Kept separate
+    because it is NOT interchangeable with the score's count: bucket-hours are what
+    _shrunk_edge weights, tickers are what a significance test may cluster on."""
+    log_path = FORECAST_LOG_DIR / f'{name}.log'
+    if not log_path.exists():
+        return 0
+    outcomes = set()
+    forecast_tickers = set()
+    try:
+        with log_path.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not row.get('ticker'):
+                    continue
+                if row.get('type') == 'resolution':
+                    outcomes.add(row['ticker'])
+                elif row.get('type') == 'forecast':
+                    forecast_tickers.add(row['ticker'])
+    except Exception:
+        return 0
+    return len(outcomes & forecast_tickers)
 
 
 def forecasts_made(name):

@@ -198,6 +198,23 @@ def get_resolved(ticker):
     return {'ticker': ticker, 'result': market['result'], 'close_time': market.get('close_time')}
 
 
+def ping():
+    """True if a live, uncached request to the API succeeds -- the reachability half of
+    domain_kalshi.observe().
+
+    Deliberately NOT routed through list_series(): that answer is cached for
+    _SERIES_CACHE_TTL (6h), so it cannot tell a reachable API from a stale copy of one,
+    which is precisely the distinction a reachability probe exists to make. limit=1 keeps
+    it to a single cheap request through the same rate limiter every other caller uses.
+    """
+    try:
+        _get('/series', {'limit': 1})
+        return True
+    except Exception as e:
+        print(f'[kalshi_api] ping: {e}')
+        return False
+
+
 def list_series(category=None, frequency=None, max_pages=20):
     """[{ticker, title, category, frequency}, ...] -- the only call that actually
     filters by category (see module docstring). Cached hours at a time."""

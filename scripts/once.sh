@@ -17,7 +17,7 @@ export CYCLE_SLEEP=14400
 # comment this out to use ollama if you have any credits left -- irrelevant while
 # REVISION_MODE=manual below, since that path never calls the model, but left set so
 # switching back to auto mode doesn't silently start spending Ollama cloud credits again
-#export MASTER_AGENT_MODEL=qwen
+export MASTER_AGENT_MODEL=gpt
 
 # Revise by hand through Claude Code instead of the local model: monitor.py dumps the
 # revision prompt to /opt/emperor_logs/pending_revision.md and blocks the whole cycle
@@ -26,7 +26,7 @@ export CYCLE_SLEEP=14400
 #export REVISION_MODE=manual
 
 date > $LOG
-#touch /opt/.monitor.py.exit
+touch /opt/.monitor.py.exit
 # Piped through tee rather than redirected straight to $LOG: under REVISION_MODE=manual
 # the cycle can pause and print a banner asking for action (what to read, what command
 # to run to resume) -- that has to reach this terminal, not just the log file, or
