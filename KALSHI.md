@@ -6,7 +6,130 @@ markets." This doc is the engineering breakdown of that one line, grounded in th
 `master_agent/domain.py` contract and the `domain_forecast.py` implementation that
 preceded it — not a redesign of either.
 
+## OUTCOME — closed 2026-08-18. Not a viable domain for profit.
+
+**Everything below this section is the plan as written on 2026-08-10, kept as history.**
+Phases 0 and 1 shipped essentially as specified; Phase 2 was never started and **should
+not be**. The live run on `ssr_agent01` ran ~7 days (2026-08-11 → 2026-08-18) and was
+stopped deliberately. Do not spend further time refining `domain_kalshi.py`, its scoring,
+or the population in the expectation that money comes out of it. It does not, and the
+reason is structural rather than a tuning problem.
+
+**The machinery is not what failed.** The domain contract carried a third domain with none
+of sdex's furniture, `monitor.py` ran it for a week with no special-casing, and
+`selftest_domain.py` guarded the swap. This is a negative result about the *market*, not
+about the loop. That distinction is the reusable part.
+
+### 1. No persistent edge ever existed — the leaderboard was measuring noise
+
+The six highest-scoring strategies of the whole run peaked at scores of 1314–1650, which
+implied Brier edges of +0.006 to +0.013 over the frozen market price. Now that each has
+180–224 resolved `(ticker, hour)` buckets, every one of them sits between **−0.0003 and
+−0.0007** — i.e. slightly *worse* than simply parroting the market. The peaks were
+small-sample flukes that regressed past zero as evidence accumulated. The strategy leading
+at shutdown (`clone_baa3c857e802`, score 1034.24) had an edge of +0.0010 over 48 buckets,
+which is the same story caught earlier in its life.
+
+This is the same noise domination `domain_forecast.py`'s run showed. Here it is worse,
+because Kalshi markets resolve on a scale of hours-to-days, so the evidence needed to tell
+skill from luck accumulates far more slowly than the loop's cull cadence.
+
+### 2. Even a perfect forecast would not have paid — friction exceeds the mispricing
+
+Calibration of `last_price` against realized outcomes, snapshotted ≥6h before close over
+234 resolved markets: every band is calibrated to within its own noise. The only band with
+a real sample (px ≤ 0.05, n=139) is mispriced by **1.4¢** — the classic favourite-longshot
+bias, in the expected direction.
+
+Against that 1.4¢ of available gross edge:
+
+- Kalshi taker fee `ceil(0.07 × C × P × (1−P))` is **≥1¢ per contract**.
+- Median bid/ask spread at forecast time is **1.0¢** (mean 3.2¢).
+
+So the bias is real, decades-documented, publicly known — and still unharvested, because
+harvesting it costs more than it pays. Backtested net of both frictions: "sell longshots"
+−0.5%, "buy NO on everything" −4.3% to −7.1%, "buy YES on everything" −12% to −13%. ("Buy
+favourites" showed +3–6% on n=2–11, which is noise, not a finding.)
+
+Reconstructing the leader as if it had traded for real (1 contract per market, hold to
+settlement): filling at last price with no fees, −$0.12 on $3.12 staked; crossing the
+spread and paying fees, **−$1.61 on $5.61 staked, −28.7%**. All eight live strategies came
+out between −5% and −39% on realistic fills. A positive Brier edge and a negative P&L at
+the same time is not a contradiction — it is the whole lesson.
+
+### 3. The genome had no information the price did not already contain
+
+`decide(market, history, state, config)` receives one market row and the strategy's own
+past `implied_prob` readings for that ticker. That is it. It is technical analysis on a
+price series, and the inputs are a strict subset of what the price already reflects. No
+rule over those inputs can have a positive expected edge against the market that produced
+them. Evolution can select noise from such a population, but it cannot manufacture
+information — which is exactly what §1 shows it did.
+
+This is the root cause. §1 and §2 are consequences.
+
+### 4. The scoring objective was never profit
+
+`score_path()` ranks on shrunk Brier edge versus the frozen market price. That is a proper
+scoring rule and it is correctly implemented — but it is not P&L, and the two came apart
+in practice (§2). Optimising it harder selects for parroting the market with small
+deviations, which is precisely what the population converged on: the leader reproduced
+`p_market` exactly on 76.6% of its rows, and deviated by a median of 1.2¢ when it did
+deviate — against a 1.0¢ spread and a ≥1¢ fee.
+
+If this domain is ever revived, score net-of-friction P&L instead. That is a contained
+change (the forecast row would need `yes_bid`/`yes_ask` frozen alongside `p_market`, which
+`.kalshi_market_history.jsonl` already records per poll), and it makes "do not trade" a
+representable action. **It does not create an edge** — it only stops the loop rewarding a
+metric uncorrelated with the goal.
+
+### 5. Capacity ceiling — the prize was never large
+
+Across the recorded Climate-and-Weather dailies: median market volume **647 contracts**,
+p90 6,648, median open interest 529. Even a fat 5% net edge on a p90-sized market is tens
+of dollars. These markets cannot support a meaningful return regardless of skill, which is
+worth weighing before any future effort is spent here.
+
+### What would have to be true to revisit this — and what is explicitly deferred
+
+The 1.0¢ median spread on daily weather markets is itself the tell: something is standing
+there quoting both sides tightly, and it is almost certainly a professional operation
+already pricing the same free NWS data any strategy here would scrape. Out-forecasting it
+on public information is not a realistic plan. Three things could change the picture, in
+descending order of realism:
+
+1. **Market making — the one worth coming back to, but NOT now.** Structurally different
+   from everything attempted here: the spread we measured as a *cost* is somebody's
+   *revenue*, and the edge requires no forecast at all. Kalshi maker fees are zero or
+   near-zero on most series (verify before relying on it), which inverts the arithmetic
+   that killed §2. It needs Phase 2 signed execution, resting-order management, and an
+   adverse-selection model — none of which can be backtested from the data this run
+   produced, since we only ever recorded top-of-book snapshots at a 300s cadence.
+   **Deliberately deferred.** Revisit as its own design exercise, not as a revision of
+   this plan; nothing in Phase 2 below is the right starting point for it.
+2. **Exogenous information** the market has not yet priced — for weather dailies, NWS/NDFD
+   gridded forecasts or METAR observations. This is the only route that creates a
+   *forecasting* edge, and it is also the one most likely already occupied (see above).
+3. **Under-covered markets.** The useful question was never "what do we know that the
+   market maker doesn't," but "which markets is nobody bothering to quote." That is a
+   different search, and the capacity ceiling in §5 applies to it doubly.
+
+### What the run left behind, and what was preserved
+
+Stopped cleanly on 2026-08-18: `emperor` stopped via supervisor, 22 strategy processes
+wound down through `strat_manager.py stopall`, both Kalshi daemons killed, watched repos
+verified clean. Nothing was deleted. Still on disk under `v/`: 125 strategy directories,
+`trades/*.log` (307 resolved tickers), `.kalshi_market_history.jsonl` (39,251 poll rows,
+238 resolved markets with full bid/ask history) and `emperor_logs/`. That dataset is the
+one durable asset this run produced — any future analysis of Kalshi weather pricing should
+start from it rather than re-recording.
+
+---
+
 ## Status this plan assumes
+
+*(Historical — this section describes what was true on 2026-08-10, before the run. See
+OUTCOME above for how it turned out.)*
 
 - The domain-plugin architecture (`domain.py`, `domain_sdex.py`, `domain_null.py`) is
   built and self-tested (`selftest_domain.py`, 414 checks).
@@ -271,6 +394,11 @@ alone; that's the whole point of the reconciliation job.
 
 ### Phase 2 — real execution (real money, later, separate decision)
 
+> **NOT STARTED, AND NOT TO BE STARTED.** Superseded by OUTCOME above: Phase 1 produced
+> no edge, so the validation this phase was explicitly gated on never landed. Kept for the
+> record. If market making is ever revisited (OUTCOME item 1), design it fresh — a
+> taker-shaped execution path is the wrong starting point for a maker strategy.
+
 Not designed in detail here — sequencing note only, gated on Phase 1's validation
 actually landing:
 
@@ -298,6 +426,11 @@ actually landing:
 
 ## Open risks worth tracking, not solving up front
 
+*(Historical. The thin-market risk below was handled by `kalshi_recorder.py`'s MIN_VOLUME
+floor and did not bite. The risk that actually killed the domain — that a well-made market
+leaves no edge for a price-only genome — is not on this list, which is the most useful
+thing about it.)*
+
 - **Thin-market gaming risk**, same shape as `dex_price.py`'s mid-price warning: a
   strategy could favor markets with wide spreads/low volume where the mark-to-market
   proxy is noisy, then look skilled by construction. Filter Phase 1's market selection by
@@ -314,6 +447,9 @@ actually landing:
   for it; don't treat it as a footnote to `domain_kalshi.py` itself.
 
 ## Recommended order
+
+*(Historical. Steps 1–6 were completed; step 7 was correctly never reached, because step 6's
+bar was not cleared — see OUTCOME above.)*
 
 1. Phase 0 spike (endpoint confirmation, category selection, rate-limit sanity check) —
    no committed code, answers change the plan above.
