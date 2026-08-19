@@ -6,3 +6,7 @@ __pycache__
 *.cache.json
 .kalshi_cache.json
 .kalshi_backtest_set.json
+.asset_price_cache.json
+.asset_universe_cache.json
+.asset_verify_cache.json
+.price_history_cache.json
