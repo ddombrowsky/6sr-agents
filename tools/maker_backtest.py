@@ -43,8 +43,10 @@ import json
 import os
 import time
 
+import assets
 import dex_trades
 import market_recorder
+import portfolio
 
 START_USD = 1000.0          # same starting capital backtest.py uses, for comparability
 
@@ -96,6 +98,26 @@ FILL_LAG_S = 5.0
 # ---------------------------------------------------------------------------
 # book helpers
 # ---------------------------------------------------------------------------
+
+def _spread_bp(row):
+    """The book's width in bp, derived when the recorder stored None.
+
+    market_recorder writes `spread_bp = ... if book.get('spread_pct') else None`, so a
+    LOCKED book -- bid == ask, spread exactly 0, which this book does a handful of times a
+    week -- is recorded as None rather than as 0.0. Handing that None to quote() is not a
+    cosmetic wart: a strategy writing the documented-correct
+    `float(book.get('spread_bp', 0.0))` still raises, because the key IS present and the
+    default therefore never applies, and a raising quote() stands the maker down for that
+    tick. Derive it from the touch, which _load_rows has already guaranteed on every row.
+    """
+    value = row.get('spread_bp')
+    if value is not None:
+        return float(value)
+    bid, ask, mid = row.get('dex_bid'), row.get('dex_ask'), row.get('dex_mid')
+    if not (bid and ask and mid):
+        return 0.0
+    return round((ask - bid) / mid * 10000.0, 2)
+
 
 def _levels(row, side):
     """The recorded ladder for `side` as [(price, usd)], best first, or [] if absent."""
@@ -575,6 +597,22 @@ def replay(strategy_dir=None, days=7, spec='XLM', config=None, quote_fn=None,
     max_inventory = _cfg(config, 'max_inventory_usd', 400.0)
 
     balance_usd, balance_xlm = START_USD, 0.0
+
+    # ONE state dict for the whole replay, mutated in place and NEVER rebuilt. main() calls
+    # load_state() once and hands quote() that same dict every tick, so a strategy that
+    # carries anything across ticks -- a spread EMA, a price history, an RSI window -- only
+    # replays as the thing that runs live if this dict survives here too. Rebuilding it per
+    # requote replayed a memoryless variant of the strategy and then scored THAT, which is
+    # the same failure as importability_report's fallback: confident-looking numbers for
+    # code that is not the code under test.
+    #
+    # `positions` and `open_offers` are here because template_repo_maker documents them as
+    # part of the state contract. balance_xlm is kept in step with positions['XLM'] through
+    # portfolio so a strategy may read either one, exactly as it may live.
+    state = {'balance_usd': balance_usd, 'balance_xlm': 0.0,
+             'inventory_usd': 0.0, 'mid': None, 'open_offers': []}
+    portfolio.normalize_state(state)
+
     live = {'bid': None, 'ask': None}       # (price, remaining_usd)
     quoted_at = None
     fills = []
@@ -592,7 +630,7 @@ def replay(strategy_dir=None, days=7, spec='XLM', config=None, quote_fn=None,
         ticks += 1
         mid = row['dex_mid']
         book = {'bid': row['dex_bid'], 'ask': row['dex_ask'], 'mid': mid,
-                'spread_bp': row.get('spread_bp'),
+                'spread_bp': _spread_bp(row),
                 'bids': row.get('bids') or [], 'asks': row.get('asks') or [],
                 'bid_depth_usd': row.get('bid_depth_usd'),
                 'ask_depth_usd': row.get('ask_depth_usd'),
@@ -608,8 +646,11 @@ def replay(strategy_dir=None, days=7, spec='XLM', config=None, quote_fn=None,
         # actually comes from -- a stale quote is a free option written to the market, and
         # a model that repriced every tick would hide the whole cost of `refresh_s`.
         if quoted_at is None or (row['ts'] - quoted_at) >= refresh_s:
-            state = {'balance_usd': balance_usd, 'balance_xlm': balance_xlm,
-                     'inventory_usd': inventory_usd, 'mid': mid}
+            state['balance_usd'] = balance_usd
+            state['inventory_usd'] = inventory_usd
+            state['mid'] = mid
+            portfolio.add_amount(state, assets.NATIVE,
+                                 balance_xlm - portfolio.get_amount(state, assets.NATIVE))
             try:
                 decision = quote_fn(book, state, config)
             except Exception as e:

@@ -140,7 +140,11 @@ def snapshot(spec='XLM'):
     row['dex_bid'] = book.get('best_bid')
     row['dex_ask'] = book.get('best_ask')
     row['dex_mid'] = book.get('mid')
-    row['spread_bp'] = round(book['spread_pct'] * 10000, 2) if book.get('spread_pct') else None
+    # `is not None`, not a truth test: a LOCKED book (bid == ask) has spread_pct 0.0,
+    # and recording that real zero as None is what makes a reader's
+    # `float(row.get('spread_bp', 0.0))` raise instead of taking its default.
+    row['spread_bp'] = (round(book['spread_pct'] * 10000, 2)
+                        if book.get('spread_pct') is not None else None)
     row['bid_depth_usd'] = book.get('bid_depth_usd')
     row['ask_depth_usd'] = book.get('ask_depth_usd')
 

@@ -188,8 +188,16 @@ def current_book():
     row = rows[-1]
     if not row.get('dex_mid'):
         return None
+    # spread_bp is derived rather than read straight through: the recorder stores None for
+    # a LOCKED book (bid == ask), and a strategy's own `float(book.get('spread_bp', 0.0))`
+    # raises on that None -- the key is present, so the default never applies -- which
+    # stands the maker down for the tick. maker_backtest._spread_bp does the same for the
+    # already-recorded rows a replay reads; kept inline here so quote() costs no import.
+    spread_bp = row.get('spread_bp')
+    if spread_bp is None and row.get('dex_bid') and row.get('dex_ask'):
+        spread_bp = round((row['dex_ask'] - row['dex_bid']) / row['dex_mid'] * 10000.0, 2)
     return {'bid': row.get('dex_bid'), 'ask': row.get('dex_ask'),
-            'mid': row.get('dex_mid'), 'spread_bp': row.get('spread_bp'),
+            'mid': row.get('dex_mid'), 'spread_bp': spread_bp,
             'bids': row.get('bids') or [], 'asks': row.get('asks') or [],
             'bid_depth_usd': row.get('bid_depth_usd'),
             'ask_depth_usd': row.get('ask_depth_usd'),
