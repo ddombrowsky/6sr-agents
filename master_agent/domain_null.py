@@ -38,6 +38,11 @@ TEMPLATE_REPO = os.environ.get('NULL_TEMPLATE_REPO', 'file:///opt/template_repo_
 
 STARTING_SCORE = 1000.0
 
+# See domain_sdex.RANK_GRACE_S's comment: this is the value every domain shared as
+# monitor.py's bare YOUNG_GRACE_S constant before it became domain-owned. Ticks resolve
+# instantly here, so unchanged.
+RANK_GRACE_S = 3 * 3600
+
 # No money exists in this domain, so there is no execution to suppress. An empty dict is
 # the honest answer and the contract explicitly allows it -- unlike sdex, where omitting
 # PAPER_ONLY would let a smoke run place a real order.

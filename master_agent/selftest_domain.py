@@ -360,14 +360,33 @@ SDEX = domain.get('sdex')
 NULL = domain.get('null')
 FORECAST = domain.get('forecast')
 MAKER = domain.get('sdex_maker')
+# Neither of these is yet folded into the obs-type/encode-decode/differential sections
+# below (those pin behavior against a pre-refactor monitor.py that predates both domains
+# entirely) -- but a domain this file never even imports is a domain domain.check() has
+# never run against, which is exactly the class of bug ("kalshi is missing a required
+# contract member") that adding RANK_GRACE_S below could otherwise introduce silently.
+KALSHI = domain.get('kalshi')
 
-for mod in (SDEX, NULL, FORECAST, MAKER):
+for mod in (SDEX, NULL, FORECAST, MAKER, KALSHI):
     problems = domain.check(mod)
     check(f'{mod.NAME} satisfies the contract', not problems, '; '.join(problems))
 
 check('DOMAIN_NAME defaults to sdex',
       domain.get().NAME == os.environ.get('DOMAIN', 'sdex'))
 check('the registry is cached', domain.get('sdex') is SDEX)
+
+# RANK_GRACE_S used to be the single constant YOUNG_GRACE_S, applied by monitor.py to
+# every domain alike -- see domain.py's contract entry for why it became per-domain.
+# sdex/null/forecast/sdex_maker all resolve fast enough that the old flat 3h default
+# still applies; pin that so nobody "tunes" it differently by accident. kalshi is the one
+# domain this was built for, so its value must genuinely differ, not just be present.
+check('sdex/null/forecast/maker RANK_GRACE_S is unchanged from the old shared default (3h)',
+      SDEX.RANK_GRACE_S == NULL.RANK_GRACE_S == FORECAST.RANK_GRACE_S
+      == MAKER.RANK_GRACE_S == 3 * 3600,
+      f'{SDEX.RANK_GRACE_S}, {NULL.RANK_GRACE_S}, {FORECAST.RANK_GRACE_S}, '
+      f'{MAKER.RANK_GRACE_S}')
+check('kalshi RANK_GRACE_S exceeds the generic default to match slow real-world resolution',
+      KALSHI.RANK_GRACE_S > 3 * 3600, KALSHI.RANK_GRACE_S)
 
 # Nothing in the loop may need an attribute off `obs`, so every domain's observation type
 # is free to differ. Assert they actually do -- if they were the same shape, this whole

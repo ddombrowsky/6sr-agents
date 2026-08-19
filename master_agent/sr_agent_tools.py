@@ -225,6 +225,34 @@ def backtest_maker_strategy(strategy_path: str, days: float = 7) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def backtest_kalshi_strategy(strategy_path: str, rebuild: bool = False) -> str:
+    """Replay a Kalshi strategy over a fixed set of already-resolved real markets.
+
+    The kalshi-domain analogue of backtest_forecast_strategy: same role, different
+    domain -- there is no synthetic seed here, only real Kalshi markets that have
+    already settled (see kalshi_backtest.py's module docstring for what "fixed" means
+    for a set built by crawling a live exchange rather than a generative model).
+    Imported lazily for the same reason backtest_strategy is.
+    """
+    try:
+        from kalshi_backtest import build_backtest_set, replay
+        examples = build_backtest_set(force=bool(rebuild)) if rebuild else None
+        result = replay(strategy_path, examples=examples)
+        if isinstance(result, dict) and result.get('decide_source') not in (None, 'main.py:decide'):
+            result['WARNING'] = (
+                f"decide_source is {result.get('decide_source')!r}: the backtester could "
+                f"NOT import decide() from main.py, so every number here describes the "
+                f"mechanical confidence_gain-only fallback, NOT this strategy's code. "
+                f"Fix the structure first: main.py's top level may contain only imports, "
+                f"assignments, defs, the docstring and an `if __name__ == '__main__'` "
+                f"guard, with the logic in a top-level "
+                f"decide(market, history, state, config). Then re-run this tool and "
+                f"check that decide_source is 'main.py:decide' before trusting any result.")
+        return json.dumps(result)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 def get_tape_stats(hours: int = 24) -> str:
     """Executed-trade statistics for XLM/USDC by size bucket, as JSON.
 
@@ -413,6 +441,7 @@ TOOLS = {
     'backtest_forecast_strategy': backtest_forecast_strategy,
     'backtest_maker_strategy': backtest_maker_strategy,
     'get_tape_stats': get_tape_stats,
+    'backtest_kalshi_strategy': backtest_kalshi_strategy,
     'get_price_history': get_price_history,
     'calculate': calculate,
     'get_current_time': get_current_time,

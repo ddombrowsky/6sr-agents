@@ -1,11 +1,8 @@
 __pycache__
-
-# Cache files that tools write NEXT TO THEMSELVES. Every one of these must be ignored:
-# /opt/tools is watched by monitor.check_boundary_integrity, and a dirty working tree
-# there prints LIVE TRADING HALTED on the next cycle. A cache file that is merely
-# untracked does it, and one that is TRACKED does it on every single write.
 .friction_cache.json
 .xlm_price_cache.json
 .ohlc_cache_*.json
 .price_history.json
 *.cache.json
+.kalshi_cache.json
+.kalshi_backtest_set.json

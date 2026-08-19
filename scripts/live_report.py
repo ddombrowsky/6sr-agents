@@ -197,7 +197,6 @@ def report(name=None, since=None):
                              'min': round(min(ratios), 6), 'max': round(max(ratios), 6)}
 
     out.update(_returns(entries))
-    out['borrow_cross_check'] = _borrow_cross_check(name, out.get('borrowed_xlm'))
     out['pubnet_cross_check'] = _pubnet_cross_check(name, since, submitted, live_usd)
 
     recorded = (live or {}).get('sizing') if live and live.get('name') == name else None
@@ -208,38 +207,6 @@ def report(name=None, since=None):
                          and any(recorded.get(k) is not None and recorded.get(k) != v
                                  for k, v in caps.items()))}
     return out
-
-
-def _borrow_cross_check(name, borrowed_from_log):
-    """Does the log's short liability agree with the strategy's own state.json?
-
-    Same spirit as _pubnet_cross_check: a second, independently written source for a number
-    this report now depends on. `borrowed_xlm` reaches the trade log only from a
-    trade_logger new enough to record it (2026-08-12), and a strategy process holds its
-    imports for its entire lifetime -- so one started before that date goes on writing lines
-    without the field. Those read as flat and silently restore the exact overstatement the
-    field was added to remove. state.json is written by that same process but straight from
-    `state`, so a disagreement here means stale code rather than a stale number, and the fix
-    is a restart, not an edit.
-
-    Returns None when there is nothing to compare against.
-    """
-    try:
-        entry = json.load(STRATEGY_STATE.open())[name]
-        state = json.load(open(Path(entry['path']) / 'state.json'))
-    except Exception:
-        return None
-    actual = float(state.get('borrowed_xlm') or 0.0)
-    logged = float(borrowed_from_log or 0.0)
-    # Drift of about one trade is expected and not worth reporting: state.json is rewritten
-    # every tick, the log only when something actually traded.
-    if abs(actual - logged) <= max(1.0, actual * 0.02):
-        return {'match': True, 'state_json_xlm': round(actual, 4), 'log_xlm': round(logged, 4)}
-    note = ('log shows no short but state.json does -- strategy is running a trade_logger '
-            'too old to record borrowed_xlm; restart it') if logged == 0 and actual > 0 else \
-           'log and state.json disagree on the outstanding short'
-    return {'match': False, 'state_json_xlm': round(actual, 4),
-            'log_xlm': round(logged, 4), 'note': note}
 
 
 def _returns(entries):
@@ -259,30 +226,15 @@ def _returns(entries):
     -- counting those as "did not fill" would report the live book flat while the paper
     book moved, which reads like a measured divergence and is really just missing data.
     With no recorded line at all, no return is reported.
-
-    Both net worths are marked **net of the XLM short liability** (SHORTING_PLAN.md).
-    `borrowed_xlm` is a debt whose sale proceeds are already sitting in `balance_usd`, so
-    adding the cash without subtracting the debt books a short as pure profit. This
-    function did exactly that until 2026-08-12: on seed_1124713bc960, carrying a 762 XLM
-    short, it reported +20.9% against a true -1.6%. score.py, backtest.py and portfolio.py
-    have always subtracted it -- they read state.json, where it is visible; this reads the
-    trade log, where it was not recorded until the same date. A line without the field is
-    read as flat, which is what every line predating shorting actually was.
-
-    Only the paper book carries a liability. The live replay below clamps every sell to
-    `live_xlm`, so it can never go short -- which is not a modelling shortcut but the real
-    constraint: pubnet has no borrow facility, only stellar_trader's pre-funded
-    SHORT_BUFFER_XLM. That asymmetry is the point of the comparison, not a flaw in it.
     """
     recorded_from = next((i for i, e in enumerate(entries) if e.get('live') is not None), None)
     if recorded_from is None:
         return {'return_note': f'no live-recorded trades yet ({len(entries)} line(s) '
                                f'predate the recording); returns not computed'}
-    xlm_idx = [i for i in range(recorded_from, len(entries)) if _is_xlm(entries[i])]
-    if not xlm_idx:
+    xlm = [e for e in entries[recorded_from:] if _is_xlm(e)]
+    if not xlm:
         return {'return_note': 'no XLM-leg trades in window; returns not computed'}
 
-    xlm = [entries[i] for i in xlm_idx]
     first, last = xlm[0], xlm[-1]
     price0 = float(first.get('price') or 0)
     price_last = float(last.get('price') or 0)
@@ -297,16 +249,7 @@ def _returns(entries):
         usd, held = usd + amount_usd, held - amount_xlm
     else:
         usd, held = usd - amount_usd, held + amount_xlm
-
-    # The debt as it stood *before* the first in-window trade. The preceding log line
-    # carries it exactly; with no preceding line there is nothing to read it from, so fall
-    # back to this line's own post-trade figure -- wrong by at most the borrow opened by
-    # that single trade, and only when the window happens to open on a short-sell.
-    borrowed_start = float((entries[xlm_idx[0] - 1] if xlm_idx[0] > 0 else first)
-                           .get('borrowed_xlm') or 0.0)
-    borrowed_last = float(last.get('borrowed_xlm') or 0.0)
-
-    start_net = usd + held * price0 - borrowed_start * price0
+    start_net = usd + held * price0
     if start_net <= 0:
         return {'return_note': 'could not reconstruct a starting net worth'}
 
@@ -328,9 +271,7 @@ def _returns(entries):
             live_xlm -= sell
             live_usd_bal += sell * price
 
-    paper_net = (float(last.get('balance_usd') or 0.0)
-                 + float(last.get('balance_xlm') or 0.0) * price_last
-                 - borrowed_last * price_last)
+    paper_net = float(last.get('balance_usd') or 0.0) + float(last.get('balance_xlm') or 0.0) * price_last
     live_net = live_usd_bal + live_xlm * price_last
     paper_pct = (paper_net - start_net) / start_net * 100
     live_pct = (live_net - start_net) / start_net * 100
@@ -338,8 +279,6 @@ def _returns(entries):
             'paper_net_worth': round(paper_net, 6),
             'live_sized_net_worth': round(live_net, 6),
             'last_price': price_last,
-            'borrowed_xlm': round(borrowed_last, 4),
-            'short_liability_usd': round(borrowed_last * price_last, 6),
             'paper_return_pct': round(paper_pct, 4),
             'live_sized_return_pct': round(live_pct, 4),
             'return_gap_pct': round(paper_pct - live_pct, 4)}
@@ -366,14 +305,6 @@ def summary_line(name=None):
                      f"live-sized {r['live_sized_return_pct']:+.2f}%")
     elif r.get('return_note'):
         parts.append(r['return_note'])
-    if r.get('borrowed_xlm'):
-        parts.append(f"open short {r['borrowed_xlm']:.0f} XLM "
-                     f"(${r['short_liability_usd']:.2f} liability, netted out of paper)")
-    borrow = r.get('borrow_cross_check') or {}
-    if borrow.get('match') is False:
-        parts.append(f"SHORT LIABILITY UNVERIFIED: {borrow['note']} "
-                     f"(state.json {borrow['state_json_xlm']:.0f} XLM "
-                     f"vs log {borrow['log_xlm']:.0f})")
     if r.get('unrecorded') and r.get('paper_return_pct') is not None:
         parts.append(f"{r['unrecorded']} pre-recording line(s) excluded")
     if r.get('refusals'):

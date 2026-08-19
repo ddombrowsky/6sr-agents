@@ -41,6 +41,7 @@ sixth is one the list omits.
      activity(name)                -> (count, first_ts, last_ts)
      activity_log_path(name)       -> Path
      config_signature(state_entry) -> hashable | None
+     RANK_GRACE_S                  int            seconds before rank-cull trusts a score
 
    `config_signature` is here because the loop dedupes the parents it clones, and "these
    two strategies are the same strategy" is a question only the domain can answer -- for
@@ -49,6 +50,15 @@ sixth is one the list omits.
 
    `obs` is whatever the domain wants -- the loop only ever tests `obs is None` and hands
    it back. Do not make the loop read an attribute of it.
+
+   `RANK_GRACE_S` used to be a single constant monitor.py applied to every domain alike
+   (three cycles' worth at monitor.py's own default CYCLE_SLEEP). That is a fact about how
+   fast a domain's feedback resolves, not about the loop, and domains differ by orders of
+   magnitude on it: domain_forecast's questions resolve in ~30s, domain_kalshi's markets
+   take hours to days. A strategy scored on a domain whose feedback hasn't arrived yet sits
+   at STARTING_SCORE with no real signal, so a grace period sized for the fast domain culls
+   the slow one on a trade-count tiebreak, not evidence -- see domain_kalshi.py's
+   RANK_GRACE_S comment for the run this was first observed on.
 
 2. A CHEAP OFFLINE REPLAY. Without one, the gates have nothing to test a revision on and
    LLM-written code reaches money through a check that only proves it parses.
@@ -202,6 +212,7 @@ CONTRACT = (
     ('activity', 1),
     ('activity_log_path', 1),
     ('config_signature', 1),
+    ('RANK_GRACE_S', None),
     # criterion 2
     ('REPLAY_DAYS', None),
     ('REPLAY_WINDOW', None),

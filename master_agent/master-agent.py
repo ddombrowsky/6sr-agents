@@ -646,17 +646,18 @@ def _build_sdex_revision_system_prompt():
 
 
 # --------------------------------------------------------------------------------------
-# Domain-conditional prompt/tool swap for the forecast domain (FUTURE.md item 3).
+# Domain-conditional prompt/tool swap for non-sdex domains (FUTURE.md items 3 and 4).
 #
 # The system prompt above -- and 15 of the 20 tools registered further up (TOOLS/
 # TOOL_SCHEMAS) -- are hardcoded to sdex: XLM, order books, trade_logger, basis, assets.
-# None of that exists in domain_forecast.py's game, and handing the revision model those
-# tools/instructions unchanged would mean every forecast-domain revision gets sdex-
-# flavored guidance and mostly fails its smoke test, falling back to mechanical
-# tweak_config jitter -- exercising evolution but never real LLM reasoning about the new
-# domain. domain.py itself defers a general `domain.llm_tools()` seam to later (see its
-# "what is deliberately not here" section); this is the minimal, contained version of
-# that for exactly the one new domain that exists today -- a branch, not a plugin system.
+# None of that exists in domain_forecast.py's or domain_kalshi.py's games, and handing
+# the revision model those tools/instructions unchanged would mean every non-sdex
+# revision gets sdex-flavored guidance and mostly fails its smoke test, falling back to
+# mechanical tweak_config jitter -- exercising evolution but never real LLM reasoning
+# about the new domain. domain.py itself defers a general `domain.llm_tools()` seam to
+# later (see its "what is deliberately not here" section); this is the minimal,
+# contained version of that for the domains that exist today -- a branch per domain, not
+# a plugin system.
 #
 # The sdex text above is untouched by this: REVISION_SYSTEM_PROMPT is only reassigned
 # below, never edited in place, so a run with DOMAIN=sdex (or unset) gets the exact same
@@ -664,36 +665,44 @@ def _build_sdex_revision_system_prompt():
 # --------------------------------------------------------------------------------------
 
 _GENERIC_TOOL_NAMES = frozenset((
-    'backtest_forecast_strategy', 'calculate', 'get_current_time', 'get_uptime',
+    'calculate', 'get_current_time', 'get_uptime',
     'read_file', 'write_file', 'fetch_url', 'install_package', 'update_package_list',
     'exec',
 ))
 
-# The maker keeps the generic core plus the tools that describe ITS market, and loses the
-# taker-only surface: backtest_strategy replays decide(), and the asset-discovery tools
+# The one extra, domain-specific fitness-check tool each non-sdex domain gets on top of
+# the generic set above -- backtest_forecast_strategy for forecast,
+# backtest_kalshi_strategy for kalshi (see sr_agent_tools.py). Keyed by DOMAIN.NAME so
+# adding a domain here is a one-line addition, not a new branch.
+#
+# sdex_maker is the one entry that adds more than a backtest: the maker keeps the generic
+# core plus the tools that describe ITS market, and loses the taker-only surface --
+# backtest_strategy replays decide(), and the asset-discovery tools
 # (list_candidate_assets / verify_asset / get_asset_price*) exist to admit new assets,
 # which this domain explicitly does not do -- XLM/USDC only. Leaving them in would invite
 # a revision to spend its budget on a knob that cannot reach the market it quotes.
-_MAKER_TOOL_NAMES = (_GENERIC_TOOL_NAMES - {'backtest_forecast_strategy'}) | frozenset((
-    'backtest_maker_strategy', 'get_tape_stats', 'get_friction', 'get_market_history',
-    'get_market_regime', 'get_dex_cex_basis', 'get_price_history',
-))
+_DOMAIN_TOOL_NAMES = {
+    'forecast': frozenset({'backtest_forecast_strategy'}),
+    'kalshi': frozenset({'backtest_kalshi_strategy'}),
+    'sdex_maker': frozenset({
+        'backtest_maker_strategy', 'get_tape_stats', 'get_friction', 'get_market_history',
+        'get_market_regime', 'get_dex_cex_basis', 'get_price_history',
+    }),
+}
 
-if _DOMAIN.NAME == 'forecast':
-    TOOLS = {name: fn for name, fn in TOOLS.items() if name in _GENERIC_TOOL_NAMES}
-    TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _GENERIC_TOOL_NAMES]
-elif _DOMAIN.NAME == 'sdex_maker':
-    TOOLS = {name: fn for name, fn in TOOLS.items() if name in _MAKER_TOOL_NAMES}
-    TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _MAKER_TOOL_NAMES]
+if _DOMAIN.NAME in _DOMAIN_TOOL_NAMES:
+    _allowed_tool_names = _GENERIC_TOOL_NAMES | _DOMAIN_TOOL_NAMES[_DOMAIN.NAME]
+    TOOLS = {name: fn for name, fn in TOOLS.items() if name in _allowed_tool_names}
+    TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _allowed_tool_names]
 
-# A function, not a module-level literal, and deliberately: _FACTS above is built from
-# whatever domain is ACTUALLY active (domain.get()'s result), so on a default/sdex run
-# _FACTS has no 'starting_score'/'score_scale'/'null_baseline' keys at all -- evaluating
-# an f-string that reads them at module-import time would raise KeyError and break
-# master-agent.py outright for the domain everything currently runs. Deferring the
-# f-string evaluation into a function called only inside the `if _DOMAIN.NAME ==
-# 'forecast':` guard below keeps this file importable (and the sdex path untouched) no
-# matter which domain is active.
+# Functions, not bare module-level literals, and deliberately: _FACTS above is built
+# from whatever domain is ACTUALLY active (domain.get()'s result), so on a default/sdex
+# run _FACTS has no 'starting_score'/'score_scale'/'null_baseline' keys at all --
+# evaluating an f-string that reads them at module-import time would raise KeyError and
+# break master-agent.py outright for the domain everything currently runs. Deferring the
+# f-string evaluation into a function called only inside its own `if _DOMAIN.NAME ==
+# ...:` guard below keeps this file importable (and the sdex path untouched) no matter
+# which domain is active.
 def _build_forecast_revision_system_prompt():
     return (
     'You are the strategy-revision agent for an evolutionary forecasting-benchmark '
@@ -793,7 +802,6 @@ def _build_forecast_revision_system_prompt():
     'disk, and why.'
     )
 
-
 # Same deferral rule as the forecast prompt above: built inside a function so the
 # f-strings that read maker-only _FACTS keys are never evaluated on an sdex run, where
 # those keys do not exist and a KeyError at import would break master-agent.py outright
@@ -890,11 +898,68 @@ def _build_maker_revision_system_prompt():
     'the changes you have already written to disk, and why.'
     )
 
+def _build_kalshi_revision_system_prompt():
+    """See KALSHI.md's "Lessons from domain_forecast.py's actual run": the forecast
+    prompt above was later gutted to a single content-free line by a self-revision pass
+    and never restored, and that run's own validity is weaker for it. Written out in
+    full here on purpose, not as a one-liner, so the same failure mode starting from
+    THIS text is at least a regression to notice rather than the starting point.
+    Every number below is read live from _FACTS (domain_kalshi.prompt_facts()), never
+    hardcoded -- see domain.py's "group 7" note on why a prompt and the code that
+    enforces it must never be allowed to state a number independently."""
+    categories = ', '.join(_FACTS['known_categories'])
+    return (
+    'You are the strategy-revision agent for an evolutionary system that trades real '
+    'Kalshi prediction markets in paper mode (no money moves -- see domain_kalshi.py). '
+    'Each cycle monitor.py creates a small batch of new strategies -- clones of the '
+    'best current performers, plus one pulled fresh from the template -- and hands each '
+    'to you before it starts forecasting. The user message tells you which job you have: '
+    '`refine` (improve on a parent with a real track record) or `explore` (a fresh '
+    'template strategy with no meaningful parent, where the job is to try something the '
+    'population is not already doing).\n\n'
+    'THE GAME: main.py\'s decide(market, history, state, config) is handed ONE currently '
+    'open market at a time (fields include implied_prob, volume, open_interest, '
+    'close_time) and must return p_hat, a probability in [0, 1] that it resolves Yes. '
+    f'The null you are scored against is {_FACTS["null_baseline"]}\n\n'
+    'SCORING IS NOT INSTANT. A forecast is logged the moment you make it, alongside the '
+    'market\'s price at that exact instant -- but the real judgment (your p_hat\'s Brier '
+    'score against the true outcome, versus that frozen market price\'s own Brier score) '
+    'only happens once the market actually settles, which can take hours to days. Your '
+    f'score starts at {_FACTS["starting_score"]} and moves by roughly '
+    f'{_FACTS["score_scale"]} times your average edge per RESOLVED forecast, shrunk '
+    f'toward zero below about {_FACTS["confidence_prior_n"]:.0f} resolved forecasts so a '
+    'small lucky sample cannot outrank a real track record -- do not expect your score '
+    'to move at all in the first few cycles after a change; that is normal, not a sign '
+    'nothing happened.\n\n'
+    'THREE KNOBS live in config.json: `confidence_gain` '
+    f'(bounded [-{_FACTS["max_confidence_gain"]}, {_FACTS["max_confidence_gain"]}]), '
+    f'`markets_per_tick` (bounded [1, {_FACTS["max_markets_per_tick"]}]), and '
+    f'`category_filter`, which must be one of: {categories}. Changing category_filter is '
+    'a real, structural move -- it changes which markets kalshi_recorder.py has cached '
+    'for you to read at all, not just a magnitude tweak. config.json is yours to extend '
+    'with new keys the same way the sdex population does; read any new key with '
+    '`config.get("your_key", <default>)`, never `config["your_key"]`.\n\n'
+    'STRUCTURE: exactly like the sdex/forecast templates, main.py\'s module top level '
+    'may contain only imports, assignments, defs, the docstring and an `if __name__` '
+    'guard -- decide() must be importable at the top level, or kalshi_backtest.py '
+    'silently falls back to replaying the mechanical confidence_gain-only rule instead '
+    'of your real code, and every number backtest_kalshi_strategy reports describes the '
+    'fallback, not your change. Always check its decide_source field first.\n\n'
+    'Use backtest_kalshi_strategy as your fitness check before committing -- it replays '
+    'against a fixed set of already-resolved real Kalshi markets and reports whether '
+    'you beat the market\'s own frozen price. A strategy that just copies the market '
+    'price (confidence_gain effectively inert) scores edge close to zero by '
+    'construction; real edge has to come from something else -- history (this ticker\'s '
+    'own recent price drift, already in the default rule), volume, spread, or a signal '
+    'genuinely outside the market\'s own price. Finish by committing your changes to a '
+    'new git branch inside the strategy\'s directory.')
 
 if _DOMAIN.NAME == 'forecast':
     REVISION_SYSTEM_PROMPT = _build_forecast_revision_system_prompt()
 elif _DOMAIN.NAME == 'sdex_maker':
     REVISION_SYSTEM_PROMPT = _build_maker_revision_system_prompt()
+elif _DOMAIN.NAME == 'kalshi':
+    REVISION_SYSTEM_PROMPT = _build_kalshi_revision_system_prompt()
 else:
     REVISION_SYSTEM_PROMPT = _build_sdex_revision_system_prompt()
 
@@ -1407,6 +1472,78 @@ def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_lin
     )
 
 
+def _refine_prompt_kalshi(strategy_name, parent_name, strategy_path, parent_score,
+                          leaderboard, tick_line) -> str:
+    """The kalshi domain's clone case. Parallel to _refine_prompt_forecast, but written
+    out in full (see _build_kalshi_revision_system_prompt's docstring for why a
+    one-liner here is a known failure mode, not a safe default to copy)."""
+    parent_path = STRATEGIES_DIR / parent_name
+    parent_config = _read_json(parent_path / 'config.json', {})
+    parent_state = _read_json(parent_path / 'state.json', {})
+    forecast_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
+    clone_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
+        f'`{strategy_path}` (a git checkout of the strategy code). It has not started '
+        f'forecasting yet.\n\n'
+        f'{tick_line}'
+        f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
+        f"Parent `{parent_name}`'s current state.json: {json.dumps(parent_state)}\n"
+        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
+        f"Parent `{parent_name}`'s most recent log lines (a mix of 'forecast' entries "
+        f"it wrote and 'resolution' entries kalshi_reconcile.py appended once a market "
+        f"settled -- join them on `ticker` to see which bets paid off):\n{forecast_tail}\n\n"
+        f"The clone's main.py (identical to the parent's right now -- this is what "
+        f"you'd edit to change forecasting logic, not just config.json):\n"
+        f"```python\n{clone_main_py}\n```\n\n"
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
+        f'Revise the clone at `{strategy_path}` however you think will improve on its '
+        f'parent, then run backtest_kalshi_strategy to check your change before '
+        f'committing, and commit to a new git branch inside that directory when done.'
+    )
+
+
+def _explore_prompt_kalshi(strategy_name, strategy_path, leaderboard, tick_line) -> str:
+    """The kalshi domain's template-spawn case. Parallel to _explore_prompt_forecast --
+    omits _population_census() for the same reason (sdex-specific machinery built
+    around months of population variety this domain does not have yet)."""
+    own_config = _read_json(strategy_path / 'config.json', {})
+    own_main_py = _read_text(strategy_path / 'main.py')
+    categories = ', '.join(_FACTS['known_categories'])
+    return (
+        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
+        f'unmodified checkout of /opt/template_repo_kalshi -- NOT a clone of any '
+        f'existing strategy. It has no parent, no forecast history and no track '
+        f'record, so there is nothing here to improve on. Your job this time is '
+        f'EXPLORATION: give the population a strategy that reads something genuinely '
+        f'different from what it already does.\n\n'
+        f'{tick_line}'
+        f'Its config.json right now: {json.dumps(own_config)}\n'
+        f'`category_filter` must be one of: {categories}. Switching to a category '
+        f'nobody in the population is currently using is itself a real exploration '
+        f'move -- it changes which markets kalshi_recorder.py caches for this strategy '
+        f'to read, not just a magnitude tweak.\n\n'
+        f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
+        f'proven code, so you are free to restructure it):\n'
+        f'```python\n{own_main_py}\n```\n\n'
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running): {json.dumps(leaderboard)}\n\n'
+        f'The template\'s default decide() only ever reads this ticker\'s own recent '
+        f'price drift (momentum). Real, orthogonal signal -- volume trend, spread '
+        f'width, or something read from outside kalshi_recorder.py entirely -- is the '
+        f'concrete open direction; a bare confidence_gain nudge is a wasted slot here, '
+        f'the same way a threshold nudge is on the sdex population. Whatever you write, '
+        f'a top-level `decide()` must remain importable: run backtest_kalshi_strategy '
+        f'and check decide_source is "main.py:decide", not "config-thresholds", before '
+        f'trusting any of its other numbers. beats_null being false is not automatically '
+        f'a failure here -- real Kalshi markets are efficiently priced and beating the '
+        f'market\'s own price is a genuinely hard bar, harder than domain_forecast\'s '
+        f'synthetic one -- but an importable decide() is not optional.\n\n'
+        f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
+    )
+
+
 def _compose_revision_messages(strategy_name: str, parent_name: str, parent_score: str,
                                 leaderboard_json: str, observation: str, role: str):
     """Build the exact messages a revision turn would open with, no model call.
@@ -1455,6 +1592,13 @@ def _compose_revision_messages(strategy_name: str, parent_name: str, parent_scor
         else:
             prompt = _refine_prompt_forecast(strategy_name, parent_name, strategy_path,
                                              parent_score, leaderboard, price_line)
+    elif _DOMAIN.NAME == 'kalshi':
+        if role == ROLE_EXPLORE:
+            prompt = _explore_prompt_kalshi(strategy_name, strategy_path, leaderboard,
+                                            price_line)
+        else:
+            prompt = _refine_prompt_kalshi(strategy_name, parent_name, strategy_path,
+                                           parent_score, leaderboard, price_line)
     elif role == ROLE_EXPLORE:
         prompt = _explore_prompt(strategy_name, strategy_path, leaderboard, price_line)
     else:

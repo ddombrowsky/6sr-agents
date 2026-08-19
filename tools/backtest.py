@@ -610,7 +610,7 @@ def backtest(strategy_dir, days=30, ticks_per_candle=1, interval=60, legs=False)
         import portfolio as _portfolio_mod
         max_borrowed_xlm = _portfolio_mod.MAX_BORROWED_XLM
     except Exception:
-        max_borrowed_xlm = 6000.0
+        max_borrowed_xlm = 600.0   # keep in sync with portfolio.MAX_BORROWED_XLM
 
     for candle, basis_row in zip(candles, basis_rows):
         price = candle['close']

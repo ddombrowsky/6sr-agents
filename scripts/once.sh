@@ -13,6 +13,7 @@ LOG=/opt/emperor_logs/monitor-once-$DSTR.log
 echo starting market recorder...
 python3 monitor.py --ensure-recorder
 
+export CYCLE_SLEEP=14400
 # comment this out to use ollama if you have any credits left -- irrelevant while
 # REVISION_MODE=manual below, since that path never calls the model, but left set so
 # switching back to auto mode doesn't silently start spending Ollama cloud credits again

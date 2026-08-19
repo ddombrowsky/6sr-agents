@@ -56,6 +56,12 @@ STARTING_SCORE = 1000.0
 # A hard requirement, not a convenience. quote_executor.sync_quotes and every primitive in
 # stellar_trader check PAPER_ONLY *inside* the function, so a smoke run of a candidate
 # main.py cannot rest a real offer no matter what it imports.
+# See domain_sdex.RANK_GRACE_S's comment: this is the value every domain shared as
+# monitor.py's bare YOUNG_GRACE_S constant before it became domain-owned. A maker's score
+# moves on every fill, and fills come in on the same cycle cadence as sdex's marks, so
+# three cycles' worth of quoting is already enough evidence to rank on -- unchanged.
+RANK_GRACE_S = 3 * 3600
+
 SMOKE_ENV = {'PAPER_ONLY': '1'}
 
 OBSERVE_FAILURE_NOTE = 'Could not read the XLM/USDC order book'

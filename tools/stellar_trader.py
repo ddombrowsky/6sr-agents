@@ -528,7 +528,7 @@ def _log_pubnet_trade(action, amount_usd, amount_xlm, tx_hash, reason=None, spec
         "timestamp": time.time(),
         "action": action,
         "amount_usd": amount_usd,
-        "amount_xlm": amount_xlm,  # estimated from the pre-trade price, not the exact fill
+        "amount_xlm": amount_xlm,  # actual ledger fill (see _actual_swap_amounts); falls back to the pre-trade estimate only if Horizon can't be reached
         "tx_hash": tx_hash,
         "reason": reason,
         "asset": spec,
@@ -849,6 +849,23 @@ def _most_recent_tx_hash(address):
     return records[0]["hash"] if records else ""
 
 
+def _actual_swap_amounts(tx_hash):
+    """(source_amount, dest_amount) as actually recorded on the ledger for a
+    path-payment-strict-send tx, not the pre-trade estimate submit_trade computed from
+    a CEX reference price. source_amount is exact by construction (strict-send fixes
+    it), but dest_amount is whatever the path filled at, which routinely differs from
+    the estimate -- that gap is what made pubnet.log's amount_xlm diverge from the
+    real fill.
+    """
+    resp = requests.get(f"{_HORIZON}/transactions/{tx_hash}/operations",
+                         timeout=_TIMEOUT)
+    resp.raise_for_status()
+    for op in resp.json()["_embedded"]["records"]:
+        if op.get("type") == "path_payment_strict_send":
+            return float(op["source_amount"]), float(op["amount"])
+    raise RuntimeError(f"no path_payment_strict_send operation found for {tx_hash}")
+
+
 def submit_trade(side: str, usd_amount: float, *, asset='XLM', short=False) -> dict:
     """Sign and submit a real trade on pubnet using the `claudio` identity.
 
@@ -967,7 +984,11 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM', short=False) -> d
             MAX_TRADE_USD_NONBASE,
             max(0.0, MAX_DAILY_USD_PER_ASSET - _daily_spent(spec)))
 
-    account = _account(_source_address())
+    try:
+        account = _account(_source_address())
+    except Exception as e:
+        return {"submitted": False, "tx_hash": None, "amount_usd": 0.0,
+                "reason": f"could not fetch account state: {e}"}
 
     if not native and side == "buy":
         held = _asset_balance(account, code, issuer)
@@ -1041,7 +1062,15 @@ def submit_trade(side: str, usd_amount: float, *, asset='XLM', short=False) -> d
     # 99999.0), but it is the same error and would surface the moment that is fixed.
     if side == "buy":
         _record_spend(capped_usd, spec)
-    filled = dest_amount if side == "buy" else send_amount
+    # dest_amount/send_amount are pre-trade estimates from a CEX reference price; the
+    # real fill is whatever the path executed at, read back from the ledger. Fall back
+    # to the estimate only if Horizon can't be reached -- a logging gap, not a reason
+    # to fail a trade that already submitted.
+    try:
+        actual_source, actual_dest = _actual_swap_amounts(tx_hash)
+    except Exception:
+        actual_source, actual_dest = send_amount, dest_amount
+    filled = actual_dest if side == "buy" else actual_source
     _log_pubnet_trade(side, capped_usd, filled if native else 0.0, tx_hash, spec=spec)
     return {"submitted": True, "tx_hash": tx_hash, "amount_usd": capped_usd,
             "reason": None}

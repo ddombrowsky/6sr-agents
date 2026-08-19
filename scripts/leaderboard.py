@@ -36,25 +36,6 @@ def load_state():
     return {}
 
 
-def borrowed_xlm_for(info):
-    """XLM currently owed against the short facility (SHORTING_PLAN.md), or None.
-
-    Read straight from the strategy's own state.json rather than through DOMAIN: unlike
-    score/activity/importability, which differ by domain, `borrowed_xlm` is a portfolio.py
-    field with no domain-specific meaning to abstract -- shorting is XLM-only and sdex-only,
-    so a strategy under a domain that never writes this key (or has no state.json at all)
-    simply reports None, the same "not applicable here" this file already shows as N/A for
-    score. Fails open: a strategy with an unreadable state.json is not this column's problem
-    to raise, it's read-only reporting on top of state monitor.py already trusts.
-    """
-    state_path = Path(info.get('path', '')) / 'state.json'
-    try:
-        raw = json.load(state_path.open())
-        return float(raw.get('borrowed_xlm') or 0.0)
-    except Exception:
-        return None
-
-
 def replay_blind(state):
     """Strategies whose main.py DOMAIN.importability() reports as not replayable.
 
@@ -102,9 +83,7 @@ def main():
                 score = None       # display-only; the raw -inf still sorts last below
         age_s = monitor.strategy_age_s(info)
         max_score = info.get('max_score')
-        borrowed = borrowed_xlm_for(info)
-        rows.append((name, info.get('status'), info.get('pid'), score, count, age_s,
-                    max_score, borrowed))
+        rows.append((name, info.get('status'), info.get('pid'), score, count, age_s, max_score))
 
     # The same order monitor.run() ranks on: strategies that have ever acted first (see
     # monitor.IDLE_GRACE_S), then by score, then by action count as a tiebreak.
@@ -113,24 +92,18 @@ def main():
               reverse=True)
 
     name_w = max(len(r[0]) for r in rows) + 2
-    header = (f"    {'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>16}{'MAX SCORE':>16}"
-              f"{'BORROWED':>12}{'ACTIONS':>10}{'AGE(h)':>9}  {'IDLE'}")
+    header = (f"{'NAME':<{name_w}}{'STATUS':<10}{'PID':<8}{'SCORE':>16}{'MAX SCORE':>16}"
+              f"{'ACTIONS':>10}{'AGE(h)':>9}  {'IDLE'}")
     print(header)
     print('-' * len(header))
-    rank=0
-    for name, status, pid, score, count, age_s, max_score, borrowed in rows[:30]:
-        rank += 1
+    for name, status, pid, score, count, age_s, max_score in rows[:20]:
         score_s = f'{score:.2f}' if score is not None else 'N/A'
         max_score_s = f'{max_score:.2f}' if max_score is not None else 'N/A'
-        # 0.00 (a real, checked zero) is left distinct from N/A (couldn't say, or this
-        # domain has no such thing) -- collapsing them would hide a state.json read
-        # failure behind what looks like a clean, debt-free strategy.
-        borrowed_s = f'{borrowed:.2f}' if borrowed is not None else 'N/A'
         pid_s = str(pid) if pid else '-'
         age_s_str = f'{age_s / 3600:.1f}' if age_s is not None else 'N/A'
         idle_s = 'yes' if name in idle_names else ''
-        print(f'{rank:>2}: {name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>16}{max_score_s:>16}'
-              f'{borrowed_s:>12}{count:>10}{age_s_str:>9}  {idle_s}')
+        print(f'{name:<{name_w}}{status or "unknown":<10}{pid_s:<8}{score_s:>16}{max_score_s:>16}'
+              f'{count:>10}{age_s_str:>9}  {idle_s}')
 
     print(f'\nDomain: {DOMAIN.NAME}')
     if obs is not None:
