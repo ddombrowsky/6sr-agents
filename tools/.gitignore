@@ -1,4 +1,8 @@
 __pycache__
+.friction_cache.json
+.xlm_price_cache.json
+.ohlc_cache_*.json
+.price_history.json
+*.cache.json
 .kalshi_cache.json
 .kalshi_backtest_set.json
-

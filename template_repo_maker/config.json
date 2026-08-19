@@ -1,0 +1,9 @@
+{
+  "name": "template_agent",
+  "schema_version": 1,
+  "half_width_bp": 0.0,
+  "quote_size_usd": 0.0,
+  "inventory_band_usd": 250.0,
+  "inventory_skew_bp": 0.0,
+  "refresh_interval_s": 30
+}

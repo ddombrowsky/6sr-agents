@@ -352,5 +352,138 @@
         "required": []
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_candidate_assets",
+      "description": "List Stellar assets that a strategy could add as one of its up to 2 extra trading legs, ranked by liquidity and reputation. Returns code, issuer, rating, trustline count and 7d volume for each. Use this to FIND candidate assets rather than recalling asset issuers from memory -- an asset code alone is not unique and impostors exist on-chain. Presence in this list is a proposal, not approval: every asset is still re-verified by monitor.py before the strategy starts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "How many candidates to return (default 15)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "verify_asset",
+      "description": "Check whether a specific (code, issuer) Stellar asset would be admitted for trading, and see the underlying evidence: reputation rating, trustline count, 7d volume, issuer flags, order-book spread and depth, and any disqualifying concerns. Call this BEFORE writing an asset into config.json -- monitor.py runs the same check and silently deletes any asset that fails.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, e.g. AQUA."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's full 56-character G... address. Never abbreviate it and never write one from memory."
+          }
+        },
+        "required": [
+          "code",
+          "issuer"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_asset_price",
+      "description": "Current USD mark for one Stellar asset plus live order-book liquidity (spread, bid depth, ask depth). Use this to set that asset's buy_below/sell_above thresholds against its real current price, and to judge how large a position it could actually support.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, e.g. AQUA."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's full 56-character G... address."
+          }
+        },
+        "required": [
+          "code",
+          "issuer"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_asset_price_history",
+      "description": "Hourly OHLC candles for one Stellar asset, oldest first, for computing indicators on an extra asset leg. Note this history comes from Stellar's on-chain DEX and is thinner and gappier than the XLM/USD history from get_price_history -- hours with no trades are absent entirely.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code, e.g. AQUA."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's full 56-character G... address."
+          },
+          "hours": {
+            "type": "integer",
+            "description": "How many hours of history (default 168)."
+          }
+        },
+        "required": [
+          "code",
+          "issuer"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "backtest_maker_strategy",
+      "description": "Replay a market-making strategy over recorded order book snapshots joined to the executed trade tape, and report what its resting quotes would have earned. Use this on every maker revision before committing it. Returns trades (FILLS, not requotes), fill_rate, quote_uptime_pct, spread_captured_usd, adverse_selection_usd and their difference net_edge_usd, inventory_max_usd, return_pct, null_pct and beats_null. Read spread_captured_usd and adverse_selection_usd together -- gross spread capture alone makes every width look profitable. Check decide_source is 'main.py:quote' before trusting any number: anything else means quote() could not be imported and the result describes a fallback, not your code.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {
+            "type": "string",
+            "description": "Absolute path to the strategy directory."
+          },
+          "days": {
+            "type": "number",
+            "description": "Days of recorded book and tape to replay. Default 7."
+          }
+        },
+        "required": [
+          "strategy_path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_tape_stats",
+      "description": "Executed-trade statistics for XLM/USDC over the last N hours, bucketed by trade size. Answers the sizing questions the order book cannot: how many trades per hour print at or above the size you would quote, how much volume that is, how one-sided the aggressing flow has been (taker_buy_pct), and what share was liquidity-pool flow no resting offer could have captured. Note the flow is roughly balanced over a week but wildly one-sided over any single hour, so do not calibrate an inventory rule on a short window.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "hours": {
+            "type": "integer",
+            "description": "Lookback window in hours. Default 24."
+          }
+        },
+        "required": []
+      }
+    }
   }
 ]

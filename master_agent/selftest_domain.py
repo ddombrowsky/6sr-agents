@@ -390,14 +390,15 @@ def _scratch(cfg):
 SDEX = domain.get('sdex')
 NULL = domain.get('null')
 FORECAST = domain.get('forecast')
-# Not yet folded into the obs-type/encode-decode/differential sections below (those pin
-# behavior against a pre-refactor monitor.py that predates this domain entirely) -- but a
-# domain this file never even imports is a domain domain.check() has never run against,
-# which is exactly the class of bug ("kalshi is missing a required contract member") that
-# adding RANK_GRACE_S below could otherwise introduce silently.
+MAKER = domain.get('sdex_maker')
+# Neither of these is yet folded into the obs-type/encode-decode/differential sections
+# below (those pin behavior against a pre-refactor monitor.py that predates both domains
+# entirely) -- but a domain this file never even imports is a domain domain.check() has
+# never run against, which is exactly the class of bug ("kalshi is missing a required
+# contract member") that adding RANK_GRACE_S below could otherwise introduce silently.
 KALSHI = domain.get('kalshi')
 
-for mod in (SDEX, NULL, FORECAST, KALSHI):
+for mod in (SDEX, NULL, FORECAST, MAKER, KALSHI):
     problems = domain.check(mod)
     check(f'{mod.NAME} satisfies the contract', not problems, '; '.join(problems))
 
@@ -407,12 +408,14 @@ check('the registry is cached', domain.get('sdex') is SDEX)
 
 # RANK_GRACE_S used to be the single constant YOUNG_GRACE_S, applied by monitor.py to
 # every domain alike -- see domain.py's contract entry for why it became per-domain.
-# sdex/null/forecast all resolve fast enough that the old flat 3h default still applies;
-# pin that so nobody "tunes" it differently by accident. kalshi is the one domain this was
-# built for, so its value must genuinely differ, not just be present.
-check('sdex/null/forecast RANK_GRACE_S is unchanged from the old shared default (3h)',
-      SDEX.RANK_GRACE_S == NULL.RANK_GRACE_S == FORECAST.RANK_GRACE_S == 3 * 3600,
-      f'{SDEX.RANK_GRACE_S}, {NULL.RANK_GRACE_S}, {FORECAST.RANK_GRACE_S}')
+# sdex/null/forecast/sdex_maker all resolve fast enough that the old flat 3h default
+# still applies; pin that so nobody "tunes" it differently by accident. kalshi is the one
+# domain this was built for, so its value must genuinely differ, not just be present.
+check('sdex/null/forecast/maker RANK_GRACE_S is unchanged from the old shared default (3h)',
+      SDEX.RANK_GRACE_S == NULL.RANK_GRACE_S == FORECAST.RANK_GRACE_S
+      == MAKER.RANK_GRACE_S == 3 * 3600,
+      f'{SDEX.RANK_GRACE_S}, {NULL.RANK_GRACE_S}, {FORECAST.RANK_GRACE_S}, '
+      f'{MAKER.RANK_GRACE_S}')
 check('kalshi RANK_GRACE_S exceeds the generic default to match slow real-world resolution',
       KALSHI.RANK_GRACE_S > 3 * 3600, KALSHI.RANK_GRACE_S)
 
@@ -422,8 +425,19 @@ check('kalshi RANK_GRACE_S exceeds the generic default to match slow real-world 
 _sdex_obs = SDEX.Observation(price=_PRICE, marks={'XLM': _PRICE})
 _null_obs = NULL.Observation(tick=0)
 _forecast_obs = FORECAST.Observation(tick=0)
-check('the three domains have pairwise-unrelated observation types',
-      len({type(_sdex_obs), type(_null_obs), type(_forecast_obs)}) == 3)
+# The maker observes a BOOK, not a scalar -- which is why re-exporting sdex's Observation
+# would both fail the check below and be wrong. A taker needs one price to compare a
+# threshold against; a maker needs to know what is already resting where, because that is
+# its queue position.
+_maker_obs = MAKER.Observation(mid=_PRICE, bid=_PRICE * 0.9995, ask=_PRICE * 1.0005,
+                               spread_bp=10.0, bid_depth_usd=1000.0,
+                               ask_depth_usd=1000.0, cex_mid=_PRICE,
+                               bids=[{'p': _PRICE * 0.9995, 'usd': 5.0}],
+                               asks=[{'p': _PRICE * 1.0005, 'usd': 5.0}],
+                               marks={'XLM': _PRICE})
+check('the four domains have pairwise-unrelated observation types',
+      len({type(_sdex_obs), type(_null_obs), type(_forecast_obs),
+           type(_maker_obs)}) == 4)
 
 # ============================================== 2. observation encode/decode round trip
 #
@@ -433,7 +447,8 @@ check('the three domains have pairwise-unrelated observation types',
 # that hid the dead revision layer for weeks.
 
 for label, mod, obs in (('sdex', SDEX, _sdex_obs), ('null', NULL, _null_obs),
-                        ('forecast', FORECAST, _forecast_obs)):
+                        ('forecast', FORECAST, _forecast_obs),
+                        ('sdex_maker', MAKER, _maker_obs)):
     encoded = mod.encode_observation(obs)
     # A str is the whole requirement: monitor passes argv as a list, so no shell sees it
     # and spaces are harmless. What is NOT allowed is returning a dict or a tuple, which

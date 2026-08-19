@@ -208,6 +208,21 @@ rm -rf "$TOOLS_COPY/.git"
 say ""
 say "--- selftest_domain.py ---"
 
+# The differential baseline, when this repo's own history cannot supply one. create.sh
+# git-inits /opt/master_agent fresh, so a new container has a one-commit history and
+# selftest_domain.py's content-addressed search finds nothing -- at which point every
+# differential check SKIPS and the run is green having verified nothing, which is worse
+# than red. The `domain-baseline` orphan branch carries the pre-refactor monitor.py
+# imported from the mirror repo; the commit is still checked against the same three
+# markers, so pinning the wrong one is reported rather than believed.
+if [ -z "$DOMAIN_BASELINE_COMMIT" ]; then
+    DOMAIN_BASELINE_COMMIT=$(git -C "$MA" rev-parse --verify -q domain-baseline || true)
+    export DOMAIN_BASELINE_COMMIT
+    if [ -n "$DOMAIN_BASELINE_COMMIT" ]; then
+        say "baseline pinned to domain-baseline ($DOMAIN_BASELINE_COMMIT)"
+    fi
+fi
+
 set +e
 (
   cd "$MA" || exit 1

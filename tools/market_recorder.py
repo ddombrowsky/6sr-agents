@@ -44,13 +44,41 @@ HISTORY_PATH = Path('/opt/trades/.market_history.jsonl')
 # file is plausibly over the cap.
 MAX_ROWS = 60000
 
-# Deliberately an OVER-estimate of a row (real ones measure ~300 B), because it is only
-# ever used as the cheap size guard in _trim(). Under-estimate it and the guard trips
-# while the file is still short of MAX_ROWS lines, at which point _trim reads and
-# rewrites the entire file on EVERY append, forever, and never gets under the guard
-# because there is nothing to remove. The old constant was 200, which was harmless at
-# one row an hour and would have become a multi-megabyte rewrite per minute here.
-_ROW_BYTES = 400
+# Deliberately an OVER-estimate of a row, because it is only ever used as the cheap size
+# guard in _trim(). Under-estimate it and the guard trips while the file is still short
+# of MAX_ROWS lines, at which point _trim reads and rewrites the entire file on EVERY
+# append, forever, and never gets under the guard because there is nothing to remove.
+# The old constant was 200, which was harmless at one row an hour and would have become a
+# multi-megabyte rewrite per minute here.
+#
+# Rows measured ~300 B before the ladder below and ~1,050 B with it, so this went
+# 400 -> 1600 in the same commit the ladder landed. Raising it is safe (the guard just
+# trips later); lowering it below the true row size is the failure described above.
+_ROW_BYTES = 1600
+
+# How many raw book levels per side to keep. The maker fill model needs depth AT a price,
+# not aggregate depth across the whole book: an offer resting at P fills only after the
+# size already queued at or better than P is consumed, and bid_depth_usd/ask_depth_usd sum
+# the whole 50-level book and so cannot answer that.
+#
+# Five, and not more, because the raw levels are here for the STRUCTURE of the touch --
+# which on this pair is routinely a couple of half-cent dust orders resting a fraction of
+# a basis point ahead of the real depth, and a maker's whole decision is whether to step
+# in front of them. Depth further out is covered exactly, and far more compactly, by the
+# cumulative curve below: measured on the live book, five levels reach only ~3 bp, while
+# the depth that matters for a quote 5-40 bp out runs to $8k and beyond.
+_LADDER_LEVELS = 5
+
+# Basis points from the touch at which cumulative depth is recorded. Chosen dense near the
+# touch, where a quote's queue position is decided, and sparse past 20 bp, where this book
+# is thousands of dollars deep and the exact number stops changing any decision.
+#
+# This is the field the fill model actually reads: cum[d] is "everything resting at or
+# better than d bp from the touch", which is exactly the FIFO queue ahead of a quote
+# placed there -- same-price orders included, since we joined the back of that queue. Two
+# arrays of 17 numbers cost ~400 B and answer at any distance; getting the same coverage
+# from raw levels would take 50 of them.
+_CUM_BP = (0.5, 1, 1.5, 2, 3, 4, 5, 7, 10, 15, 20, 30, 50, 75, 100, 150, 200)
 
 RECORD_INTERVAL = 60        # what the daemon uses, and what basis.latest() assumes
 
@@ -62,6 +90,33 @@ def _safe(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except Exception:
         return None
+
+
+def _cum_depth(levels, touch, side):
+    """Cumulative USD resting at or better than each _CUM_BP offset from `touch`.
+
+    Returned as [[bp, usd], ...] so it survives a JSON round trip as a list of pairs (a
+    dict would key on stringified floats). None when the book or the touch is missing --
+    every field in a row is independently optional, and a reader must handle its absence
+    anyway for the months of history recorded before this existed.
+
+    "At or better than" deliberately includes orders at exactly that price: a quote
+    joining a price level goes to the BACK of the queue already there, so that size is
+    ahead of it. Treating it as behind is the single easiest way to make a backtest fill
+    at prices it never would have.
+    """
+    if not levels or not touch or touch <= 0:
+        return None
+    out = []
+    try:
+        for bp in _CUM_BP:
+            edge = touch * (1 - bp / 10000.0) if side == 'bid' else touch * (1 + bp / 10000.0)
+            total = sum(lv['usd'] for lv in levels
+                        if (lv['price'] >= edge if side == 'bid' else lv['price'] <= edge))
+            out.append([bp, round(total, 2)])
+    except Exception:
+        return None
+    return out
 
 
 def snapshot(spec='XLM'):
@@ -85,9 +140,29 @@ def snapshot(spec='XLM'):
     row['dex_bid'] = book.get('best_bid')
     row['dex_ask'] = book.get('best_ask')
     row['dex_mid'] = book.get('mid')
-    row['spread_bp'] = round(book['spread_pct'] * 10000, 2) if book.get('spread_pct') else None
+    # `is not None`, not a truth test: a LOCKED book (bid == ask) has spread_pct 0.0,
+    # and recording that real zero as None is what makes a reader's
+    # `float(row.get('spread_bp', 0.0))` raise instead of taking its default.
+    row['spread_bp'] = (round(book['spread_pct'] * 10000, 2)
+                        if book.get('spread_pct') is not None else None)
     row['bid_depth_usd'] = book.get('bid_depth_usd')
     row['ask_depth_usd'] = book.get('ask_depth_usd')
+
+    # The near ladder, kept because the aggregates above cannot answer "how much is queued
+    # ahead of a quote at price P" -- see _LADDER_LEVELS. Additive: every existing reader
+    # (basis.latest, backtest._basis_series, basis_report) reads named keys and ignores
+    # unknown ones, so old rows without these keys stay readable and new rows stay
+    # readable by old code. Prices are NOT rounded -- a book 10 bp wide has meaning in the
+    # 6th decimal of an XLM price. Sizes are, but to 4 dp rather than 2: the top of this
+    # book is routinely half-cent dust orders resting inside the real depth, and rounding
+    # those to $0.00 would report zero size queued ahead of a quote placed there, which is
+    # an error in the optimistic direction on the one number the fill model is built on.
+    row['bids'] = [{'p': lv['price'], 'usd': round(lv['usd'], 4)}
+                   for lv in (book.get('bids') or [])[:_LADDER_LEVELS]]
+    row['asks'] = [{'p': lv['price'], 'usd': round(lv['usd'], 4)}
+                   for lv in (book.get('asks') or [])[:_LADDER_LEVELS]]
+    row['bid_cum'] = _cum_depth(book.get('bids'), row.get('dex_bid'), 'bid')
+    row['ask_cum'] = _cum_depth(book.get('asks'), row.get('dex_ask'), 'ask')
 
     # The book we just fetched, not another one. get_orderbook is uncached, so letting
     # half_spread fetch its own doubled the Horizon load per row and let spread_bp and
