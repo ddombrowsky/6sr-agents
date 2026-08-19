@@ -72,6 +72,13 @@ NAME = 'forecast'
 TEMPLATE_REPO = os.environ.get('FORECAST_TEMPLATE_REPO', 'file:///opt/template_repo_forecast')
 
 STARTING_SCORE = 1000.0
+
+# See domain_sdex.RANK_GRACE_S's comment: this is the value every domain shared as
+# monitor.py's bare YOUNG_GRACE_S constant before it became domain-owned. Questions here
+# resolve every ~30s (CONFIDENCE_PRIOR_N's comment below), so three cycles' worth is
+# thousands of resolutions -- unchanged.
+RANK_GRACE_S = 3 * 3600
+
 # Each point of (base_brier - brier), summed over every resolved forecast, is worth this
 # many score points. Summed rather than averaged so volume compounds -- more good calls
 # ranks higher than fewer good calls at the same accuracy, which is this domain's direct

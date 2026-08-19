@@ -44,8 +44,8 @@ The reusable criterion. SDEX satisfies 1–4; almost nothing satisfies 5 today.
    skill; every domain needs its own version of this or the leaderboard ranks luck.
 4. **Caps enforced outside the agent's reach.** The `stellar_trader.py:62-72` pattern:
    never caller-supplied, never overridable by a config or a revision.
-5. **Enough independent bets per hour that ranking isn't noise.** *This is the one the
-   current system fails.* We cull to top-8 hourly on a few hours of one asset's price
+5. **Enough independent bets per hour that ranking isn't noise.**
+   We cull to top-8 hourly on a few hours of one asset's price
    path. Most of that ordering is sampling noise, so the loop clones the winners of coin
    flips. Domains differ enormously here, and it should drive the choice.
 
@@ -108,35 +108,6 @@ Services, content, arbitrage of our own compute. This is the honest destination 
 introduces counterparties and terms-of-service surface that no current gate models. It
 needs a *different loop*, not a different tool. Revisit only after the domain-plugin work
 below exists and after at least one non-trading domain has run successfully.
-
----
-
-## The architectural change that makes it generic
-
-The domain is currently welded in at three places:
-
-- `master_agent/score.py` — fitness assumes a portfolio net worth
-- `tools/backtest.py` — replay assumes OHLC candles
-- `tools/trade_logger.py` / `tools/stellar_trader.py` — execution assumes a DEX swap
-
-**Make the domain a plugin.** A strategy declares its domain; monitor calls
-`domain.score(state)`, `domain.replay(main_py)`, `domain.execute(...)`, `domain.caps`.
-
-Do this **as part of adding domain #2, not speculatively before it.** Abstractions built
-against one example are built wrong.
-
-Then the piece currently missing for the stated goal:
-
-- **One leaderboard across domains**, with fitness normalized as *excess over that
-  domain's null, in risk units* (Sharpe-like, not raw %), so a prediction-market strategy
-  and an SDEX strategy are comparable at all.
-- **`KEEP_TOP_N` and the live slot become per-domain**, with a bandit allocating clone
-  budget across domains by realized excess return.
-
-That second bullet is the actual mechanism for "try new things and reinforce what worked"
-*at the domain level*. Without it, whichever domain happens to be working this week wins
-the entire population and the other is culled before it learns anything — the same
-failure mode `TEMPLATE_SPAWNS_PER_CYCLE` exists to prevent within a single domain.
 
 ---
 
