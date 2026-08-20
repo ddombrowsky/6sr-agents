@@ -29,11 +29,11 @@ Each script needs `OLLAMA_API_KEY` set and expects an Ollama server reachable at
 
 ```
 source env.sh
-python agent-bootstrap.py
+python emperor-agent.py
 ```
 
 - `hello.py` — minimal one-shot streaming chat, no tools. Points at `127.0.0.1:11434`.
-- `agent-bootstrap.py` — the actual tool-calling agent: an interactive REPL
+- `emperor-agent.py` — the actual tool-calling agent: an interactive REPL
   (`main()` reads from stdin) that loops `client.chat(...)` with `tools=TOOL_SCHEMAS`
   until the model responds without a tool call (`run_turn`). Also points at
   `127.0.0.1:11434`.
@@ -47,7 +47,7 @@ into a separate multi-repo trading-agent system (`master_agent/`, `template_repo
 `copy.sh` moves files between the two, and the direction depends on the flag:
 
 - `./copy.sh --to` — root → `v/agents/`: copies `requirements.txt`,
-  `agent-bootstrap.py`, `sr_agent_tools.py` and `tools.json` in, backing up the previous
+  `emperor-agent.py`, `sr_agent_tools.py` and `tools.json` in, backing up the previous
   copy into `v/agents/bak.<random>/` first. It also copies `master_agent/*`, `tools/*`,
   `template_repo/*` and `scripts/*.sh` across — with **flat globs**, so a new file must be
   flat inside those directories or it will silently not deploy.
@@ -131,14 +131,14 @@ threads around is deliberately opaque — the loop only tests it for `None`.
 
 ## Architecture: tool-calling loop
 
-The agent pattern split across `agent-bootstrap.py`, `sr_agent_tools.py`, and
+The agent pattern split across `emperor-agent.py`, `sr_agent_tools.py`, and
 `tools.json` is:
 
 1. **`tools.json`** — OpenAI-style tool schemas (`type: function`, JSON-schema
    `parameters`) passed to `client.chat(..., tools=TOOL_SCHEMAS)`. This is the
    source of truth for what the model is told is callable.
-2. **`TOOLS` dict** in `agent-bootstrap.py` — maps each schema's `name` to the actual
-   Python callable. Tool implementations can live inline in `agent-bootstrap.py`
+2. **`TOOLS` dict** in `emperor-agent.py` — maps each schema's `name` to the actual
+   Python callable. Tool implementations can live inline in `emperor-agent.py`
    (e.g. `calculate`, `get_current_time`) or be imported from a separate module like
    `sr_agent_tools.py` (e.g. `get_uptime`).
 3. **`dispatch()`** — takes one `tool_call` from the model's response, looks it up in
@@ -149,7 +149,7 @@ The agent pattern split across `agent-bootstrap.py`, `sr_agent_tools.py`, and
    around again. Returns once the model replies with plain content instead of tool
    calls.
 
-When adding a new tool: add its implementation (in `agent-bootstrap.py` or a new
+When adding a new tool: add its implementation (in `emperor-agent.py` or a new
 function in `sr_agent_tools.py`), register it in the `TOOLS` dict, and add a matching
 schema entry to `tools.json`. The schema `description` is what the model uses to
 decide when to call the tool, so be specific about when it applies (see the

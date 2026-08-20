@@ -3,6 +3,8 @@ import operator
 import subprocess
 from datetime import datetime
 
+from memory_tools import remember, recall, forget, list_memories
+
 
 def get_uptime() -> str:
     result = subprocess.run(['uptime'], capture_output=True, text=True, check=True)
@@ -105,4 +107,8 @@ TOOLS = {
     'install_package': install_package,
     'update_package_list': update_package_list,
     'exec': exec,
+    'remember': remember,
+    'recall': recall,
+    'forget': forget,
+    'list_memories': list_memories,
 }
