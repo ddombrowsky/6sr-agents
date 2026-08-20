@@ -71,6 +71,12 @@ Everything that *is* about a specific way of making money sits behind one module
 - `master_agent/domain.py` — the contract, plus the `DOMAIN` env-var registry
   (`domain.get()`), a `check(mod)` validator, and the shared filesystem/role constants.
   Its module docstring is the spec: read it before adding anything to `monitor.py`.
+  It also owns `live_switch()`, the domain-agnostic off switch for real execution
+  (`/opt/.live_disabled`, or `LIVE_TRADING=off` on the monitor process), which every
+  domain's `live_enabled()` contract member defers to before adding its own reasons.
+  `live_enabled()` gates promotion and the live flag for the whole domain;
+  `can_execute_live(name)` is the per-strategy question and neither replaces the other.
+  Both fail closed. `monitor.py --live-status` prints the verdict.
 - `master_agent/domain_sdex.py` — the Stellar DEX domain (the default). Prices, marks,
   order books, assets, threshold bands, the config gates, the seed/tweak fallbacks, the
   promotion gates, the real-money caps.
