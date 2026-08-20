@@ -427,6 +427,20 @@ def importability(source_or_path):
 # Criterion 4: caps enforced outside the agent's reach. No money exists yet (Phase 1).
 # --------------------------------------------------------------------------------------
 
+def live_enabled():
+    """(enabled, reason). Constant False, for the same reason can_execute_live is.
+
+    Phase 1 is paper-only by construction: no order path exists yet. When Phase 2
+    builds one this should start deferring to domain.live_switch() like domain_sdex does,
+    plus whatever kill switch the Kalshi execution module grows -- see KALSHI.md.
+    The switch is still a real member rather than an inherited default: the loop asks it
+    every cycle, and a domain that answered "enabled" here while refusing every strategy
+    below would put a "live trading is on" line in the cycle log of a system with no
+    money in it.
+    """
+    return False, 'the kalshi domain has no execution path yet (Phase 2, not built)'
+
+
 def caps():
     """No money, no caps. None is the contract's "cannot be consulted" value."""
     return None

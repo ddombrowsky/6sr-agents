@@ -488,6 +488,33 @@ def importability(source_or_path):
 # Criterion 4: caps enforced outside the agent's reach.
 # --------------------------------------------------------------------------------------
 
+def live_enabled():
+    """May this domain keep ANY strategy live right now? (enabled, reason). FAILS CLOSED.
+
+    Same switch, same order and same reasons as domain_sdex.live_enabled -- read that
+    one; a maker rests offers instead of taking, but "the operator turned real money off"
+    and "the money boundary is halted or absent" are identical questions on both sides.
+    Written out rather than imported from domain_sdex so this module keeps its own
+    boundary code (it deliberately does not inherit sdex's), and because a maker will
+    eventually have a reason of its own here: resting offers that outlive a halt.
+    """
+    enabled, reason = domain.live_switch()
+    if not enabled:
+        return False, reason
+    if os.environ.get('PAPER_ONLY'):
+        return False, 'PAPER_ONLY is set on this process'
+    st = _tool('stellar_trader')
+    if st is None:
+        return False, 'stellar_trader unavailable; the money boundary cannot be consulted'
+    try:
+        halted = st._HALT_PATH.exists()
+    except Exception as e:
+        return False, f'could not check the stellar_trader halt switch ({e})'
+    if halted:
+        return False, f'{st._HALT_PATH} exists (stellar_trader kill switch)'
+    return True, ''
+
+
 def caps():
     """The live cap block, read off stellar_trader. Never raises; None when unreadable.
 

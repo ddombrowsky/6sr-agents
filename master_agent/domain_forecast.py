@@ -330,6 +330,19 @@ def importability(source_or_path):
 # Criterion 4: caps enforced outside the agent's reach. No money exists in this domain.
 # --------------------------------------------------------------------------------------
 
+def live_enabled():
+    """(enabled, reason). Constant False, for the same reason can_execute_live is.
+
+    A forecasting benchmark scores Brier distance, not P&L. There is nothing to
+    execute and nothing an operator could switch on.
+    The switch is still a real member rather than an inherited default: the loop asks it
+    every cycle, and a domain that answered "enabled" here while refusing every strategy
+    below would put a "live trading is on" line in the cycle log of a system with no
+    money in it.
+    """
+    return False, 'the forecast domain has no execution path, so nothing can ever be live'
+
+
 def caps():
     """No money, no caps. None is the contract's "cannot be consulted" value."""
     return None

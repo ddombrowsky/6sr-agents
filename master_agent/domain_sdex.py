@@ -344,6 +344,52 @@ def _tools():
 # Criterion 4: the real-money boundary.
 # --------------------------------------------------------------------------------------
 
+def live_enabled():
+    """May this domain keep ANY strategy live right now? (enabled, reason). FAILS CLOSED.
+
+    The coarse switch the loop asks once per cycle before it promotes anything;
+    can_execute_live is the per-strategy one, and neither substitutes for the other (see
+    domain.py's criterion 4). Four ways to say no, none of them reachable by a revision:
+
+      * the operator's generic switch -- domain.live_switch(), i.e. /opt/.live_disabled
+        or LIVE_TRADING=off on the monitor process;
+      * PAPER_ONLY in this process's environment, which every strategy monitor starts
+        inherits and which stellar_trader.submit_trade refuses on structurally. A monitor
+        running paper-only that still promoted, wrote live.flag and recorded promotion
+        sizing was reporting a live strategy that could not place an order;
+      * stellar_trader's own /opt/trades/.live_halt -- what already refuses every real
+        order, and what _mark_stuck writes automatically past MAX_STUCK_USD. Surfacing it
+        to the loop is the point: it used to stop the money without stopping the loop, so
+        monitor kept promoting and kept believing money was deployed behind positions
+        that were never opened, which is the exact divergence live_report.py had to be
+        built to notice after 343 consecutive refused orders went unremarked;
+      * stellar_trader not importing at all -- the money boundary is not present to
+        enforce anything, so nothing may be live.
+
+    _HALT_PATH is read off the module rather than restated as a literal here. That
+    constant belongs to the money boundary; a second copy on this side is a copy that
+    eventually disagrees with the one doing the refusing.
+    """
+    enabled, reason = domain.live_switch()
+    if not enabled:
+        return False, reason
+    if os.environ.get('PAPER_ONLY'):
+        return False, 'PAPER_ONLY is set on this process'
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import stellar_trader
+    except Exception as e:
+        return False, f'could not import stellar_trader to check its halt switch ({e})'
+    try:
+        halted = stellar_trader._HALT_PATH.exists()
+    except Exception as e:
+        return False, f'could not check the stellar_trader halt switch ({e})'
+    if halted:
+        return False, f'{stellar_trader._HALT_PATH} exists (stellar_trader kill switch)'
+    return True, ''
+
+
 def caps():
     """stellar_trader's current caps, or None. Never raises.
 

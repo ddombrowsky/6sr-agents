@@ -79,6 +79,7 @@ sixth is one the list omits.
 4. CAPS ENFORCED OUTSIDE THE AGENT'S REACH. Never caller-supplied, never overridable by a
    config or a revision -- the revision LLM runs `exec` as root and is told it may edit
    its own tooling, so a cap it can reach is not a cap.
+     live_enabled()                -> (ok, reason)     FAILS CLOSED
      caps()                        -> dict | None
      can_execute_live(name)        -> (ok, reason)     FAILS CLOSED
      promotion_sizing(name)        -> dict | None
@@ -91,10 +92,32 @@ sixth is one the list omits.
    in which execution is structurally impossible. `{'PAPER_ONLY': '1'}` for sdex. A domain
    with no money returns `{}`.
 
-   Note `can_execute_live` is the one member that fails CLOSED. Every other verdict here
-   guards a fitness signal; this one decides whether real money is handed to code that
-   may be incapable of spending it, and believing money is deployed behind a position
-   that was never opened is worse than not promoting at all.
+   Note `can_execute_live` and `live_enabled` are the two members that fail CLOSED.
+   Every other verdict here guards a fitness signal; these two decide whether real money
+   moves, and believing money is deployed behind a position that was never opened is
+   worse than not promoting at all.
+
+   The two answer different questions and neither substitutes for the other:
+   `can_execute_live(name)` asks whether THAT STRATEGY is structurally able to place a
+   real order; `live_enabled()` asks whether THIS DOMAIN may have a live strategy at all
+   right now. Before it existed there was no domain-agnostic way to say "run this
+   population, but not for real money" -- a money-free domain hardcoded can_execute_live
+   to False, and sdex could only be stopped by tools/stellar_trader.py's own
+   /opt/trades/.live_halt, which is behind the money boundary and invisible to the loop:
+   monitor went on promoting, writing live.flag and recording promotion sizing for a
+   strategy whose every order was refused, which is precisely the "monitor believes money
+   is deployed" state the paragraph above is about. Now the loop asks first, clears
+   live.flag when the answer is no, and restores it when the answer changes back.
+
+   `live_switch()` below is the domain-agnostic half every domain that moves money should
+   defer to first (the operator's file/env switch); a domain adds its own reasons on top
+   -- for sdex, its own .live_halt. A domain with no money returns a constant False, the
+   same honest answer its can_execute_live gives.
+
+   It gates PROMOTION and the live flag, not execution: turning it off leaves any open
+   real position exactly where it is, for the same reason the boundary-integrity halt
+   does -- flattening routes through the money path an operator has just asked to stop
+   using. Winding a position down stays a separate, deliberate act.
 
 5. ENOUGH INDEPENDENT BETS PER HOUR THAT RANKING ISN'T NOISE. Deliberately NOT a member.
    This is a property you judge when *choosing* a domain, not something the loop can ask
@@ -191,6 +214,57 @@ ROLE_REFINE = 'refine'
 ROLE_EXPLORE = 'explore'
 
 
+# The domain-agnostic half of DOMAIN.live_enabled(): the operator's off switch for real
+# execution. Two mechanisms, because they have different reach:
+#
+#   * LIVE_DISABLED_FILE -- takes effect on the next cycle of an already-running monitor,
+#     which is what you want at 3am. Deliberately in /opt and NOT in any repo the revision
+#     LLM is invited to edit (/opt/master_agent, /opt/tools) or in a strategy directory:
+#     a switch a revision can delete is not a switch. Its contents, if any, are printed
+#     as the reason, so `echo 'why' > /opt/.live_disabled` self-documents the halt.
+#   * LIVE_ENV_VAR -- set on the process, so `LIVE_TRADING=off ./emperor.sh` brings a
+#     whole run up paper-only with nothing to clean up afterwards. Read at call time, but
+#     a process's environment cannot be changed from outside, so this one needs a restart.
+#
+# UNSET MEANS ENABLED (every existing deployment sets neither), but any *set* value that
+# is not recognised as an on-value disables: for a safety switch, `LIVE_TRADING=of` must
+# fail the safe way, and the cost of that is a typo'd on-value reading as off, which is
+# loud (the reason is printed every cycle) rather than silent.
+LIVE_DISABLED_FILE = Path('/opt/.live_disabled')
+LIVE_ENV_VAR = 'LIVE_TRADING'
+LIVE_ON_VALUES = ('1', 'on', 'yes', 'true', 'enabled', 'live')
+
+
+def live_switch():
+    """The operator's real-execution switch, as (enabled, reason). Never raises.
+
+    Not itself a contract member -- a domain's `live_enabled()` is, and one that moves
+    money should consult this first and add its own reasons on top (see domain_sdex).
+    Kept here rather than duplicated per domain because "the operator turned it off" is
+    not domain knowledge, and a kill switch with two implementations is one that will
+    disagree with itself about whether it is on.
+
+    Fails CLOSED: if the sentinel cannot even be stat'd, the honest answer is that we do
+    not know whether an operator asked for real money to stop, and the safe reading of
+    "don't know" is "stop".
+    """
+    try:
+        exists = LIVE_DISABLED_FILE.exists()
+    except Exception as e:
+        return False, f'could not check {LIVE_DISABLED_FILE} ({e})'
+    if exists:
+        try:
+            note = LIVE_DISABLED_FILE.read_text().strip().splitlines()
+        except Exception:
+            note = []
+        detail = f': {note[0][:200]}' if note else ''
+        return False, f'{LIVE_DISABLED_FILE} exists{detail}'
+    setting = os.environ.get(LIVE_ENV_VAR)
+    if setting is not None and setting.strip().lower() not in LIVE_ON_VALUES:
+        return False, f'{LIVE_ENV_VAR}={setting!r} in the environment'
+    return True, ''
+
+
 # What check() insists on: (member_name, minimum_positional_args) for callables,
 # (member_name, None) for plain attributes. Kept as data rather than as a base class so a
 # domain stays a plain module -- and so this list reads as the checklist a new domain
@@ -219,6 +293,7 @@ CONTRACT = (
     ('replay', 1),
     ('importability', 1),
     # criterion 4
+    ('live_enabled', 0),
     ('caps', 0),
     ('can_execute_live', 1),
     ('promotion_sizing', 1),

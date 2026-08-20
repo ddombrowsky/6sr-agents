@@ -172,6 +172,19 @@ def importability(source_or_path):
     return None
 
 
+def live_enabled():
+    """(enabled, reason). Constant False, for the same reason can_execute_live is.
+
+    There is no money in this domain, so the only honest answer is that real
+    execution is off and cannot be switched on.
+    The switch is still a real member rather than an inherited default: the loop asks it
+    every cycle, and a domain that answered "enabled" here while refusing every strategy
+    below would put a "live trading is on" line in the cycle log of a system with no
+    money in it.
+    """
+    return False, 'the null domain has no execution path, so nothing can ever be live'
+
+
 def caps():
     """No money, no caps. None is the contract's "cannot be consulted" value and every
     caller in the loop already tolerates it."""

@@ -1321,8 +1321,32 @@ def promote_live_strategy(current_leader, leader_score):
     position first — if it can't finish in one cycle, the old leader simply stays live
     and this retries next cycle (safe: run()'s cull loop exempts the live strategy from
     KEEP_TOP_N below).
+
+    Nothing happens at all if DOMAIN.live_enabled() says real money is switched off --
+    see below.
     """
     live = load_live_strategy()
+
+    # Asked first, before the integrity check and before the "already live" early return.
+    # This is the operator (or the domain's own kill switch) saying "no real money right
+    # now", and a system that has been told to stop should not go on to adopt a fresh
+    # integrity baseline, promote anyone, or record promotion sizing for a strategy whose
+    # every order is going to be refused. See DOMAIN.live_enabled / domain.live_switch.
+    #
+    # The flag is cleared but live_strategy.json is left pointing at the same name, so the
+    # "already live" path below restores the flag by itself once the switch comes back --
+    # the same recovery shape the integrity halt has, and for the same reason: a halt with
+    # no automatic way back is one that gets worked around instead of used.
+    enabled, why_not = DOMAIN.live_enabled()
+    if not enabled:
+        print(f'Live trading is disabled for the {DOMAIN.NAME} domain: {why_not}')
+        held = live.get('name') if live else None
+        if held and (STRATEGIES_DIR / held / 'live.flag').exists():
+            set_live_flag(held, False)
+            print(f'  cleared live.flag on {held}; any open real position is left exactly '
+                  f'as it is -- flattening it would run through the money path that was '
+                  f'just switched off, so wind it down deliberately if you want it flat')
+        return
 
     # Integrity is checked before the "already live" early return, so a boundary change
     # halts an incumbent too -- not just a would-be promotion.
@@ -1393,18 +1417,31 @@ def promote_strategy_manual(name, force=False):
     """Operator-driven promotion: wind down whoever is live, put `name` live instead.
 
     Same shape as promote_live_strategy, called by hand (`monitor.py --promote NAME`)
-    against an operator's own choice of strategy rather than this cycle's #1. The three
+    against an operator's own choice of strategy rather than this cycle's #1. The four
     hard gates are never bypassable, --force or not, because each guards something a
     human picking a name by hand cannot substitute for:
+      * DOMAIN.live_enabled       -- real money is switched off for this domain entirely
       * check_boundary_integrity  -- a compromised revision boundary
       * DOMAIN.can_execute_live   -- a strategy structurally incapable of a real order
       * DOMAIN.retire_live        -- a real position left behind with nothing watching it
+    live_enabled is emphatically not a --force candidate: --force substitutes an
+    operator's judgment for an automatic track-record bar, and the switch IS an operator's
+    judgment, already expressed. Overriding it here would mean the flag that says "I know
+    what I am doing" cancels the file that says "do not trade".
     --force only skips qualifies_for_live's track-record bar (trade count/age/score),
     since that gate exists purely as a stand-in for judgment an operator is now supplying
     directly by picking this name. Returns (ok, [lines to print]).
     """
     if not (STRATEGIES_DIR / name / 'main.py').exists():
         return False, [f'{name}: no such strategy ({STRATEGIES_DIR / name} has no main.py)']
+
+    enabled, why_not = DOMAIN.live_enabled()
+    if not enabled:
+        return False, [f'refusing to promote {name}: live trading is disabled for the '
+                       f'{DOMAIN.NAME} domain ({why_not})',
+                       f'  --force does not override this. Clear the switch '
+                       f'({domain.LIVE_DISABLED_FILE}, or {domain.LIVE_ENV_VAR} in the '
+                       f'environment) and run this again.']
 
     intact, problems = check_boundary_integrity()
     if not intact:
@@ -1709,19 +1746,28 @@ def run():
         # Wait an hour before next cycle (or exit here if asked to stop)
         sleep_or_exit(CYCLE_SLEEP)
 
-USAGE = """usage: monitor.py [--ensure-recorder | --promote NAME [--force]]
+USAGE = """usage: monitor.py [--ensure-recorder | --live-status | --promote NAME [--force]]
 
   (no arguments)        run the evolutionary loop forever, one cycle per hour
   --ensure-recorder     start the domain's background jobs if they are not already
                         running, print their report, and exit.
                         Exits 1 if they could not be confirmed running.
+  --live-status         print whether real money can move for this domain right now:
+                        the switch and why, the boundary-integrity verdict, and which
+                        strategy holds the live flag. Exits 1 if anything is blocking.
+                        Reads only; records no integrity baseline.
   --promote NAME        wind down whoever is currently live and promote NAME instead.
-                        Refuses if the safety boundary is compromised, if NAME cannot
-                        structurally place a real order, or if winding down the outgoing
-                        strategy doesn't fully flatten it. Also refuses if NAME hasn't
-                        earned the same track record an automatic promotion requires,
-                        unless --force is given.
+                        Refuses if live trading is switched off for this domain, if the
+                        safety boundary is compromised, if NAME cannot structurally place
+                        a real order, or if winding down the outgoing strategy doesn't
+                        fully flatten it. Also refuses if NAME hasn't earned the same
+                        track record an automatic promotion requires, unless --force is
+                        given.
   --force               with --promote, skip only the track-record check above.
+
+To switch real money off:   touch /opt/.live_disabled     (or LIVE_TRADING=off in the
+environment of the monitor process). The running loop picks the file up on its next
+cycle, clears live.flag, and leaves any open position alone. Delete it to switch back on.
 """
 
 if __name__ == '__main__':
@@ -1736,6 +1782,40 @@ if __name__ == '__main__':
             run()
         finally:
             _release_lock()
+    elif args == ['--live-status']:
+        # Read-only. A switch nobody can query is a switch people stop trusting, and
+        # "is it off, and why?" currently spans a file in /opt, an env var on a process
+        # someone else started, and a file behind the money boundary.
+        enabled, why = DOMAIN.live_enabled()
+        live = load_live_strategy()
+        held = live.get('name') if live else None
+        print(f'domain:        {DOMAIN.NAME}')
+        print(f'live enabled:  {"yes" if enabled else "NO"}'
+              + (f' -- {why}' if why else ''))
+        # The switch is not the only thing that stops a promotion, so a status line that
+        # only reported the switch would answer a narrower question than the one being
+        # asked. Consulted ONLY when a baseline already exists: check_boundary_integrity
+        # adopts one on a clean first run, and a read-only status command must never be
+        # what blesses the current state of the money boundary.
+        blocked = not enabled
+        if INTEGRITY_BASELINE.exists():
+            try:
+                intact, problems = check_boundary_integrity()
+            except Exception as e:
+                intact, problems = False, [f'could not be checked ({e})']
+            print(f'boundary:      {"intact" if intact else "CHANGED -- nothing will be promoted"}')
+            for problem in problems:
+                print(f'  - {problem}')
+            blocked = blocked or not intact
+        else:
+            print(f'boundary:      not baselined yet ({INTEGRITY_BASELINE} missing); '
+                  f'the next cycle records one')
+        if held:
+            flag = (STRATEGIES_DIR / held / 'live.flag').exists()
+            print(f'live strategy: {held} (live.flag {"present" if flag else "cleared"})')
+        else:
+            print('live strategy: none')
+        sys.exit(1 if blocked else 0)
     elif args == ['--ensure-recorder']:
         # Standalone supervision, for once.sh / cron / a hand check. The daemon is
         # setsid'd, so it outlives this process exiting seconds later exactly as it

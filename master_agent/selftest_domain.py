@@ -419,6 +419,71 @@ check('sdex/null/forecast/maker RANK_GRACE_S is unchanged from the old shared de
 check('kalshi RANK_GRACE_S exceeds the generic default to match slow real-world resolution',
       KALSHI.RANK_GRACE_S > 3 * 3600, KALSHI.RANK_GRACE_S)
 
+# ------------------------------------------------------------------ the live kill switch
+#
+# DOMAIN.live_enabled() is the coarse "may real money move at all right now" gate, as
+# opposed to can_execute_live's per-strategy "could THIS code place an order". It exists
+# because there was no domain-agnostic way to say "run this population, but not for real":
+# a money-free domain hardcoded can_execute_live to False, and sdex could only be stopped
+# by a file behind the money boundary that the loop never looked at, so monitor went on
+# promoting and flagging strategies whose every order was being refused.
+#
+# It fails CLOSED, so most of what is worth pinning is that it says NO in the ambiguous
+# cases -- including a typo'd on-value, which is the one people get wrong.
+
+for mod in (SDEX, NULL, FORECAST, MAKER, KALSHI):
+    verdict = mod.live_enabled()
+    check(f'{mod.NAME} live_enabled returns (bool, str)',
+          isinstance(verdict, tuple) and len(verdict) == 2
+          and isinstance(verdict[0], bool) and isinstance(verdict[1], str), repr(verdict))
+
+for mod in (NULL, FORECAST, KALSHI):
+    ok, why = mod.live_enabled()
+    check(f'{mod.NAME} can never be switched live', ok is False and bool(why), repr(why))
+
+_saved_live_env = os.environ.get(domain.LIVE_ENV_VAR)
+_saved_live_file = domain.LIVE_DISABLED_FILE
+_switch_dir = Path(tempfile.mkdtemp(prefix='live_switch_'))
+try:
+    os.environ.pop(domain.LIVE_ENV_VAR, None)
+    domain.LIVE_DISABLED_FILE = _switch_dir / '.live_disabled'
+    check('unset env and no sentinel leaves live ON -- every existing deployment sets '
+          'neither, so the default must not change under them',
+          domain.live_switch() == (True, ''), repr(domain.live_switch()))
+    for _value in ('1', 'on', 'yes', 'true', 'ENABLED', 'Live', ' on '):
+        os.environ[domain.LIVE_ENV_VAR] = _value
+        check(f'{domain.LIVE_ENV_VAR}={_value!r} keeps live on',
+              domain.live_switch()[0] is True, repr(domain.live_switch()))
+    for _value in ('0', 'off', 'no', 'false', 'paper', 'of', '', 'yse'):
+        os.environ[domain.LIVE_ENV_VAR] = _value
+        _ok, _why = domain.live_switch()
+        check(f'{domain.LIVE_ENV_VAR}={_value!r} switches live off (unrecognised means '
+              f'off, so a typo fails safe)',
+              _ok is False and domain.LIVE_ENV_VAR in _why, repr(_why))
+    os.environ.pop(domain.LIVE_ENV_VAR, None)
+
+    domain.LIVE_DISABLED_FILE.write_text('winding down for the weekend\nignored second line\n')
+    _ok, _why = domain.live_switch()
+    check('the sentinel file switches live off',
+          _ok is False and str(domain.LIVE_DISABLED_FILE) in _why, repr(_why))
+    check('the sentinel file explains itself in the reason, first line only',
+          'weekend' in _why and 'ignored second line' not in _why, repr(_why))
+    # A domain that moves money must consult the generic switch FIRST -- before anything
+    # environmental, so an operator's "stop" cannot be outvoted by a healthy money
+    # boundary. Checked here rather than by reading the source because the ordering is
+    # the whole guarantee.
+    for _mod in (SDEX, MAKER):
+        _ok, _why = _mod.live_enabled()
+        check(f'{_mod.NAME} defers to the generic switch before anything else',
+              _ok is False and str(domain.LIVE_DISABLED_FILE) in _why, repr(_why))
+finally:
+    domain.LIVE_DISABLED_FILE = _saved_live_file
+    if _saved_live_env is None:
+        os.environ.pop(domain.LIVE_ENV_VAR, None)
+    else:
+        os.environ[domain.LIVE_ENV_VAR] = _saved_live_env
+    shutil.rmtree(_switch_dir, ignore_errors=True)
+
 # Nothing in the loop may need an attribute off `obs`, so every domain's observation type
 # is free to differ. Assert they actually do -- if they were the same shape, this whole
 # file would be testing one domain twice.
@@ -956,6 +1021,39 @@ try:
         shutil.rmtree(d, ignore_errors=True)
 finally:
     monitor.DOMAIN = _real_domain
+
+# The loop must actually HONOUR the switch -- a contract member nothing calls is a switch
+# that switches nothing, which is the failure mode this whole file exists to catch. Driven
+# against NULL (live_enabled is constant False) with every side effect monkeypatched, so
+# it cannot touch a real strategy, a real flag or the integrity baseline.
+monitor.DOMAIN = NULL
+_gate_saved = (monitor.load_live_strategy, monitor.set_live_flag,
+               monitor.check_boundary_integrity, monitor.STRATEGIES_DIR)
+_gate_calls = []
+_gate_dir = Path(tempfile.mkdtemp(prefix='live_gate_'))
+try:
+    (_gate_dir / 'held').mkdir()
+    (_gate_dir / 'held' / 'main.py').write_text('# placeholder\n')
+    (_gate_dir / 'held' / 'live.flag').write_text('')
+    monitor.STRATEGIES_DIR = _gate_dir
+    monitor.load_live_strategy = lambda: {'name': 'held'}
+    monitor.set_live_flag = lambda name, live: _gate_calls.append(('flag', name, live))
+    monitor.check_boundary_integrity = lambda: (_gate_calls.append(('integrity',)),
+                                                (True, []))[1]
+    monitor.promote_live_strategy('held', 1234.0)
+    check('a disabled domain has its live flag cleared by the loop',
+          ('flag', 'held', False) in _gate_calls, repr(_gate_calls))
+    check('a disabled domain promotes nothing and adopts no integrity baseline',
+          not any(c[0] == 'integrity' for c in _gate_calls), repr(_gate_calls))
+    _ok, _lines = monitor.promote_strategy_manual('held', force=True)
+    check('--promote --force cannot override the switch', _ok is False, repr(_lines))
+    check('the refusal names the switch to clear',
+          any(str(domain.LIVE_DISABLED_FILE) in line for line in _lines), repr(_lines))
+finally:
+    (monitor.load_live_strategy, monitor.set_live_flag, monitor.check_boundary_integrity,
+     monitor.STRATEGIES_DIR) = _gate_saved
+    monitor.DOMAIN = _real_domain
+    shutil.rmtree(_gate_dir, ignore_errors=True)
 
 # --------------------------------------------------------------------------------- done
 
