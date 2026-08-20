@@ -833,9 +833,17 @@ def _run_revision(name, parent_name, score, leaderboard, obs, role=ROLE_REFINE):
     return False
 
 
-def _run_smoke_retry(name, reason):
+def _run_smoke_retry(name, reason, before_head=''):
     """One follow-up call to master-agent.py after main_py_is_sane fails, feeding the
     exact failure back into that revision's own persisted conversation.
+
+    `before_head` is passed through so the retry can run DOMAIN.check_replayable against
+    the same baseline this function's caller will use, before its subprocess exits. It is
+    the one gate that can be checked without a second smoke run, and the fix for the
+    commonest smoke failure -- a signal handler, so main.py's `finally` runs on SIGTERM --
+    is exactly the shape that trips it. Without this the retry writes a correct fix at
+    module top level, and the revert below discards a revision that had already solved the
+    problem it was sent back for.
 
     A second subprocess call rather than a loop inside _run_revision, because the smoke
     test that produces `reason` only runs here in monitor.py, after the revision
@@ -850,7 +858,7 @@ def _run_smoke_retry(name, reason):
     try:
         result = subprocess.run(
             [sys.executable, str(MASTER_AGENT_SCRIPT), 'retry-after-smoke-failure',
-             name, reason],
+             name, reason, before_head or ''],
             capture_output=True, text=True, timeout=REVISION_TIMEOUT,
         )
         if result.returncode == 0:
@@ -1032,7 +1040,7 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
         # False is either injection-only or a pre-existing broken file, and there is no
         # revision conversation for the model to react to either way.
         if not ok and revised:
-            if _run_smoke_retry(name, reason):
+            if _run_smoke_retry(name, reason, before_head):
                 ok, reason = main_py_is_sane(
                     strategy_dir, name, obs,
                     baseline_source=_main_py_at(strategy_dir, before_head))

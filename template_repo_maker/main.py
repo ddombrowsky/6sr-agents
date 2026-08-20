@@ -14,6 +14,12 @@ fitness check while replay() still returns confident-looking numbers for the fal
 `sys.path.append(...)` is a bare call expression, which is NOT on the whitelist. Do not
 "tidy" it back.
 
+The same rule is why `_install_stop_handlers()` is a top-level `def` that main() CALLS,
+rather than `signal.signal(...)` or `atexit.register(...)` written at top level. Those are
+bare call expressions too. Revisions kept reaching for exactly that shape to fix the smoke
+test's "offers still open" and getting the whole revision reverted for it; if you need
+anything to run at startup or shutdown, put it in a function and call it from main().
+
 The tick loop lives in `main()` under the `__main__` guard, not at top level, so importing
 this module for a replay never starts it.
 
@@ -77,8 +83,14 @@ offers can leave real money resting after the strategy is culled, revised or dem
 `domain_sdex_maker.can_execute_live` requires a call to `sync_quotes` by name before this
 strategy may ever go live, and `check_smoke_state` fails a candidate that finishes with
 offers still open.
+
+Standing the quotes down on the way out is this file's job, though, and it is not the
+`finally` block alone that does it -- see `_install_stop_handlers`. Deleting that call
+does not fail loudly: it fails as "N offer(s) still open after the smoke run" two minutes
+later, and the revision that removed it gets reverted.
 """
 import json
+import signal
 import sys
 import time
 from pathlib import Path
@@ -204,6 +216,39 @@ def current_book():
             'ts': row.get('ts'), '_row': row}
 
 
+def _install_stop_handlers():
+    """Make the `finally` in main() reachable when the process is terminated.
+
+    Python's default SIGTERM disposition kills the interpreter outright -- no stack
+    unwind, so no `finally`, so no stand_down and two live offers left resting. Both
+    things that stop a strategy send SIGTERM: strat_manager.stop_strategy on a cull, and
+    monitor.py's smoke test at the end of its 120s window. Until this existed, EVERY
+    revision failed that smoke test with "2 offer(s) still open" and was thrown away.
+
+    Registered from inside main(), NOT at module top level: `signal.signal(...)` is a bare
+    call expression and importability_report rejects one of those at top level, which is
+    the trap the fix for the above kept falling into. A top-level `def` is fine, so the
+    body lives here and main() calls it.
+
+    One-shot on purpose. Cleanup gets the grace period (15s in both callers) to finish;
+    a second TERM arriving mid-stand_down must not abort it. SIGKILL is the escalation
+    and nothing can catch that -- which is why MAX_OFFER_AGE_S still has to exist.
+    """
+    fired = []
+
+    def _stop(signum, _frame):
+        if fired:
+            return
+        fired.append(signum)
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):
+            pass        # not the main thread, or the platform lacks it; best-effort
+
+
 def main():
     config = load_config()
     agent_name = config.get('name', 'unnamed')
@@ -215,6 +260,7 @@ def main():
     # that hasn't written a readable state.json within SMOKE_TEST_SECONDS, and a first
     # tick can outlast that on a slow interpreter start.
     save_state(state)
+    _install_stop_handlers()   # see its docstring: without this, `finally` never runs
 
     try:
         while True:

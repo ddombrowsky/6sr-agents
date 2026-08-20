@@ -1163,6 +1163,85 @@ def _main_py_digest(strategy_path: Path):
         return None
 
 
+def _main_py_at(strategy_path: Path, ref: str):
+    """main.py's contents at a git ref, or None if git cannot answer.
+
+    Same question monitor._main_py_at asks, and the answer has to agree with it: this is
+    the baseline handed to DOMAIN.check_replayable, and check_replayable's verdict is a
+    non-regression policy, so a different baseline is a different verdict.
+    """
+    if not ref:
+        return None
+    try:
+        r = subprocess.run(['git', '-C', str(strategy_path), 'show', f'{ref}:main.py'],
+                           capture_output=True, text=True)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _replayability_fault(strategy_path: Path, strategy_name: str, baseline_source):
+    """The reason monitor.py would revert this main.py as unimportable, or None.
+
+    Asked here, in-session, because monitor.py only asks after this subprocess has exited
+    -- and by then the answer costs the whole revision. Every check monitor runs before
+    this one is either free or already paid for; this one is a pure AST walk, so catching
+    it here costs one LLM turn and no smoke run, against a discarded revision and a
+    mechanical tweak if it goes uncaught.
+
+    Deliberately calls the same DOMAIN.check_replayable monitor.py calls, with the same
+    baseline, rather than reimplementing the whitelist: a stricter copy here would nag
+    about files monitor would have accepted, and a looser one would let through exactly
+    what this is for. None means no verdict or no fault -- and note check_replayable
+    returns None for a lineage that was ALREADY unimportable, which is right: that
+    revision is not made worse by staying so, and monitor will not revert it.
+    """
+    try:
+        source = (strategy_path / 'main.py').read_text()
+    except Exception:
+        return None
+    try:
+        verdict = _DOMAIN.check_replayable(source, baseline_source, strategy_name)
+    except Exception:
+        return None     # a tooling fault must never manufacture a correction
+    if verdict is not None and not verdict[0]:
+        return verdict[1]
+    return None
+
+
+def _replayability_correction(reason: str) -> str:
+    """Sent when main.py as written would be reverted for a top-level statement.
+
+    The failure this prevents is specific and was costing whole revisions: asked to make
+    main.py clean up on SIGTERM, the model writes `signal.signal(...)` or
+    `atexit.register(...)` at module top level -- correct Python, correct fix, and a bare
+    call expression, which the replay engine's importability walk rejects. monitor.py then
+    reverts main.py to the parent's and falls back to a random tweak, so the revision is
+    lost to a rule it was never told about. Two of the four smoke-test retries across the
+    2026-08-19 cycles died exactly here.
+    """
+    return (
+        f'Your main.py will be REVERTED as written, for a structural rule rather than '
+        f'anything to do with your logic:\n\n'
+        f'  {reason}\n\n'
+        f'The replay engine imports this module to get your entry point, so importing it '
+        f'must not RUN anything. The module top level may therefore contain only imports, '
+        f'assignments, function and class definitions, the docstring, and the '
+        f'`if __name__` guard. A bare call at top level -- `signal.signal(...)`, '
+        f'`atexit.register(...)`, `sys.path.append(...)`, a logging setup line -- is a '
+        f'call expression and is not allowed there, however harmless it looks.\n\n'
+        f'This is a move, not a rewrite. Keep the behaviour: put the call inside a '
+        f'top-level `def` (definitions are fine at top level; it is only the calling that '
+        f'is not) and invoke that function from `main()`. For a signal handler that means '
+        f'a `def _install_stop_handlers():` containing the `signal.signal(...)` lines, '
+        f'called as the first thing main() does.\n\n'
+        f'Note `sys.path = sys.path + [...]` in the template: written as an assignment '
+        f'rather than `.append(...)` for this exact reason. Do not "tidy" it back.\n\n'
+        f'Fix the line named above with `write_file`, change nothing else, and reply '
+        f'briefly with what moved.'
+    )
+
+
 def _config_only_correction(strategy_path: Path) -> str:
     """Sent to an explore spawn whose revision touched config.json and nothing else."""
     return (
@@ -1196,26 +1275,43 @@ def _smoke_test_correction(reason: str) -> str:
     being true was not the same as the file actually running. Quotes the exact failure
     monitor.py logged, since a vague "it didn't work" would waste the one retry on the
     model guessing at what broke instead of fixing it.
+
+    States the top-level-statement rule outright. It is written in the template's module
+    docstring, but a revision that rewrote main.py has often replaced that docstring, and
+    a retry that never sees the rule reaches for `signal.signal(...)` or
+    `atexit.register(...)` at top level -- which check_replayable rejects, so the retry is
+    spent and the whole revision reverted for a fault the correction never warned about.
+    That was 2 of the 4 retries across the 2026-08-19 cycles.
     """
     return (
         f"Your revision was committed, but monitor.py's smoke test failed:\n\n"
         f'  {reason}\n\n'
         f'That smoke test actually starts main.py as a standalone process the way '
-        f'production does, which is a different and stricter check than the backtest '
-        f'tool you already ran -- decide_source == "main.py:decide" only proves decide() '
-        f'is importable, not that the file still runs. Common causes: the rewrite '
-        f"dropped main() or the `if __name__ == '__main__':` guard entirely (the file "
-        f'defines functions and exits immediately with no output), or it kept them but '
+        f'production does, runs it for 120s, then SIGTERMs it -- a different and stricter '
+        f'check than the backtest tool you already ran, which only imports your entry '
+        f'point and proves nothing about whether the file still runs. Common causes: the '
+        f"rewrite dropped main() or the `if __name__ == '__main__':` guard entirely (the "
+        f'file defines functions and exits immediately with no output); it kept them but '
         f'broke something in the process itself -- a forgotten import, a NameError, an '
-        f'exception before the first state save.\n\n'
+        f'exception before the first state save; or it never cleaned up on the way out, '
+        f'because Python kills the process on SIGTERM without running `finally` unless a '
+        f'handler is installed.\n\n'
+        f'ONE CONSTRAINT ON YOUR FIX, and it is the one that most often wastes this '
+        f'retry: the module top level may contain ONLY imports, assignments, function and '
+        f'class definitions, the docstring, and the `if __name__` guard. A bare call at '
+        f'top level -- `signal.signal(...)`, `atexit.register(...)`, `sys.path.append(...)` '
+        f'-- makes the file unimportable to the replay engine, and the revision gets '
+        f'reverted for that instead, whether or not it fixed the failure above. Anything '
+        f'you need to run at startup goes in a function that main() calls.\n\n'
         f'Read main.py back with `read_file`, fix whatever the error above points at '
-        f'without discarding your actual decide() logic, and write the corrected file. '
+        f'without discarding your actual strategy logic, and write the corrected file. '
         f'This is your last attempt this cycle -- if it fails again the whole revision '
         f'is discarded and replaced with a mechanical tweak.'
     )
 
 
-def retry_after_smoke_failure(strategy_name: str, reason: str = '') -> None:
+def retry_after_smoke_failure(strategy_name: str, reason: str = '',
+                              before_head: str = '') -> None:
     """One bounded extra turn after monitor.py's post-hoc main.py smoke test fails.
 
     Distinct from the in-session retry loop inside revise_strategy (which only fires for
@@ -1239,6 +1335,23 @@ def retry_after_smoke_failure(strategy_name: str, reason: str = '') -> None:
     messages.append({'role': 'user', 'content': _smoke_test_correction(reason)})
     reply = run_turn(messages)
     print(reply)
+    # The retry's own gate, and the reason `before_head` is passed in at all. This is the
+    # last attempt monitor.py will allow, and the fix it is most likely to reach for --
+    # installing a signal handler so `finally` runs -- is the one that gets written at
+    # module top level and reverted for being unimportable. Catching that here costs one
+    # more LLM turn; not catching it costs the revision, because the next thing that looks
+    # at this file is monitor.py's revert. No second smoke run is involved either way:
+    # check_replayable is a pure AST walk, and monitor re-runs the smoke test regardless.
+    if not reply.startswith('[error:'):
+        fault = _replayability_fault(strategy_path, strategy_name,
+                                     _main_py_at(strategy_path, before_head))
+        if fault:
+            print(f'[revise-strategy-retry] {strategy_name} would be reverted as '
+                  f'unimportable ({fault}); asking once for it to be moved')
+            messages.append({'role': 'user',
+                             'content': _replayability_correction(fault)})
+            reply = run_turn(messages)
+            print(reply)
     _save_revision_history(strategy_path, messages)
     if reply.startswith('[error:'):
         print(reply, file=sys.stderr)
@@ -1603,6 +1716,12 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
     # having revised.
     before = _repo_fingerprint(strategy_path)
     main_py_before = _main_py_digest(strategy_path)
+    # Read now, before the model can move HEAD: this is the commit monitor.py captured as
+    # `before_head` immediately before starting this subprocess, so it is the same
+    # baseline monitor will judge replayability against. Read after the first write and
+    # it would be the candidate's own commit, and check_replayable would compare the file
+    # to itself.
+    baseline_main_py = _main_py_at(strategy_path, 'HEAD')
     nudged_for_config_only = False
     reply = ''
     for attempt in range(1, REVISION_MAX_ATTEMPTS + 1):
@@ -1650,6 +1769,27 @@ def revise_strategy(strategy_name: str, parent_name: str, parent_score: str = ''
         print(f'[revise-strategy] {strategy_name} ({role}) changed config.json only on '
               f'attempt {attempt}; asking once for a main.py change instead')
         messages.append({'role': 'user', 'content': _config_only_correction(strategy_path)})
+
+    # One extra turn, outside the loop above and bounded to exactly one, for a main.py
+    # that would be reverted for a top-level statement. Outside rather than folded into
+    # the loop because it is a different question: that loop asks whether the model did
+    # any work, this asks whether the work it did will survive monitor.py's gate. Bounded
+    # to one because a model that cannot move a line into a function after being shown the
+    # rule will not manage it on a third ask either, and the mechanical fallback is not a
+    # catastrophe -- a wasted revision plus an unbounded prompt loop would be.
+    if not reply.startswith('[error:'):
+        fault = _replayability_fault(strategy_path, strategy_name, baseline_main_py)
+        if fault:
+            print(f'[revise-strategy] {strategy_name} wrote a main.py that would be '
+                  f'reverted ({fault}); asking once for it to be moved into a function')
+            messages.append({'role': 'user',
+                             'content': _replayability_correction(fault)})
+            reply = run_turn(messages)
+            print(reply)
+            still = _replayability_fault(strategy_path, strategy_name, baseline_main_py)
+            if still:
+                print(f'[revise-strategy] {strategy_name} main.py still not importable '
+                      f'({still}); leaving it to monitor.py')
 
     _save_revision_history(strategy_path, messages)
     if reply.startswith('[error:'):

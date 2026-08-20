@@ -972,8 +972,27 @@ def check_smoke_state(raw_state, config, obs=None):
         return False, f'net worth is not positive ({total})'
     offers = raw_state.get('open_offers')
     if offers:
-        return False, (f'{len(offers)} offer(s) still open after the smoke run; '
-                       f'offer lifecycle belongs to quote_executor, not main.py')
+        # The message names the cause, not just the symptom. It used to read "offer
+        # lifecycle belongs to quote_executor, not main.py", which is true in general and
+        # wrong as a diagnosis here: the candidate had not reimplemented anything, it had
+        # simply been SIGTERMed, and Python's default disposition for that kills the
+        # interpreter without unwinding the stack -- so the `finally: stand_down()` every
+        # one of these files inherits from the template never ran. Every revision in the
+        # 2026-08-19 cycles failed on this, and the accusatory wording sent the model
+        # hunting through its quoting code while the fix was one registration call.
+        # The last two sentences exist because the obvious fix is itself a trap: a
+        # top-level signal.signal(...) or atexit.register(...) is a bare Expr, which
+        # check_replayable rejects, and two of the four retries died there.
+        return False, (
+            f'{len(offers)} offer(s) still open after the smoke run: the smoke test ends '
+            f'by sending SIGTERM, and Python kills the process on that signal without '
+            f'running `finally`, so main.py never reached quote_executor.stand_down. '
+            f'Install a SIGTERM/SIGINT handler that raises (SystemExit or '
+            f'KeyboardInterrupt) so the existing `finally` block runs. Register it from '
+            f'INSIDE main() by calling a top-level helper function -- `signal.signal(...)` '
+            f'or `atexit.register(...)` written at module top level is a bare call '
+            f'expression, which is not importable and will get this revision reverted for '
+            f'a different reason. See _install_stop_handlers in the template.')
     fills = int(raw_state.get('fills_total') or 0)
     quoted = int(raw_state.get('quoted_sides') or 0)
     return True, (f'net worth ${total:.2f}, {fills} fill(s), '
