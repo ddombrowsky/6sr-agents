@@ -279,9 +279,22 @@ SERVER_ERROR_RETRY_DELAY = 10  # seconds
 # traces survive in emperor_logs/monitor_20260820_170626.log the counts are 5, 8, 8, 11,
 # 12 and 23, and two more revisions that day hit the limit.
 #
-# 60 gives a two-call search loop roughly the iteration count gpt-oss used to get. Read
-# from the environment rather than edited here, for the reason REVISION_TIMEOUT is: the
-# right value is a property of the model in MASTER_AGENT_MODEL, not of this file, and
+# 100 comes from measuring glm rather than extrapolating from gpt-oss. The first pass at
+# this set 60, reasoning from the six surviving gpt-oss traces (max 23) that a two-call
+# search loop wanted roughly double. The next cycle came in at 43, 54 and 60 calls -- the
+# explore spawn spent the entire budget. It finished legitimately, committing and
+# summarising rather than being cut off, but with nothing to spare, and explore is
+# structurally the longest search of the three: it has no parent to anchor on, so it
+# both surveys the population census first and hill-climbs from a cold start.
+#
+# So the ceiling has to sit well above the observed tail, not just above the mean. What
+# makes that affordable is that MAX_REPEATED_TOOL_CALLS, not this number, is what catches
+# a stuck model: it has now gone six revisions across two cycles without firing, on runs
+# ranging from an abort at 25 to a clean finish at 60. A high total budget with a tight
+# repeat limit bounds the runaway case without truncating the working one.
+#
+# Read from the environment rather than edited here, for the reason REVISION_TIMEOUT is:
+# the right value is a property of the model in MASTER_AGENT_MODEL, not of this file, and
 # this file is rewritten by emperor.sh's self-revision passes.
 #
 # Hitting either returns an '[error: ...]' reply, so revise_strategy exits non-zero and
@@ -289,7 +302,7 @@ SERVER_ERROR_RETRY_DELAY = 10  # seconds
 # persistent server errors already take. Whatever the model wrote before giving up stays
 # on disk and still faces monitor's gates; this bounds the wasted wall clock, it does not
 # decide whether the work was any good.
-MAX_TOOL_CALLS = int(os.environ.get('MAX_TOOL_CALLS', '60'))
+MAX_TOOL_CALLS = int(os.environ.get('MAX_TOOL_CALLS', '100'))
 MAX_REPEATED_TOOL_CALLS = int(os.environ.get('MAX_REPEATED_TOOL_CALLS', '3'))
 
 
