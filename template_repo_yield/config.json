@@ -1,0 +1,9 @@
+{
+  "name": "template_agent",
+  "schema_version": 1,
+  "min_edge_bp": 50.0,
+  "rebalance_hours": 12.0,
+  "max_venues": 1,
+  "emission_weight": 0.5,
+  "min_free_liquidity_usd": 100.0
+}

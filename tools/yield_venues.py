@@ -73,7 +73,6 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from aquarius.pool import sort_token_ids
 from stellar_sdk import (
     Account, Address, Asset, Network, SorobanServer, TransactionBuilder, scval,
 )
@@ -394,6 +393,8 @@ def census_aquarius(marks=None):
     the API is used only for the reward schedule, which is not on chain in enumerable
     form.
     """
+    from aquarius.pool import sort_token_ids   # only this venue needs aquarius-sdk
+
     marks = marks or {}
     rewarded, url = [], REWARD_API + "?size=100"
     while url:
@@ -476,6 +477,101 @@ def census_aquarius(marks=None):
             "pools_for_market": len(found),
         })
     return out
+
+
+# ---------------------------------------------------------------------- the snapshot
+
+# One process reads the chain; everything else reads this file. A Blend census is ~50s of
+# RPC round trips, and a population of twenty strategies each doing that on its own tick
+# would be both slow and rude to a public endpoint. domain_yield.observe() refreshes it
+# once per monitor cycle and every strategy's main.py reads it, which is the same shape
+# market_recorder.py has for the sdex domain -- with the difference that the snapshot is
+# a cache and not a history: it is overwritten, not appended, and it is NOT the rate
+# archive YIELD.md step 2 calls for.
+SNAPSHOT_PATH = os.environ.get("YIELD_SNAPSHOT", "/opt/trades/yield_snapshot.json")
+SNAPSHOT_MAX_AGE_S = 3600
+
+
+def write_snapshot(path=None, marks=None):
+    """Refresh the Blend snapshot. Returns the census written, or None if it failed.
+
+    Blend only, deliberately: the Aquarius venues cannot be entered single-sided, so an
+    allocation there is an LP position with impermanent loss and two book crossings
+    (YIELD.md section 3), and nothing in this system prices those yet. Adding Aquarius to
+    the snapshot before that arithmetic exists would put venues in front of the population
+    whose advertised rate is not a return.
+    """
+    path = path or SNAPSHOT_PATH
+    try:
+        census = census_blend(marks if marks is not None else get_marks())
+    except Exception as e:
+        print("[yield_venues] census failed: %s: %s" % (type(e).__name__, e))
+        return None
+    payload = {"as_of": int(time.time()), "venue": "blend", "blend": census}
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        # Atomic: a strategy reading this file mid-write must never see half a census.
+        temporary = "%s.tmp.%d" % (path, os.getpid())
+        with open(temporary, "w") as handle:
+            json.dump(payload, handle, default=str)
+        os.replace(temporary, path)
+    except Exception as e:
+        print("[yield_venues] could not write %s: %s" % (path, e))
+        return None
+    return payload
+
+
+def read_snapshot(path=None, max_age_s=SNAPSHOT_MAX_AGE_S):
+    """The last snapshot, or None if it is missing, unreadable or older than max_age_s.
+
+    Stale reads as absent rather than as data. A rate this system acts on is the whole
+    input to the decision, and an hour-old APY presented as current is the quiet kind of
+    wrong -- pass max_age_s=None to read it anyway and judge the age yourself.
+    """
+    path = path or SNAPSHOT_PATH
+    try:
+        with open(path) as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    if max_age_s is not None and time.time() - payload.get("as_of", 0) > max_age_s:
+        return None
+    return payload
+
+
+def allocatable_reserves(payload):
+    """Every (pool, reserve) in a snapshot that can actually be supplied into, flattened.
+
+    Three filters, none of them cosmetic: a frozen pool refuses Supply outright
+    (`require_action_allowed`), a disabled reserve is not lendable, and a reserve at or
+    above its max utilization cannot be withdrawn from until someone repays -- which is
+    exactly the "illiquid by design" case YIELD.md section 2 says must be distinguished
+    from "trapped" before any of it touches money.
+    """
+    rows = []
+    for pool in (payload or {}).get("blend", {}).get("pools", []):
+        if not pool.get("supply_allowed"):
+            continue
+        for reserve in pool.get("reserves", []):
+            if not reserve.get("enabled"):
+                continue
+            rows.append({
+                "pool": pool["name"],
+                "pool_address": pool["address"],
+                "asset": reserve["symbol"],
+                "asset_address": reserve["asset"],
+                "supply_apy": reserve["supply_apy"] or 0.0,
+                "emission_apr_gross": reserve.get("emission_apr_gross") or 0.0,
+                "utilization": reserve["utilization"],
+                "max_utilization": reserve["max_utilization"],
+                "free_liquidity": reserve["free_liquidity"],
+                "usd_price": reserve.get("usd_price"),
+                "free_liquidity_usd": ((reserve["free_liquidity"] * reserve["usd_price"])
+                                       if reserve.get("usd_price") else None),
+            })
+    return rows
 
 
 # ------------------------------------------------------------------------------ report
@@ -576,7 +672,14 @@ def main():
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a report")
     parser.add_argument("--blend", action="store_true", help="Blend only")
     parser.add_argument("--aqua", action="store_true", help="Aquarius only")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="refresh the Blend snapshot strategies read, then exit")
     args = parser.parse_args()
+
+    if args.snapshot:
+        written = write_snapshot()
+        print("wrote %s" % SNAPSHOT_PATH if written else "snapshot FAILED")
+        raise SystemExit(0 if written else 1)
 
     both = not (args.blend or args.aqua)
     marks = get_marks()

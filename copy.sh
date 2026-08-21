@@ -8,7 +8,7 @@
 # and /opt/tools and /opt/master_agent are watched git repos, so a missing .gitignore
 # means the first __pycache__ or cache write leaves an untracked file and the next
 # monitor cycle prints LIVE TRADING HALTED. scripts/selftest.sh checks for exactly this.
-SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_kalshi template_repo_maker template_repo_null"
+SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_kalshi template_repo_maker template_repo_null template_repo_yield"
 
 # The agent-side files copied into v/agents/ (== /opt/agents in the container). Listed
 # once, in a variable, for the same reason SYNCED_DIRS is: the hardcoded cp list this
