@@ -279,7 +279,44 @@ information as the only route that creates a forecasting edge *and* the one most
 already occupied — but that judgement was about NWS data behind a 1.0¢ professional quote.
 Stellar on-chain flow at $4 a trade is a much less crowded corner.
 
-### 9. Funding-rate harvest on a perp DEX — right shape, wrong venue for us
+### 9. Yield rotation across Aquarius and Blend — **see `YIELD.md`**
+
+**Added 2026-08-21. Planned in `YIELD.md`, which supersedes this summary.** Allocate capital
+across Aquarius reward pools and Blend's two main lending pools (YieldBlox and Fixed),
+rotating as their rates move. This replaces a "considered and rejected" entry written the
+same day, which evaluated passive supply, liquidations and looping and dismissed all three;
+cross-venue allocation is a fourth design and two of those three objections do not survive
+it — see `YIELD.md`'s opening section.
+
+The edge is not harvesting yield, which the null captures. It is **anticipating rate
+changes**, and it clears criterion 6 on the exogenous branch because *an APY is not a price*:
+Aquarius emissions are set by visible on-chain votes with known period boundaries, Blend's
+supply rate is a mechanical function of utilization, and neither moves in anticipation the
+way a price does. The capital that would arbitrage that lag is slow, and that stickiness is
+the structural reason the edge could persist. Same insight as item 8, applied to yields
+rather than prices — and stronger, because the quantity being predicted is mechanically
+determined rather than forecast by other participants.
+
+**Why it ranks here despite criterion 8 being brutal at ~$60 of capital**: the history is
+*backfillable*, so unlike every other candidate the viability question is answerable offline
+this week, with no capital and no domain code. Two measurements — how often the venue
+ranking flips, and what a perfect-foresight rotator earns against the best static allocation.
+The second is the kill criterion.
+
+Two failure modes that are not obvious and are detailed in `YIELD.md`: **emission-token exit
+friction** (yield arrives in AQUA and BLND, whose books `friction.py:16` already flags as far
+worse than XLM's — scoring gross APY reproduces the exact frictionless-landscape mistake at
+the top of this document), and **withdrawal is not guaranteed**, which breaks the invariant
+that every position can be market-sold to flat and would trip `MAX_STUCK_USD` /
+`LIVE TRADING HALTED` by design rather than by fault.
+
+It also needs the one piece of loop machinery no existing domain has: rotation resolves in
+days, so the cull horizon lengthens. `RANK_GRACE_S` is already per-domain and covers that for
+free, but at ~72 revisions per scored generation the population floods with strategies at
+`STARTING_SCORE` — **decoupling revision cadence from cull cadence is a `monitor.py` change**,
+not a domain constant.
+
+### 10. Funding-rate harvest on a perp DEX — right shape, wrong venue for us
 
 **Added 2026-08-21.** Structurally the best-fitting trade considered: perpetual futures pay
 funding on a fixed clock, so you are paid continuously for absorbing an imbalance rather
@@ -315,19 +352,6 @@ It is ranked last of the live items for three reasons, in increasing order of se
 Recorded so they are not re-proposed. `KALSHI.md` set the precedent that a negative result
 is worth keeping.
 
-- **Lending carry on Blend (or any Soroban lending pool).** Structurally the same trade as
-  item 9 and Stellar-native, which is why it looked attractive. It fails **criterion 9**
-  decisively: with a handful of pools and rates that move on a scale of days, passive supply
-  has the null strategy and the optimal strategy in the same place, and the population
-  converges in one cycle with nothing left to evolve. Liquidations fail criterion 5 (a
-  handful of events a week, contested by bots reading the same public state). Looping does
-  create a real strategy space — leverage ratio, health buffer, unwind triggers — but it
-  means handing the agent a borrow facility, and `SHORTING_PLAN.md` deliberately chose
-  pre-funded inventory over "Blend or any other lending protocol" for exactly that reason;
-  reversing that needs an argument, not a shrug. Blend's realistic leverage (2–3x before the
-  health factor bites) is not enough to change the arithmetic either. **Its honest use here
-  is treasury, not evolution**: idle quote inventory can sit in a pool between trades, which
-  is a supply/withdraw helper and a cap, not a `domain_blend.py`.
 - **AMM-versus-orderbook atomic cycles on Stellar.** `path-payment-strict-send` routes
   across both pools and the book in one transaction, so a profitable cycle is riskless —
   no leg risk, no inventory, and it either profits or reverts. Maximally structural. But the
@@ -376,16 +400,21 @@ is worth keeping.
    money boundary, and only accrues in wall-clock time — worth landing *before* item 4 even
    though the rest of the item comes after it.
 
-6. **Unsequenced (added 2026-08-21): ranked items 6–9.** Deliberately not given positions
+6. **Unsequenced (added 2026-08-21): ranked items 6–10.** Deliberately not given positions
    here, because each is gated on a cheap measurement that could kill it, and sequencing
    before those run would be guessing:
 
    - item 6 (competition leaderboards) — read the automated-submission terms of two or
      three candidate venues. A "no" ends the item for the cost of an afternoon.
    - item 8 (on-chain flow) — a day of Horizon event-rate recording answers criterion 5.
+   - item 9 (yield rotation) — backfill the venue rate history and compute the
+     perfect-foresight ceiling, net of emission-exit friction. See `YIELD.md`. Needs no
+     capital and touches no money boundary, so it can run alongside anything else here.
    - item 2's pair extension — a day of the recorder on the candidate pairs, which is the
      same phase-0 work item 5 above already wants and therefore nearly free.
 
    Item 6 is the one to run first on merit: it is the only candidate that answers criterion
-   8 rather than conceding it. Item 9 should not start until at least one of the above has
-   produced a result, per criterion 8's note about third paper domains.
+   8 rather than conceding it. Item 9's ceiling test is the cheapest thing on the list and
+   is Stellar-native, so it can run in parallel rather than queueing. Item 10 should not
+   start until at least one of the above has produced a result, per criterion 8's note
+   about third paper domains.
