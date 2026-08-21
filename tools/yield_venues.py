@@ -138,6 +138,46 @@ def _supply_allowed(status):
 
 _server = SorobanServer(RPC_URL)
 
+# A full census is ~100 sequential RPC round trips, which is fine once an hour and much
+# too slow to sample on a recorder's cadence. Most of those calls ask for things that
+# cannot change: a Stellar Asset Contract's symbol, an oracle's decimals. Those are
+# cached for the life of the process. Oracle PRICES are cached too but only briefly --
+# they move, and a stale price silently mis-sizes free_liquidity_usd and every emission
+# APR that divides by it.
+#
+# What is deliberately NOT cached is anything that decides whether capital can move:
+# pool status, reserve enablement, utilization and the reserve data behind the rates.
+# A frozen pool that reads as active because the answer was cached is the failure this
+# whole module exists to prevent.
+_SYMBOL_CACHE = {}
+_DECIMALS_CACHE = {}
+_PRICE_CACHE = {}
+PRICE_TTL_S = 300
+
+
+def _symbol(asset_id):
+    if asset_id not in _SYMBOL_CACHE:
+        _SYMBOL_CACHE[asset_id] = simulate(asset_id, "symbol")
+    return _SYMBOL_CACHE[asset_id]
+
+
+def _oracle_decimals(oracle):
+    if oracle not in _DECIMALS_CACHE:
+        _DECIMALS_CACHE[oracle] = simulate(oracle, "decimals") or 7
+    return _DECIMALS_CACHE[oracle]
+
+
+def _oracle_price(oracle, asset_id):
+    key = (oracle, asset_id)
+    cached = _PRICE_CACHE.get(key)
+    if cached and time.time() - cached[0] < PRICE_TTL_S:
+        return cached[1]
+    quote = simulate(oracle, "lastprice",
+                     [scval.to_enum("Stellar", scval.to_address(asset_id))])
+    price = quote["price"] / 10 ** _oracle_decimals(oracle) if quote else None
+    _PRICE_CACHE[key] = (time.time(), price)
+    return price
+
 
 def _http_json(url, timeout=25):
     req = urllib.request.Request(url, headers=_HTTP_HEADERS)
@@ -283,7 +323,7 @@ def census_blend(marks=None):
         oracle = _addr(config["oracle"]) if config.get("oracle") else None
         # Oracle price decimals vary by deployment -- YieldBlox's reports 7, and assuming
         # it for every pool put Etherfuse's XLM supply at $108bn.
-        oracle_decimals = (simulate(oracle, "decimals") if oracle else None) or 7
+        oracle_decimals = _oracle_decimals(oracle) if oracle else 7
 
         pool = {
             "name": storage.get("Name"),
@@ -311,12 +351,7 @@ def census_blend(marks=None):
             supplied = (data["b_supply"] * data["b_rate"]) // SCALAR_12 / scalar
             borrowed = _mul_ceil(data["d_supply"], data["d_rate"], SCALAR_12) / scalar
 
-            price = None
-            if oracle:
-                quote = simulate(oracle, "lastprice",
-                                 [scval.to_enum("Stellar", scval.to_address(asset_id))])
-                if quote:
-                    price = quote["price"] / 10 ** oracle_decimals
+            price = _oracle_price(oracle, asset_id) if oracle else None
 
             # Emission index: reserve index * 2, +1 for the bToken (supply) side.
             emis = simulate(pool_id, "get_reserve_emissions",
@@ -330,7 +365,7 @@ def census_blend(marks=None):
                     emission_apr = blnd_per_year * marks["BLND"] / (supplied * price)
 
             pool["reserves"].append({
-                "symbol": simulate(asset_id, "symbol"),
+                "symbol": _symbol(asset_id),
                 "asset": asset_id,
                 "enabled": config_r["enabled"],
                 "utilization": util,

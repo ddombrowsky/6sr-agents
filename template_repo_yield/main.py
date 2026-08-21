@@ -37,16 +37,31 @@ EMISSION_REALIZATION, a fixed haircut nobody's config can move. What a config CA
 two are deliberately separate -- if believing in emissions also made you earn more, the
 optimum would be "believe hardest", which measures nothing.
 
-## What gets scored
+## What gets scored -- NOT what this file writes down
 
-domain_yield.score() reads `apy_bp` out of state.json: the net paper return over the last
-WINDOW_S, annualized, in basis points. It is self-reported and nothing audits it. Writing
-a big number there raises the score and measures nothing at all -- domain_yield says so
-in its own docstring and in the revision prompt, and a run that does it is worthless.
+**Nothing in state.json is read for scoring.** Not `apy_bp`, not `nav`. Writing a large
+number into either changes nothing: domain_yield recomputes the return from the outside,
+by replaying the allocations this file LOGS against tools/yield_recorder.py's record of
+what each venue paid, charging tools/yield_replay.py's cost model, and crediting only the
+time the recorder observed this process running. The strategy supplies decisions; the
+domain supplies rates, costs and liveness.
 
-Annualized over a rolling window rather than accumulated since birth, for the reason
-template_repo_null/main.py gives: a lifetime total makes score a function of age, so the
-oldest strategy is always on top and rank-culling measures birthdays.
+`nav` and `apy_bp` are kept because this file needs its own estimate to decide with. They
+are this strategy's opinion, and they are ignored when it is ranked.
+
+What IS ranked is **excess over a null** -- allocate once to the highest-rate venue with
+real free liquidity, then never rotate -- annualized in basis points over a three-day
+window. Matching the null scores exactly STARTING_SCORE. Two consequences worth having in
+mind before rewriting `choose()`:
+
+  * **A one-off cost is amplified ~122x** by annualizing over three days. Paying 1bp to
+    rotate reads as ~122bp of score. Crossing assets costs 25bp, which reads as ~3000bp
+    and has to be earned back by a very large rate improvement; moving between two pools
+    lending the SAME asset costs ~1bp and needs only a couple of percent of APY to pay.
+    That asymmetry, not the headline rates, is where the edge is.
+  * **Being stopped is not neutral.** Flat earns nothing while the null keeps earning, so
+    downtime sinks the score rather than freezing it -- about 73bp of annualized excess
+    per eight hours down. Do not exit on an error you could survive.
 
 `min_edge_bp`, `rebalance_hours`, `max_venues`, `emission_weight` and
 `min_free_liquidity_usd` live in config.json, not here, so mechanical mutation can find
@@ -56,6 +71,7 @@ still runs.
 """
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -71,6 +87,15 @@ TRADES_DIR = Path('/opt/trades')
 
 TICK_SECONDS = 60
 SECONDS_PER_YEAR = 31536000.0
+
+# How often a strategy that is doing nothing says so. Holding is frequently the correct
+# action here, and a correct hold and a wedged process look identical in a log that only
+# records rotations -- this is the line that separates them. It is NOT how the system
+# knows the strategy is alive: tools/yield_recorder.py checks the pid from outside, on
+# the principle that a rule deciding rank must not depend on the cooperation of the thing
+# being ranked. Fifteen minutes is ~96 lines a day, and one action ever is already enough
+# to keep monitor's is_idle from demoting a strategy that holds.
+HEARTBEAT_S = 900
 
 # The window `apy_bp` is measured over. Matched to domain_yield.RANK_GRACE_S: a score
 # computed over a window longer than the loop waits before culling would rank strategies
@@ -112,7 +137,7 @@ def load_state():
                 return json.load(f)
         except Exception as e:
             print(f'could not read state.json ({e}); starting fresh')
-    return {'nav': 1.0, 'apy_bp': 0.0, 'cost_bp': 0.0, 'rotations': 0,
+    return {'name': None, 'nav': 1.0, 'apy_bp': 0.0, 'cost_bp': 0.0, 'rotations': 0,
             'allocation': [], 'last_rotation_ts': 0.0, 'history': []}
 
 
@@ -295,10 +320,49 @@ def update_window(state, now):
     state['apy_bp'] = round(total_return * (SECONDS_PER_YEAR / elapsed) * 10000.0, 2)
 
 
+def flatten(agent_name, state, now, reason):
+    """Record that this strategy is out of the market, and stop accruing.
+
+    Written on the way down so the log explains itself. It is NOT what makes the score
+    stop: the recorder observes from outside whether this process is alive, precisely so
+    that a strategy killed with SIGKILL, or one that segfaults, is treated the same as
+    one that shut down politely. A supplied position keeps paying whether or not the
+    process that chose it is running, so "stopped" has to mean "flat" somewhere that
+    the strategy cannot decline to write.
+    """
+    if not state.get('allocation'):
+        return
+    log_event(agent_name, {
+        'timestamp': now, 'name': agent_name, 'event': 'flat', 'reason': reason,
+        'venues': [f"{leg.get('pool')}/{leg.get('asset')}" for leg
+                   in state.get('allocation') or []],
+        'nav': round(float(state.get('nav', 1.0)), 8),
+    })
+    state['allocation'] = []
+
+
+def install_signal_handlers():
+    """Turn SIGTERM into a normal unwind so main()'s `finally` runs.
+
+    monitor.py names a missing handler as the commonest cause of a failed smoke test: a
+    strategy killed by the default disposition never runs its cleanup, so its last state
+    and its exit are both unrecorded.
+    """
+    def _stop(signum, _frame):
+        raise SystemExit(f'signal {signum}')
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):
+            pass
+
+
 def main():
+    install_signal_handlers()
     config = load_config()
     agent_name = config.get('name', 'unnamed')
     state = load_state()
+    state['name'] = agent_name
     print(f"Agent {agent_name} starting with nav {state.get('nav', 1.0):.6f} "
           f"({state.get('rotations', 0)} rotations)")
 
@@ -307,7 +371,20 @@ def main():
     # venue read can be a chain refresh on a fresh container.
     save_state(state)
 
+    try:
+        tick_forever(config, agent_name, state)
+    finally:
+        # Whatever brought us down -- a cull, a container stop, an exception -- the
+        # position is recorded as closed and the last state is on disk.
+        flatten(agent_name, state, time.time(), 'stopped')
+        save_state(state)
+
+
+def tick_forever(config, agent_name, state):
     last_tick = time.time()
+    # Seeded to now, and reset by every allocate/rotate below: an allocation is already
+    # evidence that this tick ran, and a heartbeat one second after it says nothing.
+    last_heartbeat = last_tick
 
     while True:
         now = time.time()
@@ -358,12 +435,25 @@ def main():
                     'timestamp': now, 'name': agent_name,
                     'event': 'allocate' if first else 'rotate',
                     'venues': [f"{r['pool']}/{r['asset']}" for r in target],
+                    # The addresses and weights, not just the display names: this is what
+                    # tools/yield_replay.py scores the strategy on, and a leg it cannot
+                    # resolve to a venue key is a leg that earns nothing.
+                    'allocation': state['allocation'],
                     'expected_apy': round(sum(expected_apy(r, config) for r in target)
                                           / len(target), 6),
                     'cost_bp': round(cost_bp, 4),
                     'nav': round(float(state['nav']), 8),
                 })
                 held = target
+                last_heartbeat = now
+
+        if held and now - last_heartbeat >= HEARTBEAT_S:
+            last_heartbeat = now
+            log_event(agent_name, {
+                'timestamp': now, 'name': agent_name, 'event': 'hold',
+                'venues': [f"{r['pool']}/{r['asset']}" for r in held],
+                'nav': round(float(state.get('nav', 1.0)), 8),
+            })
 
         update_window(state, now)
         save_state(state)

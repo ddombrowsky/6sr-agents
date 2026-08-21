@@ -8,17 +8,19 @@ against a real venue set -- not because the question is settled. Everything here
 paper. Nothing can be promoted. Read the four limits below before treating any number it
 produces as evidence:
 
-  1. **The score is self-reported.** `score()` reads an annualized yield out of the
-     strategy's own state.json, exactly as domain_null does, and nothing audits it. The
-     revision prompt says so out loud (see prompt_facts) because a model that notices can
-     "win" by writing a large number into state.json, which measures nothing. Real
-     scoring recomputes the allocation's return from the recorded rate history, and that
-     history is YIELD.md step 2, which does not exist yet.
-  2. **There is no replay.** `replay()` returns None -- the contract's "could not be
-     measured", which every caller in the loop fails open on. A replay needs rate history
-     and there is none: public Soroban RPC retains about seven days and contract state
-     reads are current-value only. Until step 2 lands, revision gating here proves that
-     code parses and runs, and nothing more.
+  1. ~~The score is self-reported.~~ **Fixed.** `score_path` now recomputes the return
+     from tools/yield_replay.py: the strategy's logged allocations, priced against
+     tools/yield_recorder.py's rate history, charged the domain's cost model, and
+     credited only for the time the recorder observed the process alive. `apy_bp` in
+     state.json is ignored. What is ranked is EXCESS over a contemporaneous null, not
+     yield, because every strategy here collects roughly the base rate and ranking on the
+     total sorts the population mostly by beta.
+  2. **There is still no replay.** `replay()` returns None -- the contract's "could not
+     be measured", which every caller in the loop fails open on. Scoring replays
+     decisions that were actually made; a revision gate needs to simulate a candidate
+     config over history it never ran in, which is the same engine pointed at a different
+     input and is not built. Until it is, revision gating here proves that code parses and
+     runs, and nothing more.
   3. **Blend only.** Aquarius is in YIELD.md and not in this module. Its pools cannot be
      entered single-sided, so an allocation there is an LP position carrying impermanent
      loss plus two book crossings, and nothing in this system prices either yet
@@ -64,6 +66,7 @@ Select it with DOMAIN=yield.
 import json
 import os
 import random
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -83,11 +86,11 @@ TEMPLATE_REPO = os.environ.get('YIELD_TEMPLATE_REPO', 'file:///opt/template_repo
 
 STARTING_SCORE = 1000.0
 
-# Score is STARTING_SCORE + the strategy's annualized net paper yield in basis points, so
-# a strategy earning 5% shows 1500 and one paying more in rotation costs than it earns
-# shows below 1000. Annualized rather than cumulative on purpose: a cumulative total makes
-# score a function of age, every strategy's number climbs forever, and rank-culling ends
-# up measuring birthdays (the trap domain_null's template docstring describes).
+# Score is STARTING_SCORE + annualized EXCESS over the null, in basis points: a strategy
+# beating the null by 1%/yr shows 1100, one matching it shows 1000, one that sat flat
+# while the null earned shows below it. Annualized rather than cumulative on purpose --
+# a cumulative total makes score a function of age, every number climbs forever, and
+# rank-culling ends up measuring birthdays (the trap domain_null's template describes).
 
 # YIELD.md's horizon section: rotation decisions arrive on a scale of days, not seconds,
 # so a grace period sized for a domain whose feedback resolves in 30s would cull this one
@@ -96,6 +99,26 @@ STARTING_SCORE = 1000.0
 # testing the loop itself -- set YIELD_RANK_GRACE_S=3600 for that, and know that what you
 # are then watching is noise.
 RANK_GRACE_S = int(os.environ.get('YIELD_RANK_GRACE_S', 3 * 24 * 3600))
+
+# The window both sides are measured over. Tied to RANK_GRACE_S deliberately: a score
+# computed over a window longer than the loop waits before culling would rank strategies
+# on a number that has not finished forming.
+SCORE_WINDOW_S = RANK_GRACE_S
+
+# Below this much covered history a strategy scores exactly STARTING_SCORE. Annualizing
+# an hour of luck multiplies it by 8,760, and a newborn that happened to catch one good
+# interval would out-rank everything that has actually been running -- which is the
+# failure YOUNG_GRACE_S exists to prevent, arriving through the score instead of the cull.
+MIN_SCORING_S = 6 * 3600
+
+# One bad sample -- a venue misreported at 400% for one interval -- must not be able to
+# produce an unrankable number. +/-200%/yr is far outside anything real here and still
+# leaves every plausible result untouched.
+SCORE_CLAMP_BP = 20000.0
+
+# Only used to state the cost amplification in prompt_facts. The scoring itself takes the
+# constant from yield_replay so there is one definition of a year in the arithmetic.
+SECONDS_PER_YEAR_HINT = 31536000.0
 
 # No execution path exists (see limit 4), so a smoke run cannot place an order. PAPER_ONLY
 # is set anyway: it costs nothing, tools/stellar_trader.py already honours it, and the day
@@ -112,7 +135,23 @@ REPLAY_WINDOW = 'the recorded rate history (does not exist yet -- YIELD.md step 
 
 # A snapshot older than this is not shown to the population. See yield_venues.read_snapshot:
 # stale reads as absent, because an hour-old APY presented as current is the quiet failure.
-SNAPSHOT_MAX_AGE_S = 2 * 3600
+# Sized against the recorder's 300s cadence, not against CYCLE_SLEEP: the daemon is what
+# refreshes it, and a snapshot that has missed four samples means the daemon is in
+# trouble, whether or not a monitor cycle happens to be due.
+SNAPSHOT_MAX_AGE_S = 1800
+
+RECORDER_SCRIPT = Path('/opt/tools/yield_recorder.py')
+RECORDER_INTERVAL = 300
+RECORDER_PID_FILE = domain.TRADES_DIR / '.yield_recorder.pid'
+RECORDER_LOG = domain.TRADES_DIR / 'yield_recorder.log'
+
+
+def _strategy_python():
+    """Whichever interpreter runs a strategy, so a supervised daemon can never run under
+    a different one. Imported at call time: strat_manager mkdirs /opt/strategies as an
+    import side effect, which would otherwise make this module container-only."""
+    from strat_manager import _strategy_python as resolve
+    return resolve()
 
 
 def _venues():
@@ -145,20 +184,24 @@ class Observation:
 
 
 def observe():
-    """Refresh the venue snapshot and hand back the allocatable rows.
+    """The allocatable venue rows, from the snapshot the recorder daemon maintains.
 
-    The refresh is ~50s of RPC round trips, which is why it happens once per cycle here
-    rather than once per strategy per tick: every main.py reads the file this writes.
-    A failed refresh falls back to the last snapshot at any age, because a stale venue
-    list is still a better basis for one cycle than none -- but the age travels with it
-    so `observation_line` can say so.
+    Reads rather than censuses. A census is ~21s of RPC and the daemon is already doing
+    one every RECORDER_INTERVAL, so fetching a second one here would cost a cycle's
+    latency to produce a slightly different view of the same moment -- and the scorer
+    would then be pricing decisions against rates nobody was shown.
+
+    Censusing directly is the fallback, not the path: it only happens when no daemon has
+    ever run, which is the first cycle of a fresh container. A failed refresh falls back
+    to the last snapshot at any age, because a stale venue list is still a better basis
+    for one cycle than none -- and the age travels with it so observation_line can say so.
     """
     venues = _venues()
     if venues is None:
         return None
-    payload = venues.write_snapshot()
+    payload = venues.read_snapshot(max_age_s=SNAPSHOT_MAX_AGE_S)
     if payload is None:
-        payload = venues.read_snapshot(max_age_s=None)
+        payload = venues.write_snapshot() or venues.read_snapshot(max_age_s=None)
     if payload is None:
         return None
     rows = venues.allocatable_reserves(payload)
@@ -212,18 +255,103 @@ def _state_of(strategy_path):
         return None
 
 
-def score(state_dict, obs):
-    """STARTING_SCORE + the annualized net paper yield the strategy reported, in bp.
+def _replay():
+    try:
+        import yield_replay
+        return yield_replay
+    except Exception:
+        return None
 
-    Self-reported, and limit 1 in this module's docstring is about exactly that. The
-    second element is the contract's list of things that could not be priced: here, any
+
+# score_path is called once per strategy per cycle and every call needs the same window of
+# rate history and the same null. Loading and re-nulling per strategy would be the whole
+# file times the population; this caches both for the life of one scoring pass, keyed on
+# the history file's size and mtime so an appended sample invalidates it.
+_SCORE_CACHE = {'stamp': None, 'window': None, 'history': [], 'nulls': {}}
+
+
+def _history_stamp():
+    try:
+        import yield_recorder
+        stat = yield_recorder.HISTORY_PATH.stat()
+        return (stat.st_size, stat.st_mtime)
+    except Exception:
+        return None
+
+
+def _window_history(now):
+    """Rate-history rows covering the scoring window, cached for this pass."""
+    stamp = _history_stamp()
+    window = int(now // 60)          # re-null at most once a minute
+    if _SCORE_CACHE['stamp'] != stamp or _SCORE_CACHE['window'] != window:
+        try:
+            import yield_recorder
+            rows = yield_recorder.history(since=now - SCORE_WINDOW_S - 3600)
+        except Exception:
+            rows = []
+        _SCORE_CACHE.update({'stamp': stamp, 'window': window,
+                             'history': rows, 'nulls': {}})
+    return _SCORE_CACHE['history']
+
+
+def _null_for(history, since, until):
+    """The benchmark for one span, cached: identical spans share one computation."""
+    key = (round(since), round(until))
+    if key not in _SCORE_CACHE['nulls']:
+        replay = _replay()
+        _SCORE_CACHE['nulls'][key] = (
+            replay.null_static_best(history, since, until) if replay else None)
+    return _SCORE_CACHE['nulls'][key]
+
+
+def _scored(name, strategy_path, now=None):
+    """The full scoring result for one strategy, or None if it cannot be measured.
+
+    Both sides are measured over the SAME span, which is what makes the comparison mean
+    anything: a strategy younger than the window is scored against a null that started
+    when it did, rather than against one that had a three-day head start.
+    """
+    replay = _replay()
+    if replay is None:
+        return None
+    now = now or time.time()
+    history = _window_history(now)
+    if not history:
+        return None
+
+    events = replay.load_events(activity_log_path(name), until=now)
+    if not events:
+        return None
+    first_event = float(events[0]['timestamp'])
+    since = max(now - SCORE_WINDOW_S, first_event, float(history[0]['ts']))
+    if now - since < MIN_SCORING_S:
+        return None
+
+    mine = replay.run(history, replay.intent_changes(events), since, now, name=name)
+    if not mine or mine['covered_s'] < MIN_SCORING_S:
+        return None
+    null = _null_for(history, since, now)
+    if not null:
+        return None
+
+    excess = mine['return'] - null['return']
+    annualized_bp = excess * (replay.SECONDS_PER_YEAR / mine['covered_s']) * 10000.0
+    annualized_bp = max(-SCORE_CLAMP_BP, min(SCORE_CLAMP_BP, annualized_bp))
+    return {'excess_bp': annualized_bp, 'mine': mine, 'null': null}
+
+
+def score(state_dict, obs):
+    """The state-dict form of the contract member. score_path is the authoritative one.
+
+    A state dict does not identify a strategy -- the log to replay is found by name, and
+    the only name that cannot be forged is the directory's. This form therefore trusts
+    `state_dict['name']`, which normalize_config keeps equal to the directory name, and
+    is here because the contract asks for it. monitor.py ranks with score_path.
+
+    The second element is the contract's list of things that could not be priced: any
     venue the strategy claims to hold that is not in this cycle's allocatable set, which
     is how a strategy parked in a pool that has since frozen becomes visible.
     """
-    try:
-        apy_bp = float(state_dict.get('apy_bp', 0.0))
-    except (TypeError, ValueError):
-        return STARTING_SCORE, ['apy_bp']
     unpriced = []
     if obs is not None:
         known = obs.by_key()
@@ -231,14 +359,33 @@ def score(state_dict, obs):
             key = (leg.get('pool_address'), leg.get('asset_address'))
             if key not in known:
                 unpriced.append(f"{leg.get('pool')}/{leg.get('asset')}")
-    return STARTING_SCORE + apy_bp, unpriced
+    name = state_dict.get('name')
+    if not isinstance(name, str) or not name:
+        return STARTING_SCORE, unpriced
+    result = _scored(name, domain.STRATEGIES_DIR / name)
+    if result is None:
+        return STARTING_SCORE, unpriced
+    return STARTING_SCORE + result['excess_bp'], unpriced
 
 
 def score_path(strategy_path, obs):
-    state = _state_of(strategy_path)
-    if state is None:
+    """STARTING_SCORE + annualized excess over the null, recomputed from evidence.
+
+    Nothing here reads a number the strategy wrote. The allocations come from its log,
+    the rates from the recorder, the costs from yield_replay's constants, and the time it
+    was actually running from the recorder's pid observations.
+
+    Returns STARTING_SCORE -- not None -- when a strategy cannot be measured yet. None
+    means "error reading state" to monitor and sorts to -inf, which would cull every
+    newborn in the population on its first cycle.
+    """
+    path = Path(strategy_path)
+    if not path.exists():
         return None
-    return score(state, obs)[0]
+    result = _scored(path.name, path)
+    if result is None:
+        return STARTING_SCORE
+    return STARTING_SCORE + result['excess_bp']
 
 
 def activity_log_path(name):
@@ -568,25 +715,31 @@ def cleanup_scratch(scratch_name):
 # --------------------------------------------------------------------- instruments
 
 def report_activity(performances, limit=None):
-    """Rotations against yield -- the turnover-vs-edge question, in this domain's units.
+    """Where each score came from: rotations, what they cost, and time spent flat.
 
-    A yield strategy that rotates often is paying a real cost for it, and this is where
-    that shows up next to what it earned.
+    The turnover-vs-edge question in this domain's units, and the place a strategy that
+    is losing to the null shows WHY. The three columns are the three ways to lose here --
+    rotate too much, rotate across assets, or be stopped while the null keeps earning --
+    and the score alone does not distinguish them.
+
+    Note the amplification in the cost column: a one-off cost annualized over a three-day
+    window is multiplied by ~122, so 1bp paid reads as ~122bp of score.
     """
     rows = []
     for name, _ in performances[:limit]:
-        state = _state_of(Path(domain.STRATEGIES_DIR) / name)
-        if not state:
+        result = _scored(name, Path(domain.STRATEGIES_DIR) / name)
+        if result is None:
             continue
-        rows.append((name, int(state.get('rotations', 0) or 0),
-                     float(state.get('apy_bp', 0.0) or 0.0),
-                     float(state.get('cost_bp', 0.0) or 0.0)))
+        mine = result['mine']
+        rows.append((name, result['excess_bp'], mine['rotations'], mine['cost_bp'],
+                     mine['flat_s'] / 3600.0, mine['covered_s'] / 3600.0))
     if not rows:
+        print('No strategy has enough recorded history to be scored yet.')
         return
-    print('Rotation vs yield:')
-    for name, rotations, apy_bp, cost_bp in rows:
-        print(f'  {name}: {rotations} rotation(s), {apy_bp:+.0f}bp annualized, '
-              f'{cost_bp:.0f}bp paid in rotation cost')
+    print('Score attribution (excess over the static null):')
+    for name, excess_bp, rotations, cost_bp, flat_h, covered_h in rows:
+        print(f'  {name}: {excess_bp:+.0f}bp excess over {covered_h:.0f}h, '
+              f'{rotations} rotation(s) costing {cost_bp:.1f}bp, {flat_h:.1f}h flat')
 
 
 def stuck_report(performances, state, obs):
@@ -623,6 +776,13 @@ def stuck_report(performances, state, obs):
 
 
 def report_regime(obs):
+    """This cycle's venues, and the answer to YIELD.md's kill criterion so far.
+
+    The second block is measurement 2, recomputed every cycle off the recorded history:
+    what the best possible rotation path was worth against simply sitting in the venue
+    that turned out best. It is the number that decides whether this domain should exist,
+    and printing it every cycle means nobody has to remember to go and ask.
+    """
     if obs is None or not obs.rows:
         return
     ranked = sorted(obs.rows, key=lambda r: -(r['supply_apy'] + r['emission_apr_gross']))
@@ -634,6 +794,42 @@ def report_regime(obs):
               f"{row['supply_apy'] * 100:5.2f}% + {row['emission_apr_gross'] * 100:5.2f}% "
               f"emis, free {free}")
 
+    replay = _replay()
+    if replay is None:
+        return
+    now = time.time()
+    history = _window_history(now)
+    if not history:
+        return
+    since = max(now - SCORE_WINDOW_S, float(history[0]['ts']))
+    if now - since < MIN_SCORING_S:
+        print(f'Rate history covers {(now - since) / 3600:.1f}h; '
+              f'measurement 2 needs {MIN_SCORING_S / 3600:.0f}h')
+        return
+
+    def annualized(result):
+        return result['return'] * (replay.SECONDS_PER_YEAR / result['covered_s']) * 100
+
+    try:
+        static = replay.best_static_ex_post(history, since, now)
+        optimal = replay.optimal_rotation(history, since, now)
+        null = _null_for(history, since, now)
+    except Exception as e:
+        print(f'measurement 2 unavailable ({e})')
+        return
+    if not (static and optimal and null):
+        return
+    edge_bp = (optimal['return'] - static['return']) * (
+        replay.SECONDS_PER_YEAR / optimal['covered_s']) * 10000
+    if abs(edge_bp) < 0.5:
+        edge_bp = 0.0       # otherwise a rounding artefact prints as "-0bp"
+    print(f"Over the last {optimal['covered_s'] / 3600:.0f}h, annualized: "
+          f"null {annualized(null):.2f}%, best static {annualized(static):.2f}%, "
+          f"optimal rotation {annualized(optimal):.2f}% "
+          f"({optimal['rotations']} switches, {optimal['cost_bp']:.1f}bp of cost)")
+    print(f'  YIELD.md measurement 2 -- what rotating was worth at all: '
+          f'{edge_bp:+.0f}bp/yr. If this stays small, the domain is dead.')
+
 
 def report_experiments():
     pass
@@ -644,24 +840,96 @@ def report_live(live_name):
 
 
 def ensure_background_jobs():
-    """The venue snapshot is the only background data here, and observe() refreshes it.
+    """Start the rate recorder if it is not running, then report what history exists.
 
-    This is the belt for the braces: monitor calls this on paths that do not observe, and
-    a population reading a snapshot nobody refreshed would allocate on hours-old rates
-    without anything saying so.
+    Idempotent and called once per cycle. The daemon is setsid'd out of monitor's process
+    group so it outlives both a cycle and an emperor window -- which matters more here
+    than for sdex, because the scoring window is three days and monitor is restarted
+    roughly every twelve hours.
+
+    It also guarantees a snapshot exists before returning. That is not tidiness: a
+    strategy that starts with no snapshot allocates to nothing, logs nothing, and is
+    `idle` by its first scoring -- and monitor.py's cull exempts a young strategy from
+    the rank cull only if it is NOT idle (`age < YOUNG_GRACE_S and name not in
+    idle_names`). So a missing snapshot at spawn time does not delay a strategy, it
+    deletes it, three days of grace notwithstanding.
     """
     venues = _venues()
     if venues is None:
+        print('yield_venues unavailable; no recorder started and no snapshot written')
         return
+
+    if not background_jobs_alive():
+        domain.TRADES_DIR.mkdir(parents=True, exist_ok=True)
+        log = open(RECORDER_LOG, 'a')
+        proc = subprocess.Popen(
+            [_strategy_python(), '-u', str(RECORDER_SCRIPT),
+             '--daemon', '--interval', str(RECORDER_INTERVAL)],
+            stdout=log, stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,       # survives a TERM to monitor's process group
+        )
+        RECORDER_PID_FILE.write_text(str(proc.pid))
+        print(f'Started yield recorder (pid {proc.pid}, every {RECORDER_INTERVAL}s) '
+              f'-> {RECORDER_LOG}')
+
+    # The daemon's first sample is ~21s away; a spawn this cycle cannot wait for it.
     if venues.read_snapshot(max_age_s=SNAPSHOT_MAX_AGE_S) is None:
+        print('No fresh venue snapshot; censusing synchronously so this cycle can spawn')
         venues.write_snapshot()
+
+    try:
+        import yield_recorder
+    except Exception as e:
+        print(f'yield_recorder unavailable ({e}); nothing is recording rates')
+        return
+    extent = yield_recorder.span()
+    last = (yield_recorder.tail(1) or [{}])[0]
+    age = round(time.time() - last['ts']) if last.get('ts') else None
+    print(f"Rate history: {extent['rows']} rows over {extent['hours']}h; "
+          f"last row {age}s ago, {len(last.get('rows') or [])} venues, "
+          f"{len(last.get('live') or [])} strategies live")
+    if age is not None and age > RECORDER_INTERVAL * 5:
+        print(f'WARNING: rate history is {age}s stale. Nothing can be scored over a '
+              f'window it does not cover. Check {RECORDER_LOG}')
+    if extent['hours'] * 3600 < RANK_GRACE_S:
+        print(f"Rate history covers {extent['hours']}h of the "
+              f"{RANK_GRACE_S / 3600:.0f}h scoring window -- scores are provisional "
+              f"until it fills")
 
 
 def background_jobs_alive():
-    venues = _venues()
-    if venues is None:
+    """Is the recorder daemon running? Pid file plus two confirmations.
+
+    `os.kill(pid, 0)` alone is not enough: the pid file survives a container restart and
+    pids are recycled, so a stale file can name a live and entirely unrelated process, at
+    which point monitor believes it has a recorder forever while nothing is being
+    written. /proc/<pid>/cmdline settles it.
+    """
+    try:
+        pid = int(RECORDER_PID_FILE.read_text().strip())
+    except Exception:
         return False
-    return venues.read_snapshot(max_age_s=SNAPSHOT_MAX_AGE_S) is not None
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().decode('utf-8', 'replace')
+    except Exception:
+        return False        # cannot confirm -> assume not ours and respawn
+    return 'yield_recorder' in cmdline
+
+
+def _replay_facts():
+    replay = _replay()
+    if replay is None:
+        return {}
+    return {
+        'rotation_cost_same_asset_bp': replay.SAME_ASSET_BP,
+        'rotation_cost_cross_asset_bp': replay.CROSS_ASSET_BP,
+        'emission_realization': replay.EMISSION_REALIZATION,
+        'null_min_liquidity_usd': replay.NULL_MIN_LIQUIDITY_USD,
+    }
 
 
 def prompt_facts():
@@ -670,14 +938,30 @@ def prompt_facts():
     Group 7 of the contract: the prompt told the model sdex's score haircut was 0.999 for
     weeks while score.py enforced 0.899, so nothing here is written as a literal in prose.
     """
-    return {
+    facts = {
         'starting_score': STARTING_SCORE,
-        'score_formula': ('STARTING_SCORE + the annualized net paper yield in basis '
-                          'points that main.py writes to state.json as apy_bp'),
-        'score_is_self_reported': ('yes -- nothing audits apy_bp. Writing a large number '
-                                   'there raises the score and measures nothing, and the '
-                                   'run is worthless if you do it'),
-        'null_baseline': 'allocate once to the highest-rate venue and never rotate',
+        'score_formula': ('STARTING_SCORE + annualized EXCESS over the null in basis '
+                          'points, recomputed from your logged allocations priced '
+                          'against the recorded rate history. Matching the null scores '
+                          '1000; beating it by 1%/yr scores 1100'),
+        'score_is_self_reported': ('no. Nothing in state.json is read for scoring -- not '
+                                   'apy_bp, not nav. Only the allocations you log, the '
+                                   'rates the recorder saw, and whether your process was '
+                                   'observed running'),
+        'scoring_window_hours': SCORE_WINDOW_S / 3600,
+        'flat_when_stopped': ('a strategy the recorder does not see running earns '
+                              'nothing for that time while the null keeps earning, so '
+                              'downtime lowers the score rather than freezing it. About '
+                              '73bp of annualized excess per 8h down, at a 6.6% null'),
+        'cost_amplification': ('a one-off cost annualized over the scoring window is '
+                               'multiplied by ~%.0f, so 1bp paid to rotate reads as '
+                               '~%.0fbp of score. Rotating across ASSETS has to earn a '
+                               'lot to pay for itself; rotating between pools lending '
+                               'the SAME asset costs almost nothing'
+                               % (SECONDS_PER_YEAR_HINT / SCORE_WINDOW_S,
+                                  SECONDS_PER_YEAR_HINT / SCORE_WINDOW_S)),
+        'null_baseline': ('allocate once to the highest-rate venue that has real free '
+                          'liquidity, then never rotate'),
         'venues': 'Blend v2 lending pools that will accept a supply, Blend only',
         'aquarius_excluded_because': ('its pools cannot be entered single-sided, so a '
                                       'position there carries impermanent loss and two '
@@ -690,3 +974,5 @@ def prompt_facts():
         'rank_grace_s': RANK_GRACE_S,
         'knobs': sorted(DEFAULTS),
     }
+    facts.update(_replay_facts())
+    return facts
