@@ -38,6 +38,46 @@ MODEL_NICKNAMES = {
 # editing this literal: successive emperor passes kept flipping it between 'gpt' and
 # 'qwen' and overwriting each other's choice. 'gpt' is the current deliberate default.
 MODEL = MODEL_NICKNAMES.get(os.environ.get('MASTER_AGENT_MODEL', 'gpt'), MODEL_NICKNAMES['gpt'])
+
+
+def _is_cloud_model(model: str) -> bool:
+    """Is `model` one of Ollama's cloud-hosted models rather than a local pull?
+
+    Ollama names them by tag, in two shapes that both appear in MODEL_NICKNAMES:
+    a bare `:cloud` (glm-5.2:cloud) and a sized `:<size>-cloud` (gpt-oss:120b-cloud).
+    Match on the tag rather than searching the whole string so a local model that merely
+    has 'cloud' in its name -- a user pull like `someone/cloudy:8b` -- is not swept in.
+    """
+    tag = model.rsplit(':', 1)[-1] if ':' in model else ''
+    return tag == 'cloud' or tag.endswith('-cloud')
+
+
+def _should_think() -> bool:
+    """Whether to ask for a reasoning pass on this turn.
+
+    On for cloud models, off for local ones. The cloud models here are all
+    hybrid-reasoning and are trained to plan before a tool call; the local fallbacks are
+    small (granite4.1:8b) and either do not reason at all or cannot afford the tokens on
+    this host, so asking costs latency for nothing.
+
+    This matters for more than quality. With think=False, glm-5.2:cloud does not stop
+    reasoning -- it relocates it, emitting the whole chain of thought into `content`
+    alongside its tool_calls (see the transcripts saved in the 2026-08-21 cycle's
+    .strategy-revision-history.json files, which are full of "Still losing. The issue is
+    deeper..."). `content` is the channel revise_strategy reads as the model's answer and
+    the channel an '[error: ...]' reply is detected on, so reasoning landing there is
+    noise in a load-bearing field. think=True moves it to its own `thinking` key.
+
+    Read at call time, not at import: MODEL is rebindable by `/model <nick>` in the REPL,
+    and a switch to a local fallback has to turn thinking back off. Force it either way
+    with AGENT_THINK=on|off when bisecting a model's behaviour.
+    """
+    override = os.environ.get('AGENT_THINK', '').strip().lower()
+    if override in ('on', '1', 'true', 'yes'):
+        return True
+    if override in ('off', '0', 'false', 'no'):
+        return False
+    return _is_cloud_model(MODEL)
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 TOOLS_MODULE_FILE = os.path.abspath(sr_agent_tools.__file__)
@@ -163,6 +203,19 @@ def dispatch(tool_call) -> dict:
     return {'role': 'tool', 'name': name, 'content': result}
 
 
+def _message_chars(msg) -> int:
+    """Size of one message, counting the reasoning channel as well as `content`.
+
+    With _should_think() on, an assistant turn's `thinking` can outweigh its `content`
+    -- and it is sent back to the model on the next turn like everything else, because
+    run_turn appends the whole model_dump. Counting only `content` made both callers
+    below systematically under-read the prompt, which is harmless for the log line and
+    not harmless for _truncate_messages: under-counting there drops too few messages and
+    spends another round trip discovering the prompt is still too long.
+    """
+    return sum(len(str(msg.get(key) or '')) for key in ('content', 'thinking'))
+
+
 _OVERFLOW_RE = re.compile(r'exceeded max context length by (\d+) tokens')
 
 
@@ -185,7 +238,7 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
         removed_chars = 0
         removed = 0
         for msg in messages[keep_from:keep_from + droppable]:
-            removed_chars += len(str(msg.get('content') or ''))
+            removed_chars += _message_chars(msg)
             removed += 1
             if removed_chars >= target_chars:
                 break
@@ -208,24 +261,41 @@ SERVER_ERROR_RETRY_DELAY = 10  # seconds
 # looked at that; the loop was `while True` and ended only because the model eventually
 # stopped on its own. The identical repeats are the sharper signal, hence the much
 # tighter limit: one duplicated call is a recoverable hiccup, a third in a row is a stuck
-# model. The total budget is the backstop for a model that thrashes without repeating
-# itself exactly. Replaying that transcript against these values aborts at tool call 19
-# of 32; at a repeat limit of 4 it only reaches back to 26, and at 2 it would fire on
-# call 2 of every run that ever double-writes a file.
+# model. At a repeat limit of 4 that transcript only aborts at call 26 of 32, and at 2 it
+# would fire on call 2 of every run that ever double-writes a file.
+#
+# MAX_TOOL_CALLS is only the backstop for a model that thrashes without repeating itself
+# exactly, and it was set to 25 when the answer to "how many calls is a normal revision"
+# came entirely from gpt-oss:120b-cloud, which front-loads its reads and writes each file
+# once or twice. It does not survive a model that searches empirically. glm-5.2:cloud
+# hill-climbs -- write_file, backtest_strategy, read the return_pct, rewrite -- at two
+# calls per candidate, so 25 is about ten candidates including the opening reads. On
+# 2026-08-21 that aborted all three revisions of the cycle mid-iteration (see
+# emperor_logs/monitor-once-1787333633.log), and MAX_REPEATED_TOOL_CALLS never fired in
+# any of them, which is this file's own evidence that the runs were searching rather than
+# stuck. seed_6b1557e660a3 had already reached `beats_buy_hold true` at 2.98% vs 1.96%
+# and was still tuning when the budget cut it off; the fallback then overwrote its
+# thresholds. gpt-oss was already close to the ceiling too -- of the six revisions whose
+# traces survive in emperor_logs/monitor_20260820_170626.log the counts are 5, 8, 8, 11,
+# 12 and 23, and two more revisions that day hit the limit.
+#
+# 60 gives a two-call search loop roughly the iteration count gpt-oss used to get. Read
+# from the environment rather than edited here, for the reason REVISION_TIMEOUT is: the
+# right value is a property of the model in MASTER_AGENT_MODEL, not of this file, and
+# this file is rewritten by emperor.sh's self-revision passes.
 #
 # Hitting either returns an '[error: ...]' reply, so revise_strategy exits non-zero and
 # monitor.py applies its random-tweak fallback -- the same path quota exhaustion and
 # persistent server errors already take. Whatever the model wrote before giving up stays
 # on disk and still faces monitor's gates; this bounds the wasted wall clock, it does not
 # decide whether the work was any good.
-MAX_TOOL_CALLS = 25
-MAX_REPEATED_TOOL_CALLS = 3
+MAX_TOOL_CALLS = int(os.environ.get('MAX_TOOL_CALLS', '60'))
+MAX_REPEATED_TOOL_CALLS = int(os.environ.get('MAX_REPEATED_TOOL_CALLS', '3'))
 
 
 def _estimate_context_tokens(messages: list) -> int:
     """Rough token estimate (~4 chars/token) of the current message list."""
-    chars = sum(len(str(msg.get('content') or '')) for msg in messages)
-    return chars // 4
+    return sum(_message_chars(msg) for msg in messages) // 4
 
 
 def _call_signature(tool_call) -> str:
@@ -262,7 +332,7 @@ def run_turn(messages: list) -> str:
         print('...')
         print(f'[info] estimated context size: ~{_estimate_context_tokens(messages)} tokens')
         try:
-            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS, think=False)
+            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS, think=_should_think())
         except ResponseError as e:
             error_text = str(e)
             if 'prompt too long' in error_text.lower() and _truncate_messages(messages, error_text):

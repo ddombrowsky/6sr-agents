@@ -827,7 +827,17 @@ def _run_revision(name, parent_name, score, leaderboard, obs, role=ROLE_REFINE):
             # unanswerable from the log alone.
             print(f'Master agent revised {name} ({role}):\n{result.stdout.strip()}')
             return True
+        # stdout, not just stderr. stderr carries the one-line '[error: ...]' reason and
+        # nothing else; stdout is where master-agent.py prints the '  -> tool(...)' /
+        # '  <- result' trace, so dropping it here made every failed revision unreadable
+        # from the logs alone. When the 2026-08-21 cycle lost all three revisions to the
+        # tool-call budget, the only surviving evidence of what the model had been doing
+        # was each clone's .strategy-revision-history.json -- which run_turn truncates to
+        # REVISION_HISTORY_MAX_MESSAGES, i.e. the last two calls. The failures are exactly
+        # the runs worth reading: a success is a revision that worked.
         print(f'Master agent revision failed for {name} ({role}): {result.stderr.strip()}')
+        if result.stdout.strip():
+            print(f'Master agent transcript for {name} ({role}) before the failure:\n{result.stdout.strip()}')
     except Exception as e:
         print(f'Master agent revision errored for {name} ({role}): {e}')
     return False
@@ -865,6 +875,9 @@ def _run_smoke_retry(name, reason, before_head=''):
             print(f'Master agent retried {name} after smoke failure:\n{result.stdout.strip()}')
             return True
         print(f'Master agent smoke-failure retry failed for {name}: {result.stderr.strip()}')
+        # Same reasoning as the stdout print in _run_revision above.
+        if result.stdout.strip():
+            print(f'Master agent smoke-retry transcript for {name} before the failure:\n{result.stdout.strip()}')
     except Exception as e:
         print(f'Master agent smoke-failure retry errored for {name}: {e}')
     return False

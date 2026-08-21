@@ -17,6 +17,47 @@ MODEL_NICKNAMES = {
     'granite': 'granite4.1:8b',
 }
 MODEL = MODEL_NICKNAMES['glm']
+
+
+def _is_cloud_model(model: str) -> bool:
+    """Is `model` one of Ollama's cloud-hosted models rather than a local pull?
+
+    Ollama names them by tag, in two shapes that both appear in MODEL_NICKNAMES:
+    a bare `:cloud` (glm-5.2:cloud) and a sized `:<size>-cloud` (gpt-oss:120b-cloud).
+    Match on the tag rather than searching the whole string so a local model that merely
+    has 'cloud' in its name -- a user pull like `someone/cloudy:8b` -- is not swept in.
+
+    Kept identical to master-agent.py's copy. The two files cannot share it: that one is
+    named with a hyphen and is not importable, which is the same reason the ROLE_*
+    constants had to move into domain.py.
+    """
+    tag = model.rsplit(':', 1)[-1] if ':' in model else ''
+    return tag == 'cloud' or tag.endswith('-cloud')
+
+
+def _should_think() -> bool:
+    """Whether to ask for a reasoning pass on this turn.
+
+    On for cloud models, off for local ones. The cloud models here are all
+    hybrid-reasoning and are trained to plan before a tool call; the local fallbacks are
+    small (granite4.1:8b) and either do not reason at all or cannot afford the tokens on
+    this host, so asking costs latency for nothing.
+
+    With think=False a hybrid model does not stop reasoning -- it relocates it, emitting
+    the chain of thought into `content` next to its tool_calls. That is the field
+    emperor.sh's caller reads as the agent's answer, so reasoning landing there is noise
+    in a load-bearing channel. think=True moves it to its own `thinking` key.
+
+    Read at call time, not at import: MODEL is rebindable by `/model <nick>` in the REPL,
+    and a switch to a local fallback has to turn thinking back off. Force it either way
+    with AGENT_THINK=on|off when bisecting a model's behaviour.
+    """
+    override = os.environ.get('AGENT_THINK', '').strip().lower()
+    if override in ('on', '1', 'true', 'yes'):
+        return True
+    if override in ('off', '0', 'false', 'no'):
+        return False
+    return _is_cloud_model(MODEL)
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 
@@ -49,6 +90,18 @@ def dispatch(tool_call) -> dict:
     return {'role': 'tool', 'name': name, 'content': result}
 
 
+def _message_chars(msg) -> int:
+    """Size of one message, counting the reasoning channel as well as `content`.
+
+    With _should_think() on, an assistant turn's `thinking` can outweigh its `content`,
+    and it is sent back on the next turn like everything else. Counting only `content`
+    under-reads the prompt -- harmless in the log line below, not harmless in
+    _truncate_messages, where it drops too few messages and spends another round trip
+    rediscovering that the prompt is still too long.
+    """
+    return sum(len(str(msg.get(key) or '')) for key in ('content', 'thinking'))
+
+
 _OVERFLOW_RE = re.compile(r'exceeded max context length by (\d+) tokens')
 
 
@@ -71,7 +124,7 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
         removed_chars = 0
         removed = 0
         for msg in messages[keep_from:keep_from + droppable]:
-            removed_chars += len(str(msg.get('content') or ''))
+            removed_chars += _message_chars(msg)
             removed += 1
             if removed_chars >= target_chars:
                 break
@@ -89,8 +142,7 @@ SERVER_ERROR_RETRY_DELAY = 2  # seconds
 
 def _estimate_context_tokens(messages: list) -> int:
     """Rough token estimate (~4 chars/token) of the current message list."""
-    chars = sum(len(str(msg.get('content') or '')) for msg in messages)
-    return chars // 4
+    return sum(_message_chars(msg) for msg in messages) // 4
 
 
 def run_turn(messages: list) -> str:
@@ -99,7 +151,7 @@ def run_turn(messages: list) -> str:
         print('...')
         print(f'[info] estimated context size: ~{_estimate_context_tokens(messages)} tokens')
         try:
-            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS, think=False)
+            response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS, think=_should_think())
         except ResponseError as e:
             error_text = str(e)
             if 'prompt too long' in error_text.lower() and _truncate_messages(messages, error_text):
