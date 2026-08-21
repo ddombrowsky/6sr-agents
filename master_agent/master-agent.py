@@ -656,6 +656,12 @@ _GENERIC_TOOL_NAMES = frozenset((
 # which this domain explicitly does not do -- XLM/USDC only. Leaving them in would invite
 # a revision to spend its budget on a knob that cannot reach the market it quotes.
 _DOMAIN_TOOL_NAMES = {
+    # The empty set is a real entry, not an omission. Being absent from this dict means
+    # "no filtering", which for the null domain would hand the revision model the whole
+    # sdex surface -- get_xlm_price, verify_asset, backtest_strategy -- for a game with
+    # no price, no assets and a replay() that never runs the genome. It has no fitness
+    # tool of its own to add, so generic-only is the right answer and this says so.
+    'null': frozenset(),
     'forecast': frozenset({'backtest_forecast_strategy'}),
     'kalshi': frozenset({'backtest_kalshi_strategy'}),
     'sdex_maker': frozenset({
@@ -928,7 +934,80 @@ def _build_kalshi_revision_system_prompt():
     'genuinely outside the market\'s own price. Finish by committing your changes to a '
     'new git branch inside the strategy\'s directory.')
 
-if _DOMAIN.NAME == 'forecast':
+# Same deferral rule as the prompts above: `starting_score` and `null_baseline` are
+# domain_null.prompt_facts() keys and exist on no other domain, so this f-string must not
+# be evaluated unless null is the domain actually selected.
+#
+# Deliberately the shortest of the five. This domain is a test harness for the loop
+# itself -- there is one knob with a known closed-form optimum -- and padding the prompt
+# out to sdex length would only give the model more surface to invent requirements from.
+def _build_null_revision_system_prompt():
+    return (
+    'You are the strategy-revision agent for an evolutionary system running the NULL '
+    'domain: a coin-flip guessing game with no prices, no assets and no money. It exists '
+    'to exercise the evolutionary loop itself -- score, rank, cull, clone, revise, gate, '
+    'promote -- on a game that costs nothing and resolves instantly. Each cycle '
+    'monitor.py creates a small batch of new strategies (clones of the best current '
+    'performers, plus one pulled fresh from the template) and hands each to you before '
+    'it starts. The user message says which job you have: `refine` (improve on a parent '
+    'with a track record) or `explore` (a fresh template spawn, where the job is to try '
+    'something the population is not already doing). You have full read/write/exec '
+    "access to the strategy's directory.\n\n"
+    'THE GAME. Every few seconds the strategy draws `questions_per_tick` questions (a '
+    'config.json knob). A question shows exactly one number, `feature`, in [0, 1]: it is '
+    'the true probability that the question resolves True. '
+    "main.py's `decide(question, history, state, config)` returns True, False, or None "
+    'to skip. The outcome is drawn AFTER decide() returns, from a number decide() never '
+    'received -- there is nothing to read ahead to, so do not spend the revision looking '
+    'for it. A correct answer pays +1, a wrong one -1, and EVERY answer is charged '
+    "ANSWER_COST (0.25 in the template) whether it was right or not. Skipping pays and "
+    'costs nothing.\n\n'
+    'That cost is the whole problem. Answering a lopsided question (feature near 0 or 1) '
+    'is worth it; answering a coin-flip (feature near 0.5) loses money on average. The '
+    "template's rule answers when `abs(feature - 0.5) >= confidence - 0.5`, making "
+    '`confidence` a selectivity threshold: 0.5 answers everything, 1.0 answers nothing. '
+    'Its steady-state payoff is `(2 - 2c) * (c - 0.25)` per question. That is a real '
+    'optimum at an interior value of c, and both being too eager and being too picky '
+    'lose to it -- if you change the rule, work out where your version peaks rather than '
+    'assuming more selectivity is always better.\n\n'
+    f'SCORING. Fitness is {_FACTS["starting_score"]:.0f} + `points`, where `points` is '
+    f'what the strategy banked over the last POINTS_WINDOW_S seconds -- a rolling window, '
+    f'not a lifetime total, so a strategy cannot climb the leaderboard by being old and '
+    f'a tick spent skipping banks nothing into a window that empties regardless. The null '
+    f'baseline is "{_FACTS["null_baseline"]}", which scores exactly the starting value. '
+    f'Beating it is the entire objective.\n\n'
+    "state.json's `points` is self-reported: nothing audits it, and writing a large "
+    'number into it directly would "win" without playing. Do not -- that measures '
+    'nothing and is the one result this domain exists to not produce. Change decide(), '
+    'or the knobs it reads, and let main() do the banking.\n\n'
+    'There is no backtester for this domain. Its replay is mechanical (it counts '
+    'configured questions, it does not run your code), so your fitness evidence is '
+    'reasoning about the payoff above plus, if you want it, a short `exec` that samples '
+    'your rule over random features and prints the mean. Keep main()\'s tick loop and '
+    "its `if __name__ == '__main__':` guard intact: strat_manager starts main.py once as "
+    'a standalone process, so a file that defines decide() and then reaches the bottom '
+    'exits immediately, fails the smoke test and reverts your whole revision. Read any '
+    'config key you add as `config.get("your_key", <default>)`, never '
+    '`config["your_key"]`, and do not drop `name`, `confidence` or `questions_per_tick` '
+    '-- monitor repairs or rejects a config missing those.\n\n'
+    'When you are done, commit on a new git branch inside the strategy\'s own directory '
+    "(`git checkout -b auto/<timestamp>` then `git add -A && git commit -m ...`).\n\n"
+    # Same incident and same reason it sits last as in the four prompts above.
+    'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
+    '`write_file` and `exec` tool calls you actually make. Pasting a config.json into '
+    'your answer does not write it, quoting a main.py diff does not apply it, and a '
+    '`git commit` line inside a code fence does not run. monitor.py reads the directory, '
+    'never your summary, and a revision that left the files untouched is discarded and '
+    'replaced with a mechanical config nudge. Before your final reply, `read_file` every '
+    'path you claim to have changed and confirm it.\n\n'
+    'Finish by replying with a short summary of the changes you have already written to '
+    'disk, and why.'
+    )
+
+
+if _DOMAIN.NAME == 'null':
+    REVISION_SYSTEM_PROMPT = _build_null_revision_system_prompt()
+elif _DOMAIN.NAME == 'forecast':
     REVISION_SYSTEM_PROMPT = _build_forecast_revision_system_prompt()
 elif _DOMAIN.NAME == 'sdex_maker':
     REVISION_SYSTEM_PROMPT = _build_maker_revision_system_prompt()
@@ -1500,6 +1579,85 @@ def _refine_prompt_forecast(strategy_name, parent_name, strategy_path, parent_sc
     )
 
 
+def _refine_prompt_null(strategy_name, parent_name, strategy_path, parent_score,
+                       leaderboard, tick_line) -> str:
+    """The null domain's clone case. Parallel to _refine_prompt_forecast, minus every
+    concept (price, trade_amount_usd, an independent judge) it has no meaning for."""
+    parent_path = STRATEGIES_DIR / parent_name
+    parent_config = _read_json(parent_path / 'config.json', {})
+    parent_state = _read_json(parent_path / 'state.json', {})
+    answer_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
+    clone_main_py = _read_text(strategy_path / 'main.py')
+    # `recent` is the raw rolling window -- up to 500 [timestamp, delta] pairs, and the
+    # single largest thing in this state.json. `points` is already its sum, so quoting
+    # the window itself spends tokens restating a number the next line gives exactly.
+    parent_state = {k: v for k, v in parent_state.items() if k != 'recent'}
+    return (
+        f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
+        f'`{strategy_path}`. It has not answered a question yet.\n\n'
+        f'{tick_line}'
+        f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
+        f"Parent `{parent_name}`'s current state.json (`points` is the rolling-window "
+        f"total it is scored on; answered/correct/skipped are lifetime counts, and the "
+        f"window itself is omitted here): {json.dumps(parent_state)}\n"
+        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
+        f"Parent `{parent_name}`'s most recent resolved answers:\n{answer_tail}\n\n"
+        f"The clone's main.py (identical to the parent's right now -- this is what you'd "
+        f"edit to change the guessing logic, not just config.json):\n"
+        f"```python\n{clone_main_py}\n```\n\n"
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
+        f'Revise the clone at `{strategy_path}` however you think will improve on its '
+        f'parent, then commit your changes to a new git branch inside that directory.'
+    )
+
+
+def _explore_prompt_null(strategy_name, strategy_path, leaderboard, tick_line) -> str:
+    """The null domain's template-spawn case. Parallel to _explore_prompt_forecast.
+
+    Omits _population_census() for the same reason that one does: the census is
+    sdex-specific machinery built around a population with months of accumulated
+    variety, and this domain ships with one knob.
+    """
+    own_config = _read_json(strategy_path / 'config.json', {})
+    own_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
+        f'unmodified checkout of /opt/template_repo_null -- NOT a clone of any existing '
+        f'strategy. It has no parent, no answer history and no track record, so there '
+        f'is nothing here to improve on. Your job this time is EXPLORATION: give the '
+        f'population a strategy that is structurally different from what it already '
+        f'runs.\n\n'
+        f'{tick_line}'
+        f'Its config.json right now: {json.dumps(own_config)}\n'
+        f'monitor.py checks the config you leave behind: `name` must still be exactly '
+        f'"{strategy_name}", `confidence` must be in [0.5, 1.0] and '
+        f'`questions_per_tick` must be a positive integer. Even if your logic does not '
+        f'use a plain threshold at all, you must still leave both knobs in range -- '
+        f'otherwise monitor repairs them back to safe defaults.\n\n'
+        f'CONFIG.JSON IS YOURS TO EXTEND beyond those keys -- nothing validates it '
+        f'against a schema, and the whole dict reaches your `decide(question, history, '
+        f'state, config)` unchanged. A nonlinearity, a per-tick budget, a rule that '
+        f'varies the threshold with how the last few answers went -- whatever your '
+        f'logic needs belongs in config.json under a name that says what it means, not '
+        f'hardcoded in main.py. Two rules:\n'
+        f'  * ALWAYS read your own keys as `config.get("your_key", <sensible '
+        f'default>)`, never `config["your_key"]` -- a KeyError on the first tick fails '
+        f'the smoke test and is reverted.\n'
+        f'  * Do not rename, repurpose or drop `name`, `confidence` or '
+        f'`questions_per_tick`. Add alongside them.\n\n'
+        f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
+        f'proven code, so you are free to restructure it, but keep main() and its '
+        f'`__main__` guard):\n```python\n{own_main_py}\n```\n\n'
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running): {json.dumps(leaderboard)}\n\n'
+        f'Note that a structurally different strategy still has to beat the payoff the '
+        f'template already gets -- being different is the job, but being worse is still '
+        f'worse. Commit your changes to a new git branch inside `{strategy_path}` when '
+        f'done.'
+    )
+
+
 def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_line) -> str:
     """The forecast domain's template-spawn case. Parallel to _explore_prompt.
 
@@ -1668,7 +1826,14 @@ def _compose_revision_messages(strategy_name: str, parent_name: str, parent_scor
     # anchoring on a price out of its training data.
     price_line = _DOMAIN.observation_line(_DOMAIN.decode_observation(observation))
 
-    if _DOMAIN.NAME == 'forecast':
+    if _DOMAIN.NAME == 'null':
+        if role == ROLE_EXPLORE:
+            prompt = _explore_prompt_null(strategy_name, strategy_path, leaderboard,
+                                          price_line)
+        else:
+            prompt = _refine_prompt_null(strategy_name, parent_name, strategy_path,
+                                         parent_score, leaderboard, price_line)
+    elif _DOMAIN.NAME == 'forecast':
         if role == ROLE_EXPLORE:
             prompt = _explore_prompt_forecast(strategy_name, strategy_path, leaderboard,
                                               price_line)

@@ -56,9 +56,14 @@ during setup by `v/emperor.sh.UNMANAGED`, which is removed only after the stop.
 Which template repo a domain seeds from is read out of `master_agent/domain_<name>.py`'s
 `TEMPLATE_REPO` rather than kept in a table — the mapping is not mechanical
 (`DOMAIN=sdex_maker` clones `/opt/template_repo_maker`), and the container re-answers the
-same question from the imported module at the end so the two are compared. `DOMAIN=null`
-is the one registered domain `create.sh` cannot bootstrap: there is no
-`template_repo_null` in this repo, and it says so instead of inventing one.
+same question from the imported module at the end so the two are compared. Every
+registered domain has a template in this repo, so all five bootstrap; a domain whose
+template is missing is refused by name rather than half-built.
+
+`./create.sh null` is the cheap end-to-end test of the whole machine: no money, no
+network, no API rate limits, and a game that resolves every few seconds instead of every
+few hours. Use it to check that a change to `monitor.py` or the loop still scores, ranks,
+culls, clones, revises and gates — then run the real domain.
 
 `v/agents/` holds a working copy of the agent scripts for execution/testing inside that
 container. `v/` has since grown well beyond a script mirror into a separate multi-repo
@@ -107,7 +112,29 @@ Everything that *is* about a specific way of making money sits behind one module
 - `master_agent/domain_null.py` — a coin-flip forecasting game with no prices and no
   money. Selected with `DOMAIN=null`. It exists to prove the contract carries a domain
   that has none of sdex's furniture, and was the skeleton for the real benchmark domain
-  below.
+  below. It is also the domain to reach for when testing the loop itself: `./create.sh
+  null` brings the whole system up — emperor loop, revision cycles and all — against a
+  game that costs nothing and resolves in seconds.
+
+  Its seed genome is `template_repo_null/`. A question shows one number, `feature` in
+  [0, 1], which is the true probability it resolves True; `decide()` answers True, False
+  or None to skip, and the outcome is drawn only *after* decide() returns, from a number
+  decide() never received. A right answer pays +1, a wrong one -1, and every answer is
+  charged `ANSWER_COST` — that charge is what makes it a game rather than a counter,
+  since without it answering is always non-negative and the only strategy is to answer
+  everything. The template's rule answers when `|feature - 0.5| >= confidence - 0.5`, so
+  `confidence` is a selectivity threshold whose steady-state payoff `(2 - 2c) * (c -
+  0.25)` peaks at **c = 0.625** — an interior optimum, inside the range
+  `seed_config` seeds from and reachable by `tweak_config`'s ±5% jitter, so there is
+  something real for the loop to find. `points` is a rolling *time* window, not a
+  lifetime total: a total would make score a function of age and rank-culling would
+  measure birthdays, while a per-answer average would reward answering almost nothing.
+
+  `domain_null.score()` reads that number out of the strategy's own `state.json` and
+  nothing audits it — that is deliberate and is what keeps this a skeleton rather than a
+  benchmark (`domain_forecast.py` is the judged one). The revision prompt says so
+  explicitly, because a model that notices can "win" by writing a big number into
+  state.json, which measures nothing.
 - `master_agent/domain_forecast.py` — the benchmark domain FUTURE.md item 3 asked for:
   free, fast, no money, and *actually* scored (unlike `domain_null`, where a strategy
   just writes a number into its own `state.json` and nothing checks it). Selected with

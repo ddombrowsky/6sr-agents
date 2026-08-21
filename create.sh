@@ -38,6 +38,7 @@
 # [program:emperor]
 # command=/opt/master_agent/emperor.sh
 # directory=/opt/master_agent
+# environment=MASTER_AGENT_MODEL=gpt,CYCLE_SLEEP=28800
 # autostart=true
 # autorestart=true
 # startsecs=1
@@ -50,6 +51,12 @@
 # killasgroup=true
 
 # -n flag = nodaemon, required to exist as init proc
+#
+# The `environment=` line is where a container's CYCLE_SLEEP and MASTER_AGENT_MODEL come
+# from -- NOT from env.sh, which this script writes and which sets neither. Worth knowing
+# before wondering why a fresh container sleeps 8h between cycles when monitor.py's own
+# default is 3600: override per-run with `docker exec -e CYCLE_SLEEP=... `, or rebuild the
+# image to change it for good.
 
 set -e
 
