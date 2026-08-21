@@ -8,7 +8,7 @@
 # and /opt/tools and /opt/master_agent are watched git repos, so a missing .gitignore
 # means the first __pycache__ or cache write leaves an untracked file and the next
 # monitor cycle prints LIVE TRADING HALTED. scripts/selftest.sh checks for exactly this.
-SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_maker"
+SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_kalshi template_repo_maker"
 
 # Count every cp that fails and refuse to exit 0 if any did.
 #
@@ -55,10 +55,20 @@ copy_files() {
 }
 
 if [ "$1" = "--to" ] ; then
-    tf=`mktemp -d ./v/agents/bak.XXXXX`
-    mv -v ./v/agents/emperor-agent.py ./v/agents/sr_agent_tools.py \
-        ./v/agents/tools.json $tf
-    cp -v requirements.txt emperor-agent.py sr_agent_tools.py \
+    # create.sh calls this against a v/ that has just been made, where none of the three
+    # exist yet. `mv` of a missing file is an error that used to leave an empty bak.XXXXX
+    # behind on every bootstrap, so back up only what is actually there -- and do not
+    # make the backup directory at all if there is nothing to put in it.
+    mkdir -p ./v/agents
+    to_back_up=
+    for f in emperor-agent.py sr_agent_tools.py tools.json ; do
+        [ -e "./v/agents/$f" ] && to_back_up="$to_back_up ./v/agents/$f"
+    done
+    if [ -n "$to_back_up" ] ; then
+        tf=`mktemp -d ./v/agents/bak.XXXXX`
+        mv -v $to_back_up $tf
+    fi
+    say_cp requirements.txt emperor-agent.py sr_agent_tools.py \
         tools.json ./v/agents/
     for d in $SYNCED_DIRS ; do
         [ -d "./$d" ] || continue

@@ -38,19 +38,43 @@ python emperor-agent.py
   until the model responds without a tool call (`run_turn`). Also points at
   `127.0.0.1:11434`.
 
-`create.sh` starts a detached `ubuntu` container with the `v/` directory bind-mounted to
-`/opt`. `v/` is gitignored; `v/agents/` holds a working copy of the agent scripts for
-execution/testing inside that container. `v/` has since grown well beyond a script mirror
-into a separate multi-repo trading-agent system (`master_agent/`, `template_repo/`,
-`tools/`, `strategies/`, `trades/`); see `v/CLAUDE.md` for that.
+`create.sh` builds a container **and the `v/` volume it runs against**, for one domain:
+
+```
+./create.sh [--reuse-volume] [<domain>]        # domain defaults to sdex
+docker start $(cat .containername)
+```
+
+Those two lines are the whole bootstrap. `v/` is gitignored, so a new worktree starts with
+no volume at all, and everything the running system needs is built by `create.sh`: the
+directory skeleton, a `./copy.sh --to` deploy, `v/env.sh` (with the key and `DOMAIN=`),
+`git init` + first commit in `v/master_agent`, `v/tools` and the domain's template repo,
+the `domain-baseline` branch `selftest.sh` needs, and `/opt/agents/venv` built by the
+*container's* interpreter. The container is left **stopped**; the emperor is held inert
+during setup by `v/emperor.sh.UNMANAGED`, which is removed only after the stop.
+
+Which template repo a domain seeds from is read out of `master_agent/domain_<name>.py`'s
+`TEMPLATE_REPO` rather than kept in a table — the mapping is not mechanical
+(`DOMAIN=sdex_maker` clones `/opt/template_repo_maker`), and the container re-answers the
+same question from the imported module at the end so the two are compared. `DOMAIN=null`
+is the one registered domain `create.sh` cannot bootstrap: there is no
+`template_repo_null` in this repo, and it says so instead of inventing one.
+
+`v/agents/` holds a working copy of the agent scripts for execution/testing inside that
+container. `v/` has since grown well beyond a script mirror into a separate multi-repo
+trading-agent system (`master_agent/`, `template_repo/`, `tools/`, `strategies/`,
+`trades/`); see `v/CLAUDE.md` for that.
 
 `copy.sh` moves files between the two, and the direction depends on the flag:
 
 - `./copy.sh --to` — root → `v/agents/`: copies `requirements.txt`,
   `emperor-agent.py`, `sr_agent_tools.py` and `tools.json` in, backing up the previous
-  copy into `v/agents/bak.<random>/` first. It also copies `master_agent/*`, `tools/*`,
-  `template_repo/*` and `scripts/*.sh` across — with **flat globs**, so a new file must be
-  flat inside those directories or it will silently not deploy.
+  copy into `v/agents/bak.<random>/` first (skipped entirely on a fresh volume, where
+  there is nothing to back up). It also copies `master_agent/*`, `tools/*`, every
+  `template_repo*/*` in `SYNCED_DIRS` and `scripts/*.sh` across — with **flat globs**, so a
+  new file must be flat inside those directories or it will silently not deploy. A new
+  template repo has to be added to `SYNCED_DIRS`; `create.sh` refuses to bootstrap a domain
+  whose template is missing from it, because that volume would freeze at creation time.
 - `./copy.sh` (no args) — `v/` → root: copies `v/agents/*` to the repo root and
   `v/{master_agent,tools,template_repo}/*` over their root-level counterparts.
 
