@@ -1,0 +1,6 @@
+{
+  "name": "template_agent",
+  "schema_version": 1,
+  "confidence": 0.6,
+  "questions_per_tick": 1
+}

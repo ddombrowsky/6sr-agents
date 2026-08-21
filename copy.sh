@@ -8,7 +8,7 @@
 # and /opt/tools and /opt/master_agent are watched git repos, so a missing .gitignore
 # means the first __pycache__ or cache write leaves an untracked file and the next
 # monitor cycle prints LIVE TRADING HALTED. scripts/selftest.sh checks for exactly this.
-SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_kalshi template_repo_maker"
+SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_kalshi template_repo_maker template_repo_null"
 
 # Count every cp that fails and refuse to exit 0 if any did.
 #
@@ -61,7 +61,7 @@ if [ "$1" = "--to" ] ; then
     # make the backup directory at all if there is nothing to put in it.
     mkdir -p ./v/agents
     to_back_up=
-    for f in emperor-agent.py sr_agent_tools.py tools.json ; do
+    for f in emperor-agent.py sr_agent_tools.py memory_tools.py tools.json ; do
         [ -e "./v/agents/$f" ] && to_back_up="$to_back_up ./v/agents/$f"
     done
     if [ -n "$to_back_up" ] ; then
@@ -69,7 +69,22 @@ if [ "$1" = "--to" ] ; then
         mv -v $to_back_up $tf
     fi
     say_cp requirements.txt emperor-agent.py sr_agent_tools.py \
-        tools.json ./v/agents/
+        memory_tools.py tools.json ./v/agents/
+
+    # memory_tools.py was missing from that list until 2026-08-21, and emperor-agent.py
+    # imports it at line 9. Every emperor self-revision pass on a container that never had
+    # it hand-placed died instantly with ModuleNotFoundError -- ssr_agent00 was still in
+    # that state when this was found, and the only trace is one line in agent_<stamp>.log,
+    # since emperor.sh reports the step as failed and carries on to the next cycle.
+    # Exactly the flat-glob trap CLAUDE.md warns about.
+    #
+    # memory.json is deliberately NOT deployed with it. It is not config or seed data: it
+    # is whatever emperor-agent.py's `remember` tool wrote down on ONE container, mirrored
+    # here by the reverse direction of this script. Copying it onto a different container
+    # hands that container another one's memories -- the tracked copy's only fact is about
+    # /opt/agents/swarm/ slot files, which do not exist on every container, so seeding it
+    # plants something false as often as not. memory_tools.py needs no file to start:
+    # _load() returns {} when it is absent and the first `remember` creates it.
     for d in $SYNCED_DIRS ; do
         [ -d "./$d" ] || continue
         mkdir -p "./v/$d"
