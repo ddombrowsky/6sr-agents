@@ -11,11 +11,12 @@ import sr_agent_tools
 
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
+    'glm': 'glm-5.2:cloud',
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
     'granite': 'granite4.1:8b',
 }
-MODEL = MODEL_NICKNAMES['qwen']
+MODEL = MODEL_NICKNAMES['glm']
 SELF_FILE = os.path.abspath(__file__)
 TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
 
