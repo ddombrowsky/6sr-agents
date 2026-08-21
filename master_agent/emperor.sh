@@ -167,7 +167,29 @@ ast.parse(open(sys.argv[1]).read())" "$path" 2>>"$AGENT_LOG"; then
     fi
 }
 
+# Floor on how fast this loop may spin, and an escalating backoff on top of it.
+#
+# Both are no-ops on a healthy cycle, which has already burned the whole $RUN_HOURS
+# window by the time it reaches the delay. They only bind when monitor.py exits almost
+# immediately -- which it does, in well under a second, whenever /opt/.monitor.lock is
+# already held by a live monitor.py.
+#
+# That is not hypothetical. On 2026-08-20 monitor.py was still running from a previous
+# emperor.sh when supervisor restarted this script: monitor.py is launched with setsid
+# (see below), so it lives in its own session and supervisor's killasgroup never reached
+# it. The orphan kept the lock, every fresh monitor.py refused to start and exited at
+# once, and this loop -- which had no delay in it anywhere -- ran 48 complete cycles in
+# 48 seconds. Each wrote a monitor log, a prompt and an agent log, and prune_logs keeps
+# only $LOG_RETENTION_CYCLES of each, so the spin deleted every log from the run that
+# had actually been working. A stuck dependency must not be able to erase the evidence
+# of itself, which is what these two settings are for.
+MIN_CYCLE_SECONDS=$(duration_to_seconds "${EMPEROR_MIN_CYCLE:-60}")
+MAX_BACKOFF_SECONDS=$(duration_to_seconds "${EMPEROR_MAX_BACKOFF:-1h}")
+# Doubles per *consecutive* suspiciously-short cycle, reset by the first normal one.
+BACKOFF=0
+
 while true; do
+    CYCLE_START=$(date +%s)
     STAMP=$(date +%Y%m%d_%H%M%S)
     MONITOR_LOG="$LOG_DIR/monitor_$STAMP.log"
     AGENT_LOG="$LOG_DIR/agent_$STAMP.log"
@@ -226,7 +248,19 @@ while true; do
     # SyntaxError from a bad self-edit in a previous cycle) rather than
     # having genuinely finished early.
     if [ "$MONITOR_ELAPSED" -lt $((RUN_SECONDS / 10)) ]; then
-        echo "[emperor] WARNING: monitor.py exited after only ${MONITOR_ELAPSED}s (window was ${RUN_SECONDS}s) -- possible crash-on-startup, check $MONITOR_LOG" >&2
+        echo "[emperor] WARNING: monitor.py exited after only ${MONITOR_ELAPSED}s (window was ${RUN_SECONDS}s) -- possible crash-on-startup or a held /opt/.monitor.lock, check $MONITOR_LOG" >&2
+        # Consecutive short cycles double the wait, so a dependency that stays stuck for
+        # hours costs a handful of cycles rather than thousands.
+        if [ "$BACKOFF" -eq 0 ]; then
+            BACKOFF=$MIN_CYCLE_SECONDS
+        else
+            BACKOFF=$((BACKOFF * 2))
+            if [ "$BACKOFF" -gt "$MAX_BACKOFF_SECONDS" ]; then
+                BACKOFF=$MAX_BACKOFF_SECONDS
+            fi
+        fi
+    else
+        BACKOFF=0
     fi
 
     echo "[emperor] building analysis prompt at $PROMPT_FILE"
@@ -291,5 +325,19 @@ HEADER
 
     if [ "$ONCE" = "1" ]; then
         break
+    fi
+
+    # Hold the next cycle off until the floor (or the current backoff, whichever is
+    # larger) has elapsed since this cycle STARTED, so the work already done counts
+    # towards it and a normal cycle waits not at all.
+    CYCLE_ELAPSED=$(( $(date +%s) - CYCLE_START ))
+    DELAY=$MIN_CYCLE_SECONDS
+    if [ "$BACKOFF" -gt "$DELAY" ]; then
+        DELAY=$BACKOFF
+    fi
+    REMAINING=$(( DELAY - CYCLE_ELAPSED ))
+    if [ "$REMAINING" -gt 0 ]; then
+        echo "[emperor] cycle took ${CYCLE_ELAPSED}s; holding the next one off for ${REMAINING}s (floor ${MIN_CYCLE_SECONDS}s, backoff ${BACKOFF}s)"
+        sleep "$REMAINING"
     fi
 done

@@ -10,6 +10,20 @@
 # monitor cycle prints LIVE TRADING HALTED. scripts/selftest.sh checks for exactly this.
 SYNCED_DIRS="master_agent tools template_repo template_repo_forecast template_repo_kalshi template_repo_maker template_repo_null"
 
+# The agent-side files copied into v/agents/ (== /opt/agents in the container). Listed
+# once, in a variable, for the same reason SYNCED_DIRS is: the hardcoded cp list this
+# replaces silently disabled the ENTIRE emperor self-revision layer for a week.
+# memory_tools.py was added to emperor-agent.py's imports on 2026-08-13 and never added
+# to that cp list, so from then on every emperor-agent.py invocation died at
+# `import memory_tools` -- and the only trace was a 170-byte agent_*.log nobody read,
+# while emperor.sh went on logging ordinary-looking cycles. If you add an import to
+# emperor-agent.py, add the module here.
+#
+# memory.json is deliberately NOT in this list: it is state one container writes, not
+# code the host deploys. It flows container -> host via the reverse direction's glob and
+# never the other way -- see the note in the --to branch below for why not even as a seed.
+AGENT_FILES="requirements.txt emperor-agent.py sr_agent_tools.py memory_tools.py tools.json"
+
 # Count every cp that fails and refuse to exit 0 if any did.
 #
 # This script used to fail SILENTLY and half-deploy. `git init`/`git checkout` run inside
@@ -55,33 +69,36 @@ copy_files() {
 }
 
 if [ "$1" = "--to" ] ; then
-    # create.sh calls this against a v/ that has just been made, where none of the three
+    # create.sh calls this against a v/ that has just been made, where none of these
     # exist yet. `mv` of a missing file is an error that used to leave an empty bak.XXXXX
     # behind on every bootstrap, so back up only what is actually there -- and do not
     # make the backup directory at all if there is nothing to put in it.
     mkdir -p ./v/agents
     to_back_up=
-    for f in emperor-agent.py sr_agent_tools.py memory_tools.py tools.json ; do
+    for f in $AGENT_FILES ; do
         [ -e "./v/agents/$f" ] && to_back_up="$to_back_up ./v/agents/$f"
     done
     if [ -n "$to_back_up" ] ; then
         tf=`mktemp -d ./v/agents/bak.XXXXX`
         mv -v $to_back_up $tf
     fi
-    say_cp requirements.txt emperor-agent.py sr_agent_tools.py \
-        memory_tools.py tools.json ./v/agents/
+    for f in $AGENT_FILES ; do
+        [ -e "./$f" ] || continue
+        say_cp "./$f" ./v/agents/
+    done
 
     # memory_tools.py was missing from that list until 2026-08-21, and emperor-agent.py
     # imports it at line 9. Every emperor self-revision pass on a container that never had
     # it hand-placed died instantly with ModuleNotFoundError -- ssr_agent00 was still in
     # that state when this was found, and the only trace is one line in agent_<stamp>.log,
     # since emperor.sh reports the step as failed and carries on to the next cycle.
-    # Exactly the flat-glob trap CLAUDE.md warns about.
+    # Exactly the flat-glob trap CLAUDE.md warns about, and why the list is now a variable.
     #
-    # memory.json is deliberately NOT deployed with it. It is not config or seed data: it
-    # is whatever emperor-agent.py's `remember` tool wrote down on ONE container, mirrored
-    # here by the reverse direction of this script. Copying it onto a different container
-    # hands that container another one's memories -- the tracked copy's only fact is about
+    # memory.json is deliberately NOT deployed with it, not even as a seed onto a
+    # container that has none. It is not config or seed data: it is whatever
+    # emperor-agent.py's `remember` tool wrote down on ONE container, mirrored here by the
+    # reverse direction of this script. Copying it onto a different container hands that
+    # container another one's memories -- the tracked copy's only fact is about
     # /opt/agents/swarm/ slot files, which do not exist on every container, so seeding it
     # plants something false as often as not. memory_tools.py needs no file to start:
     # _load() returns {} when it is absent and the first `remember` creates it.

@@ -52,6 +52,17 @@
 # stopsignal=TERM
 # stopasgroup=true
 # killasgroup=true
+#
+# NOTE the single environment= line. supervisord's ini parser keeps only the LAST
+# occurrence of a duplicated key, so two environment= lines silently discard the first
+# one -- which is how MASTER_AGENT_MODEL came to be absent from the running emperor's
+# environment while the config appeared to set it. Add variables to that one line,
+# comma-separated; never as a second line.
+#
+# killasgroup does NOT reach monitor.py: emperor.sh launches it under setsid, in its own
+# session, deliberately (see the comment at that call). Restarting this program therefore
+# leaves an orphaned monitor.py holding /opt/.monitor.lock, so stop the program, kill any
+# surviving /opt/monitor.py, and only then start it again.
 
 # -n flag = nodaemon, required to exist as init proc
 #
