@@ -1,9 +1,13 @@
 # YIELD.md — yield rotation across Stellar's lending and reward venues
 
-**Written 2026-08-21.** A candidate domain: allocate capital across Aquarius reward pools
+**Written 2026-08-21. Amended 2026-08-21** after the open questions at the bottom were
+answered; the amendments are marked inline, and every one of them narrows the case rather
+than widens it.
+
+A candidate domain: allocate capital across Aquarius reward pools
 and Blend's two main lending pools (YieldBlox and Fixed), rotating as their rates move.
 This document is the case for investigating it, the two measurements that decide it, and
-the two ways it could quietly fail. It is *not* an implementation plan — `MAKER.md`'s
+the three ways it could quietly fail. It is *not* an implementation plan — `MAKER.md`'s
 phase structure would be premature here, because the cheap test below can end the item.
 
 FUTURE.md's ranked item 9 is the one-line version. This is the argument.
@@ -60,6 +64,15 @@ This is the same insight as FUTURE.md's item 8 (on-chain flow), applied to yield
 of prices — and it is stronger, because the quantity being predicted is mechanically
 determined rather than being a price that other participants are also forecasting.
 
+**Amendment: the Aquarius half of this argument is being retired.** Aquarius's voting system is
+changing, and its reward mechanics will be much less dynamic in future. A rate that stops
+moving cannot be anticipated, so the problem on that side is not that the lag is too small to
+arbitrage — it is that there is progressively less to arbitrage. What survives intact is Blend,
+whose supply APY remains a mechanical function of utilization and moves the moment anyone
+borrows or repays. The premise weakens from *two independent rate mechanisms, both moving* to
+*one moving, one nearly static*, which is a direct hit on measurement 1: a ranking flip needs
+both sides to move.
+
 ---
 
 ## The two measurements that decide it
@@ -68,6 +81,19 @@ The reason to take this seriously ahead of the other candidates: **pool state is
 and historical, so it is backfillable.** Unlike the maker, which needed weeks of
 `market_recorder.py` before any backtest could exist, months of APY, emission and
 utilization history should be reconstructible immediately. Criterion 2 comes nearly free.
+
+**Amendment: criterion 2 is not free, for two unrelated reasons.** Public Soroban RPC retains
+about seven days — asked for events at ledger 1000 on 2026-08-21, mainnet replied that the
+available range was 63,940,515–64,061,474, roughly 121k ledgers at ~5s each. Contract state
+reads are current-value only; there is no *state as of last March* call. So months of history
+means replaying pool events out of an archive — Hubble/BigQuery's `crypto-stellar`, the Galexie
+datalake, or raw history archives — which is real work with its own gaps rather than an
+immediate read. **Pick the archive source before promising the backfill.**
+
+And the Aquarius half of that history is **regime-suspect**: emission movements recorded under
+the outgoing voting system describe a mechanism being replaced. A perfect-foresight rotator
+scored against them returns a large number measuring a game no longer on offer — the same class
+of fiction as a gross-APY backtest, reached by a different route.
 
 Which means the whole viability question is answerable **offline, with no capital, no
 domain module and no population**:
@@ -88,7 +114,7 @@ produce a large and entirely fictional result.
 
 ---
 
-## Two ways this fails quietly
+## Three ways this fails quietly
 
 ### 1. Emission-token exit friction — this codebase has been burned by exactly this
 
@@ -108,6 +134,15 @@ A related trap: **the emission token's book depth caps the strategy's size**, in
 of any cap in `stellar_trader.py`. Earning 500 AQUA a week is only worth 500 AQUA if 500
 AQUA can be sold without moving the book.
 
+**Amendment: the friction is asymmetric, and that matters more than its average size.**
+Aquarius yield is mostly AQUA, plus some in-kind fee income on the concentrated pools. Blend
+pays interest in the supplied asset, and adds BLND emissions only on some pools, by a
+configuration that rarely changes. So nearly all of Aquarius's advertised APY has to survive
+the AQUA book to become a return, while most of Blend's arrives already denominated in what was
+supplied. Net of friction the two venues' headline numbers are not comparable, and a ranking
+computed on advertised APY has the sign of its own error built in. The BLND component, being
+config-driven and stable, is a near-constant rather than a state variable worth predicting.
+
 ### 2. Withdrawal is not guaranteed, and that breaks an existing invariant
 
 Every position this system holds today can be market-sold to flat. `wind_down` assumes it,
@@ -123,6 +158,32 @@ up as utilization falls* from *trapped*. That is a money-boundary design questio
 belongs in `domain.py` group 4, not in a strategy's `main.py`. It is the single largest
 piece of new safety work this domain requires, and it should be designed before the first
 live allocation, not after the first halt.
+
+**Amendment: this shrinks, and what remains splits in two.** Blend pools carry no lockup. The
+backstop does, and backstop contributions are excluded from this model — which also keeps the
+borrow facility `SHORTING_PLAN.md:7` rejected out of the design entirely. The Blend side of the
+concern therefore reduces to utilization-driven illiquidity: transient, readable before
+allocating, and boundable by sizing against free liquidity rather than by new stuck-semantics.
+The Aquarius side does not reduce, because an AMM exit is a price and not a par redemption —
+and that is a large enough problem to stand on its own below.
+
+### 3. An Aquarius position is not a yield position
+
+Aqua AMM pools cannot be entered single-sided. A position there is a yield position **plus a
+short-volatility LP payoff**, and three consequences follow that the framing above hides.
+
+It carries price exposure, so it is a non-base leg by any honest accounting — which puts it
+under the cap discussed in "Capacity, honestly" below rather than outside it. Entering requires
+swapping into the pair ratio and exiting requires swapping back, so every Aquarius rotation
+crosses books twice, at XLM's 12bp at best and `friction.py:16`'s 151–186bp on the assets the
+population keeps trying to admit. And impermanent loss must appear in measurement 2 as a term
+rather than a footnote: it is the one cost that grows with exactly the volatility that makes
+rotation look attractive in the first place.
+
+The practical consequence is a narrowing. Only the low-IL subset of Aquarius is tractable —
+stable pools and tightly correlated pairs — so step 1 has to record pool type and pair
+composition, not address and rate alone. A 40-pool sample of the 337 the AMM API lists split
+`constant_product` 30 / `stable` 6 / `concentrated` 4, so that subset is real but small.
 
 ---
 
@@ -180,11 +241,18 @@ At roughly $60 of capital, a perfectly captured 5% differential is a few dollars
 Criterion 8 applies with full force and the answer is the one it prescribes: the reason to
 run this is **what it teaches**, not what it earns.
 
-Two things soften it slightly relative to the rest of FUTURE.md's list. Supply-side yield can
-deploy the *whole* balance rather than the $8 that `MAX_TOTAL_NONBASE_EXPOSURE_USD` allows a
-trading strategy, so capacity binds less tightly here than anywhere else on the list. And
-rotation costs are Stellar transaction fees — fractions of a cent — rather than the 10–20bp
-round trip that makes FUTURE.md item 10's perp version structurally negative at this size.
+Two things soften it slightly relative to the rest of FUTURE.md's list — and **both are
+Blend-only**, where the original text claimed them for the domain as a whole.
+
+Supply-side lending can deploy the *whole* balance rather than the $8 that
+`MAX_TOTAL_NONBASE_EXPOSURE_USD` (`tools/stellar_trader.py:75`) allows a trading strategy, so
+capacity binds less tightly there than anywhere else on the list. An Aquarius LP position is
+two-sided and price-exposed, so it is precisely the kind of leg that cap exists to bound.
+
+And rotation *between Blend pools* costs Stellar transaction fees — fractions of a cent —
+rather than the 10–20bp round trip that makes FUTURE.md item 10's perp version structurally
+negative at this size. Rotating into or out of Aquarius costs two book crossings, which is
+squarely the regime item 10 was rejected for.
 
 ---
 
@@ -192,13 +260,20 @@ round trip that makes FUTURE.md item 10's perp version structurally negative at 
 
 1. **Confirm the venues.** Enumerate the Blend pools (YieldBlox, Fixed) and the Aquarius
    reward pools, their contract addresses and their current rates, by contract simulation.
-   `tools/reflector_oracle.py` is the precedent: the `stellar` CLI is installed, simulation
-   is read-only, costs nothing and signs nothing, and that file's docstring documents the
-   convention of confirming constants live rather than scraping docs.
-2. **Backfill history.** Reconstruct APY, emission rate and utilization per venue over as
-   long a window as the chain allows. This is the artifact everything else depends on.
+   `tools/reflector_oracle.py` is the precedent for confirming constants live rather than
+   scraping docs — read-only, costs nothing, signs nothing. The `stellar` CLI is no longer the
+   only route: `stellar-sdk` and `aquarius-sdk` are now installed, so simulation can run
+   in-process. Record pool type and pair composition on the Aquarius side, per §3. Then add
+   one reading that needs no archive at all: **how far Blend supply APY has actually moved**
+   across the two pools over the ~7-day RPC window. If Blend utilization is itself sticky, the
+   domain is dead without the backfill ever being built.
+2. **Backfill history.** Reconstruct APY, emission rate and utilization per venue over as long
+   a window as the chain allows — which starts with choosing an archive source, since RPC holds
+   a week. Treat pre-change Aquarius emissions as a description of a retired mechanism rather
+   than as evidence about the next one.
 3. **Run the two measurements**, net of emission-exit friction sized from the real AQUA and
-   BLND books rather than assumed. **Stop here if measurement 2 is small.**
+   BLND books rather than assumed, and net of IL and two-sided entry cost on any Aquarius leg.
+   **Stop here if measurement 2 is small.**
 4. Only then: the withdrawal/stuck boundary design, `domain_yield.py`,
    `template_repo_yield/`, and the revision-vs-cull decoupling in `monitor.py`.
 
@@ -216,10 +291,26 @@ plan:
 - Aquarius emission mechanics: the voting period length, when a vote snapshot binds, and how
   far ahead the next period's emissions are actually knowable. The entire criterion 6 argument
   rests on this lag being real and non-trivial.
+  Answer: aquarius's voting system is changing.  The reward mechanics will
+  be much less dynamic in the future.
 - Whether Blend pool participation carries any lockup, cooldown or withdrawal delay beyond
   utilization-driven illiquidity.
+  Answer: blend pool has no lock-up.  The backstop _does_, but we're not
+  including backstop contributions in this model.
 - Whether AMM participation on the Aquarius side means impermanent loss must be modeled, or
   whether reward pools can be entered on a single-sided basis. IL materially changes
   measurement 2 and is easy to omit by accident.
+  Answer: Aqua AMM pools cannot be entered one-sided.  IL must be considered.
 - How much of each venue's yield is emission-denominated versus paid in the supplied asset.
   This ratio determines how much of the friction in §1 above actually bites.
+  Answer: For aqua, it's mostly AQUA and -- in the case of concentrated AMMs --
+  partially in the assets themselves from fees.  For Blend, you earn interest
+  on deposits, and sometimes earn BLND emissions (this changes based on pool
+  configuration, but does not change often).
+
+Those answers raised one more, and it is now the load-bearing one:
+
+- **How far along is the Aquarius voting change** — announced, in progress, or already live?
+  It decides whether historical Aquarius emission data can be used for measurement 2 at all,
+  or whether that half of the backfill should be skipped as a measurement of a regime that no
+  longer exists. Everything else in step 1 can proceed without the answer.
