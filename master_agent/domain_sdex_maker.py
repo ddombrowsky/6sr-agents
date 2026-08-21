@@ -183,6 +183,24 @@ def _clamp(value, lo, hi, default):
     return max(lo, min(hi, value))
 
 
+def _observed_mid():
+    """The last recorded mid, or None. Never raises.
+
+    Used to mark inventory outside a cycle, where the `obs` the loop threads around is
+    not in hand -- live_track_record gets a name and nothing else. Reads the recorder
+    rather than the order book on purpose: a promotion gate that makes a network call
+    fails when the network does, and the recorder's last row is at most a tick old.
+    """
+    recorder = _tool('market_recorder')
+    if recorder is None:
+        return None
+    try:
+        tail = recorder.tail(1)
+        return tail[-1].get('dex_mid') if tail else None
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------------------
 # Criterion 1: fitness resolvable inside a cycle.
 # --------------------------------------------------------------------------------------
@@ -579,6 +597,92 @@ def can_execute_live(name):
         return False, (f'main.py calls {sorted(forbidden)} directly instead of going '
                        f'through quote_executor; offer lifecycle is not the strategy\'s')
     return True, 'calls sync_quotes and does not reach around it'
+
+
+def live_track_record(name):
+    """Has this genome shown a MAKER's edge, or is it a long position in a rally?
+    (ok, reason). FAILS CLOSED.
+
+    Optional contract member (see domain.py criterion 4): `qualifies_for_live` consults
+    it when a domain defines it, and a domain that does not define it keeps the old
+    trade-count/age/score bar unchanged.
+
+    That bar cannot see the failure this catches. Score is derived from the strategy's own
+    state.json, which marks inventory to market, so in a trending market the strategy that
+    ranks #1 is the one holding the most XLM -- and promoting on score alone deploys real
+    money into a directional bet wearing a maker's clothes. Observed 2026-08-21: the whole
+    population showed gross capture of -1.01 bp against net +25.63 bp, the difference being
+    a 25% XLM rally against ~$250 of pinned inventory each, while the 7-day replay had
+    every ranked strategy at a NEGATIVE net edge.
+
+    Two questions, both asked of numbers the strategy does not write:
+
+      1. `net_edge_usd > 0` -- spread captured minus adverse selection, from replay(),
+         which is exactly "the part a maker controls" (maker_backtest.py:819) and excludes
+         what the mid did on its own. NOT `beats_null`: the null is a fixed-width quoter,
+         not a zero, and on this pair it has been losing money, so `beats_null` is
+         satisfied by losing more slowly. On 2026-08-21 the null itself replayed at
+         -31.17, and the two top-ranked strategies at -11.19 and -38.18.
+
+      2. Inventory inside the genome's own band. Past it, one side has stood down
+         (template_repo_maker/main.py:53) and the strategy is not making a market at all;
+         stuck_report already prints this, but printing it and promoting anyway is how a
+         directional position gets the live flag. Deliberately the instantaneous reading
+         rather than a persistence window: a promotion happens at a moment, and being
+         wrong here costs a delayed promotion -- the next cycle promotes it if inventory
+         has come back inside -- not money.
+
+    Fails CLOSED, unlike every other caller of replay() in the loop. replay()'s docstring
+    says its callers fail open because they guard a fitness signal; this one guards real
+    money, and "the replay could not run" is not evidence of an edge.
+    """
+    # Checked before the replay is trusted, not for the caller's benefit: maker_backtest
+    # falls back to its own null quoter when it cannot load a quote() (maker_backtest.py's
+    # `strategy_dir or 'null'`), so a name with no main.py behind it comes back with a
+    # complete, plausible result describing a strategy that does not exist.
+    if not (STRATEGIES_DIR / name / 'main.py').exists():
+        return False, f'{STRATEGIES_DIR / name} has no main.py'
+    result = replay(STRATEGIES_DIR / name)
+    if result is None:
+        return False, 'replay could not run, so no maker edge has been demonstrated'
+    net = (result.get('raw') or {}).get('net_edge_usd')
+    try:
+        net = float(net)
+    except (TypeError, ValueError):
+        return False, 'replay reported no net_edge_usd, so no maker edge has been measured'
+    if net != net:                                        # NaN
+        return False, 'replay reported a NaN net_edge_usd'
+    if net <= 0:
+        null_net = (result.get('raw') or {}).get('null_net_edge_usd')
+        against = f' (the null is {null_net:+.2f})' if isinstance(null_net, (int, float)) else ''
+        return False, (f'{REPLAY_DAYS}d replay net edge is ${net:+.2f}{against}: spread '
+                       f'capture minus adverse selection is not positive')
+
+    config = _read_json(STRATEGIES_DIR / name / 'config.json', {}) or {}
+    try:
+        band = float(config.get('inventory_band_usd'))
+    except (TypeError, ValueError):
+        return False, 'config.json has no readable inventory_band_usd to judge inventory against'
+    if band <= 0:
+        return False, f'inventory_band_usd is {band}, so inventory is unbounded'
+
+    raw_state = _read_json(STRATEGIES_DIR / name / 'state.json')
+    if not isinstance(raw_state, dict):
+        return False, 'state.json is unreadable, so inventory cannot be checked'
+    mid = _observed_mid()
+    if not mid:
+        return False, 'no recorded mid available, so inventory cannot be marked'
+    try:
+        inventory = float(raw_state.get('balance_xlm') or 0.0) * mid
+    except (TypeError, ValueError):
+        return False, 'state.json has no readable balance_xlm'
+    if abs(inventory) > band:
+        side = 'bid' if inventory > 0 else 'ask'
+        return False, (f'inventory ${inventory:.0f} is past its ${band:.0f} band, so the '
+                       f'{side} is stood down: a directional position, not a two-sided quote')
+
+    return True, (f'{REPLAY_DAYS}d replay net edge ${net:+.2f}, inventory ${inventory:.0f} '
+                  f'inside its ${band:.0f} band')
 
 
 def promotion_sizing(name):
@@ -1117,14 +1221,7 @@ def report_activity(performances, limit=None):
     rows = list(performances or [])[:limit or 8]
     if not rows:
         return
-    obs_mid = None
-    recorder = _tool('market_recorder')
-    if recorder is not None:
-        try:
-            tail = recorder.tail(1)
-            obs_mid = tail[-1].get('dex_mid') if tail else None
-        except Exception:
-            obs_mid = None
+    obs_mid = _observed_mid()
     print('Maker activity (24h live; bt_net$ is the 8-day replay, not live):')
     print(f"  {'strategy':<26} {'fills':>6} {'buy/sell':>10} {'volume$':>9} "
           f"{'gross$':>8} {'resid$':>8} {'net$':>8} {'bt_net$':>8}")

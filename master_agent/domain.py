@@ -86,18 +86,31 @@ sixth is one the list omits.
      prepare_live(name)            -> dict
      retire_live(old_name)         -> (ok, [lines])
      SMOKE_ENV                     dict
+     live_track_record(name)       -> (ok, reason)     OPTIONAL, FAILS CLOSED
 
    SMOKE_ENV is a hard requirement, not a convenience: the loop smoke-tests candidate
    code by RUNNING it, and any domain that can move real money must supply an environment
    in which execution is structurally impossible. `{'PAPER_ONLY': '1'}` for sdex. A domain
    with no money returns `{}`.
 
-   Note `can_execute_live` and `live_enabled` are the two members that fail CLOSED.
-   Every other verdict here guards a fitness signal; these two decide whether real money
-   moves, and believing money is deployed behind a position that was never opened is
-   worse than not promoting at all.
+   `live_track_record` is the one optional member here, and the only optional member
+   anywhere in this contract that guards money. It answers "has this strategy earned real
+   money", which `monitor.qualifies_for_live` otherwise decides on trade count, age and
+   score alone -- three things that are true of every domain and therefore cannot see a
+   score that rose for a reason that is not skill. That reason IS domain knowledge: the
+   maker's score marks inventory to market, so a trending market ranks whoever is holding
+   the most, and the strategy the loop would promote in a rally is a directional position
+   rather than the best market maker. A domain that can tell its own edge from its own
+   drift implements this; one that cannot omits it and keeps the old bar exactly. Not in
+   CONTRACT for that reason -- `check()` must not fail a domain for declining to answer a
+   question it has no way to answer.
 
-   The two answer different questions and neither substitutes for the other:
+   Note `can_execute_live`, `live_enabled` and `live_track_record` are the members that
+   fail CLOSED. Every other verdict here guards a fitness signal; these three decide
+   whether real money moves, and believing money is deployed behind a position that was
+   never opened is worse than not promoting at all.
+
+   The first two answer different questions and neither substitutes for the other:
    `can_execute_live(name)` asks whether THAT STRATEGY is structurally able to place a
    real order; `live_enabled()` asks whether THIS DOMAIN may have a live strategy at all
    right now. Before it existed there was no domain-agnostic way to say "run this
@@ -108,6 +121,11 @@ sixth is one the list omits.
    strategy whose every order was refused, which is precisely the "monitor believes money
    is deployed" state the paragraph above is about. Now the loop asks first, clears
    live.flag when the answer is no, and restores it when the answer changes back.
+
+   `live_track_record(name)` is a third and separate question again -- not "can it" and
+   not "may we", but "should it": both of the others can be yes about a strategy that has
+   never shown an edge. It is a bar, so an operator's `--promote --force` skips it, which
+   `can_execute_live` and `live_enabled` never allow.
 
    `live_switch()` below is the domain-agnostic half every domain that moves money should
    defer to first (the operator's file/env switch); a domain adds its own reasons on top

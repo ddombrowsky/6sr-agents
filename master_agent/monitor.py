@@ -1310,6 +1310,15 @@ def qualifies_for_live(name, score):
     on any quiet day. Real money only goes to a strategy with a real, profitable
     track record. If nothing qualifies, nothing is promoted and no live trading
     happens this cycle -- that is the intended safe default.
+
+    The bar here is deliberately domain-agnostic -- count, age, and "did score move off
+    the starting baseline" are true of any population. What that cannot see is a score
+    that went up for a reason that is not skill, which is domain knowledge: a maker's
+    score marks inventory to market, so a trending market promotes whoever is holding
+    the most. A domain that can distinguish its own edge from its own drift says so in
+    the optional DOMAIN.live_track_record(name), consulted last because it is the most
+    expensive question (the maker's runs a replay) and there is no point asking it about
+    a strategy that has not cleared the cheap bars.
     """
     # Checked first: this is about whether the strategy *can* act live at all, which
     # no amount of paper track record makes up for. The only domain member that fails
@@ -1325,6 +1334,19 @@ def qualifies_for_live(name, score):
         return False, f'trade history spans only {age / 3600:.1f}h (need {MIN_LIVE_AGE_S / 3600:.1f}h)'
     if score <= MIN_LIVE_SCORE:
         return False, f'score {score:.2f} is not above the {MIN_LIVE_SCORE:.2f} starting baseline'
+    # Optional, and absent means "this domain has nothing to add" rather than "no": a
+    # domain that cannot separate edge from drift is left exactly where it was before
+    # this hook existed. The domains that define it fail CLOSED inside it.
+    track_record = getattr(DOMAIN, 'live_track_record', None)
+    if track_record is not None:
+        try:
+            earned, why = track_record(name)
+        except Exception as e:
+            # A gate that guards real money and crashes has not said yes.
+            return False, f'{DOMAIN.NAME} track-record check failed ({e})'
+        if not earned:
+            return False, why
+        return True, f'{count} trades over {age / 3600:.1f}h, score {score:.2f}; {why}'
     return True, f'{count} trades over {age / 3600:.1f}h, score {score:.2f}'
 
 def promote_live_strategy(current_leader, leader_score):
@@ -1441,9 +1463,13 @@ def promote_strategy_manual(name, force=False):
     operator's judgment for an automatic track-record bar, and the switch IS an operator's
     judgment, already expressed. Overriding it here would mean the flag that says "I know
     what I am doing" cancels the file that says "do not trade".
-    --force only skips qualifies_for_live's track-record bar (trade count/age/score),
-    since that gate exists purely as a stand-in for judgment an operator is now supplying
-    directly by picking this name. Returns (ok, [lines to print]).
+    --force only skips qualifies_for_live's track-record bar (trade count/age/score, and
+    DOMAIN.live_track_record where a domain defines one), since that gate exists purely as
+    a stand-in for judgment an operator is now supplying directly by picking this name.
+    Note that live_track_record is the one an operator is most likely to be overriding on
+    purpose -- deliberately putting a strategy live to measure it against the tape before
+    it has an edge to show -- and the refusal it prints says what was actually wrong, so
+    read it before reaching for --force. Returns (ok, [lines to print]).
     """
     if not (STRATEGIES_DIR / name / 'main.py').exists():
         return False, [f'{name}: no such strategy ({STRATEGIES_DIR / name} has no main.py)']
@@ -1490,8 +1516,9 @@ def promote_strategy_manual(name, force=False):
             else:
                 return False, [f'{name} does not qualify for live: {reason}',
                                '  pass --force to override this check (trade count/age/'
-                               'score only -- boundary integrity and can_execute_live are '
-                               'never overridden)']
+                               'score and the domain track-record check only -- boundary '
+                               'integrity, live_enabled and can_execute_live are never '
+                               'overridden)']
         else:
             lines.append(f'{DOMAIN.OBSERVE_FAILURE_NOTE}; could not verify track record '
                          f'this pass')
