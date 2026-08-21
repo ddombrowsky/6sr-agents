@@ -20,9 +20,12 @@
 #   * /opt/master_agent and /opt/tools as git repos -- monitor.py's
 #     check_boundary_integrity() halts live trading on a dirty or non-repo watched dir,
 #     and emperor.sh commits its own self-revisions into them.
-#   * the domain's template repo as a git repo -- every spawn is
-#     `git clone file:///opt/template_repo...`, so without a commit in it the population
-#     cannot grow at all.
+#   * the template repos as git repos -- every spawn is
+#     `git clone file:///opt/template_repo...`, so without a commit in the domain's own
+#     template the population cannot grow at all. All of the deployed templates are
+#     inited, not just that one: /opt/st.sh walks `template_repo*` and the others would
+#     each print a `not a git repository` fatal, and switching DOMAIN in v/env.sh would
+#     otherwise land on a template that cannot be cloned.
 #   * /opt/env.sh -- emperor.sh does `. ./env.sh` before anything else, and copy.sh
 #     deliberately does NOT deploy it (it holds the key, and it is where DOMAIN is set).
 #
@@ -279,7 +282,17 @@ init_repo() {
 echo "--- git repos"
 init_repo v/master_agent watched
 init_repo v/tools watched
-init_repo "v/$TEMPLATE_DIR" seed
+
+# EVERY template repo copy.sh deployed, not just this domain's. Only $TEMPLATE_DIR is
+# needed to spawn strategies today, but the others are all sitting in /opt as ordinary
+# directories, and two things trip over that: /opt/st.sh loops `for f in master_agent
+# template_repo* tools` and prints a `fatal: not a git repository` for each one, and
+# switching a container to another domain by editing DOMAIN in v/env.sh would leave it
+# unable to clone at all. git-initing them costs one commit each and removes both traps.
+for d in v/template_repo* ; do
+    [ -d "$d" ] || continue
+    init_repo "$d" seed
+done
 
 # The differential baseline for selftest_domain.py. Its search is content-addressed --
 # the newest commit of monitor.py that still defines the three functions that moved into

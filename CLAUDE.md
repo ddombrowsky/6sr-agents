@@ -48,7 +48,9 @@ docker start $(cat .containername)
 Those two lines are the whole bootstrap. `v/` is gitignored, so a new worktree starts with
 no volume at all, and everything the running system needs is built by `create.sh`: the
 directory skeleton, a `./copy.sh --to` deploy, `v/env.sh` (with the key and `DOMAIN=`),
-`git init` + first commit in `v/master_agent`, `v/tools` and the domain's template repo,
+`git init` + first commit in `v/master_agent`, `v/tools` and every deployed
+`template_repo*` (not just the selected domain's — `st.sh` walks them all, and switching
+`DOMAIN` in `v/env.sh` later would otherwise land on a template that cannot be cloned),
 the `domain-baseline` branch `selftest.sh` needs, and `/opt/agents/venv` built by the
 *container's* interpreter. The container is left **stopped**; the emperor is held inert
 during setup by `v/emperor.sh.UNMANAGED`, which is removed only after the stop.
