@@ -1550,6 +1550,19 @@ def promote_strategy_manual(name, force=False):
 
 
 def run():
+    # One-time note at startup if CYCLE_SLEEP is well above the default: the throughput
+    # cost is not obvious from the sleep line alone (which just says "Sleeping for
+    # 28800s..."), and an 8h cycle reduces evolutionary throughput 8x with no other
+    # signal in the log. Printed here rather than at import so it appears once per
+    # monitor.py invocation, at the top of the log an emperor pass reads first.
+    if CYCLE_SLEEP > 7200:
+        cycles_per_day = 24 * 3600 / CYCLE_SLEEP
+        revisions_per_day = cycles_per_day * REVISION_CHANCE * REVISIONS_PER_CYCLE
+        default_revisions = 24 * REVISION_CHANCE * REVISIONS_PER_CYCLE
+        print(f'NOTE: CYCLE_SLEEP={CYCLE_SLEEP}s ({CYCLE_SLEEP / 3600:.1f}h) -- '
+              f'{cycles_per_day:.1f} cycles/day, ~{revisions_per_day:.1f} revisions/day. '
+              f'Default 3600s gives 24 cycles/day, ~{default_revisions:.1f} revisions/day. '
+              f'Evolutionary throughput is {revisions_per_day / default_revisions * 100:.0f}% of default.')
     while True:
         print('--- Monitoring cycle', datetime.datetime.now(), '---')
         # Rolled once here, then drawn down by whichever path creates strategies this
