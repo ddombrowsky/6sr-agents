@@ -989,6 +989,7 @@ def seed_config(config_path, name, obs=None):
     print(f"  seeded {name}: {config['half_width_bp']} bp half-width, "
           f"${config['quote_size_usd']} per side, "
           f"skew {config['inventory_skew_bp']} bp, "
+          f"band ${config.get('inventory_band_usd', 250.0)}, "
           f"refresh {config['refresh_interval_s']}s")
 
 
@@ -1020,10 +1021,23 @@ def tweak_config(parent_path, new_path, name):
         config['inventory_skew_bp'] = round(_clamp(skew * random.uniform(0.7, 1.4)
                                                    if skew else random.uniform(0.0, 4.0),
                                                    0.0, 20.0, skew), 2)
+        # Perturb the inventory band so evolution can explore it through cloning, not
+        # only through LLM revisions. Without this, every clone inherits the parent's
+        # band exactly, and since the default (250.0) and most parents share it, the
+        # whole population is stuck at the same band width. Measured 2026-08-21: 5 of
+        # the top 8 strategies had inventory past their $250 band, the bid stood down
+        # on each, and the only path to a different band was an LLM revision -- which
+        # 25% of cycles (control arm) do not produce at all.
+        band = _clamp(parent.get('inventory_band_usd', 250.0),
+                      MIN_INVENTORY_BAND_USD, MAX_INVENTORY_BAND_USD, 250.0)
+        config['inventory_band_usd'] = round(_clamp(band * random.uniform(0.7, 1.5),
+                                                    MIN_INVENTORY_BAND_USD,
+                                                    MAX_INVENTORY_BAND_USD, band), 2)
         if not _write_json(new_path, config):
             return False
         print(f"  tweaked from parent: {config['half_width_bp']} bp, "
-              f"${config['quote_size_usd']}, skew {config['inventory_skew_bp']} bp")
+              f"${config['quote_size_usd']}, skew {config['inventory_skew_bp']} bp, "
+              f"band ${config['inventory_band_usd']}")
         return True
     except Exception as e:
         print(f'  tweak_config failed ({e}); falling back to a fresh seed')

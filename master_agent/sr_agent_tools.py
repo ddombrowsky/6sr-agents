@@ -21,7 +21,11 @@ def read_file(path: str) -> str:
         return f'error: {e}'
 
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str = '', content: str = '') -> str:
+    if not path:
+        return ('error: write_file requires a "path" argument. '
+                'You provided content but no path. '
+                'Call write_file(path="/path/to/file", content="...")')
     try:
         with open(path, 'w') as f:
             f.write(content)
@@ -91,7 +95,14 @@ def get_current_time() -> str:
     return datetime.now().isoformat()
 
 
-def exec(command: str) -> str:
+def exec(command: str = '', cmd=None) -> str:
+    # Accept 'cmd' as an alias: the model sometimes calls exec(cmd=...) instead of
+    # exec(command=...), and occasionally passes a list (subprocess API pattern).
+    command = command or cmd
+    if isinstance(command, list):
+        command = ' '.join(str(c) for c in command)
+    if not command:
+        return 'error: exec requires a "command" string argument (e.g. exec(command="ls -la"))'
     try:
         result = subprocess.run(
             ['/bin/sh', '-c', command],
