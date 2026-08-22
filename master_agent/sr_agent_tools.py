@@ -13,10 +13,25 @@ def get_uptime() -> str:
     return result.stdout.strip()
 
 
-def read_file(path: str) -> str:
+def read_file(path: str, depth=None) -> str:
     try:
         with open(path) as f:
-            return f.read()
+            content = f.read()
+        # Some models pass depth=N expecting the first N lines (a parameter they
+        # know from other agent environments). Honour it: it saves response
+        # tokens and gives the model what it asked for. Found in the wild
+        # 2026-08-22: glm-5.2:cloud called read_file(path=..., depth=200) and
+        # got an opaque TypeError, wasting a tool-call round-trip.
+        if depth is not None:
+            try:
+                depth = int(depth)
+            except (TypeError, ValueError):
+                depth = None
+            if depth is not None and depth > 0:
+                lines = content.splitlines()
+                if len(lines) > depth:
+                    content = '\n'.join(lines[:depth]) + f'\n... ({len(lines) - depth} more lines)'
+        return content
     except Exception as e:
         return f'error: {e}'
 
@@ -91,7 +106,20 @@ def get_current_time() -> str:
     return datetime.now().isoformat()
 
 
-def exec(command: str) -> str:
+def exec(command: str = '', cmd=None) -> str:
+    # Accept cmd as an alias for command. glm-5.2:cloud repeatedly calls
+    # exec(cmd=...) instead of exec(command=...) -- 5 times in one cycle
+    # (2026-08-22), each wasting a tool-call round-trip even with the seventh
+    # emperor pass's improved TypeError message. The model also sometimes
+    # passes a list (cmd=['bash', '-lc', ...]) expecting a subprocess-style
+    # call; join it into a string so /bin/sh -c can run it.
+    if not command and cmd is not None:
+        if isinstance(cmd, list):
+            command = ' '.join(str(c) for c in cmd)
+        else:
+            command = str(cmd)
+    if not command:
+        return 'error: no command provided'
     try:
         result = subprocess.run(
             ['/bin/sh', '-c', command],

@@ -1,3 +1,4 @@
 {
-  "agent_input_files": "slot-1.txt, slot-2.txt, and slot-3.txt in /opt/agents/swarm/ are agent input files: swarm_monitor.py pipes whichever slot file changes as the opening turn into a fresh emperor-agent.py process (each run is a brand-new interpreter with no memory of prior runs, so this fact only persists via the remember tool / memory.json)."
+  "eighth_pass_commit": "Eighth emperor pass (2026-08-22): commit 419fc6d in master_agent. Added exec(cmd=) alias, read_file(depth=) partial reads, and apply_patch note to prompt. Needs rm /opt/.integrity_baseline.json before next cycle.",
+  "live_strategy_stuck": "seed_1124713bc960 has been the live strategy since 2026-08-21 14:21. Wind_down failed twice (transaction submission timeout on Stellar pubnet). Two better strategies qualified (seed_1_1785762887, clone_f43df64b3ded) but promotion is blocked until wind_down succeeds. Monitor is not running (exited after 10:01 cycle on 2026-08-22)."
 }

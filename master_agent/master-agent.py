@@ -188,6 +188,17 @@ _STARTUP_MTIMES = _watched_mtimes()
 def dispatch(tool_call) -> dict:
     name = tool_call['function']['name']
     args = tool_call['function']['arguments']
+    # Some Ollama versions return arguments as a JSON string rather than a parsed
+    # dict. Parse it so fn(**args) works either way; an unparseable string degrades
+    # to an empty dict, which produces a clear "missing required argument" error
+    # rather than an AttributeError on .items().
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
     print(f'  -> {name}({", ".join(f"{k}={v!r}" for k, v in args.items())})')
     fn = TOOLS.get(name)
     if not fn:
@@ -195,6 +206,25 @@ def dispatch(tool_call) -> dict:
     else:
         try:
             result = fn(**args)
+        except TypeError as e:
+            # The default TypeError for a missing or wrong argument is opaque to the
+            # model ("missing 1 required positional argument: "path""). Give it
+            # the concrete list of what it sent so it can self-correct in one retry
+            # instead of three. Found in the wild 2026-08-20: glm-5.2:cloud called
+            # write_file(content="...") without path three times in one revision
+            # and calculate(path="...") once, wasting tool-call budget each time.
+            msg = str(e)
+            provided = list(args.keys())
+            if 'missing' in msg and 'argument' in msg:
+                result = (f'error: {name}() {msg} -- you provided arguments '
+                         f'{provided}. Every required argument must be passed as a '
+                         f'keyword pair (e.g. {name}(path="...", content="...")).')
+            elif 'unexpected keyword' in msg:
+                result = (f'error: {name}() {msg} -- you provided arguments '
+                         f'{provided}. Check the tool schema for the correct '
+                         f'argument names.')
+            else:
+                result = f'error: {type(e).__name__}: {e}'
         except Exception as e:
             result = f'error: {type(e).__name__}: {e}'
     result = str(result)
@@ -699,6 +729,8 @@ def _build_sdex_revision_system_prompt():
     'really on disk. And check the order you did things in -- a `backtest_strategy` '
     'result from before you wrote the file describes the old code, not your revision, so '
     're-run it rather than quoting it.\n\n'
+    'Note: `apply_patch` is not installed in this environment. Do not use it -- use '
+    '`write_file` to write the complete file contents instead.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
     )

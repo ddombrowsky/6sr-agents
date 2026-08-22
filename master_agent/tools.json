@@ -232,6 +232,10 @@
           "path": {
             "type": "string",
             "description": "Absolute or relative path to the file to read"
+          },
+          "depth": {
+            "type": "integer",
+            "description": "Maximum number of lines to read from the top of the file. If omitted, reads the whole file."
           }
         },
         "required": [
@@ -324,11 +328,13 @@
           "command": {
             "type": "string",
             "description": "The shell command to run, e.g. \"ls -la /opt\""
+          },
+          "cmd": {
+            "type": "string",
+            "description": "Alias for command. Prefer 'command'."
           }
         },
-        "required": [
-          "command"
-        ]
+        "required": []
       }
     }
   },
