@@ -271,6 +271,25 @@
   {
     "type": "function",
     "function": {
+      "name": "apply_patch",
+      "description": "Apply a patch to files on disk using the V4A \"*** Begin Patch\" patch format. Prefer this over write_file when you are changing a few lines of a large file: you send only the changed lines instead of re-emitting the whole file. The `patch` argument is the complete patch text, for example:\n*** Begin Patch\n*** Update File: /opt/strategies/clone_abc123/main.py\n@@\n-from price_feed import get_price\n+from price_feed import get_price\n+from moving_averages import exponential_moving_average as ema\n*** End Patch\nEvery line inside an @@ hunk must start with '-' (a line to remove), '+' (a line to add) or a space (an unchanged line of context). The '-' and context lines must match the file EXACTLY as it is on disk right now, so read_file the target first and copy the lines from it. A hunk that matches nothing, or that matches in more than one place, aborts the ENTIRE patch and writes nothing -- include enough surrounding context to be unambiguous. Also supports '*** Add File: <path>' (body is all '+' lines), '*** Delete File: <path>' and '*** Move to: <path>'. Relative paths resolve against the current working directory; absolute paths are safer. If a patch will not match after a retry, fall back to write_file with the complete new file contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "patch": {
+            "type": "string",
+            "description": "The complete patch text, from '*** Begin Patch' through '*** End Patch'"
+          }
+        },
+        "required": [
+          "patch"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "fetch_url",
       "description": "Fetch the contents of a URL via curl (follows redirects) and return the response body.",
       "parameters": {

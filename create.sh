@@ -379,6 +379,27 @@ docker exec "$name" sh -c '
     /opt/agents/venv/bin/pip install --quiet -r /opt/agents/requirements.txt
 '
 
+# `apply_patch` on PATH, as a bare command.
+#
+# The revision models are trained on codex's apply_patch and reach for it as a SHELL
+# command -- `apply_patch <<'PATCH' ... PATCH` through the exec tool -- far more often
+# than as a tool call: all eight logged attempts in the 2026-08-21 cycles were the shell
+# form, and every one died with `/bin/sh: 1: apply_patch: not found`. Registering it in
+# tools.json alone would therefore have caught none of them. The implementation is
+# /opt/tools/apply_patch.py (deployed by copy.sh with the rest of tools/), and this is
+# the only thing that makes the name resolve.
+#
+# Not a symlink into /opt/tools: that directory is a watched git repo, and a link named
+# `apply_patch` living in it would show up as an untracked file and trip
+# check_boundary_integrity. The link lives in /usr/local/bin and points inward.
+#
+# An EXISTING container predating this gets it with one command:
+#   docker exec $(cat .containername) ln -sf /opt/tools/apply_patch.py /usr/local/bin/apply_patch
+docker exec "$name" sh -c '
+    chmod +x /opt/tools/apply_patch.py
+    ln -sf /opt/tools/apply_patch.py /usr/local/bin/apply_patch
+'
+
 # The venv was created by root. Hand /opt back to the invoking user or the next
 # `./copy.sh --to` half-deploys against root-owned files -- silently, because callers
 # routinely redirect it to /dev/null.
@@ -389,6 +410,13 @@ echo "--- verifying"
 docker exec "$name" /opt/agents/venv/bin/python -c 'import ollama' \
     || { echo "ERROR: the venv cannot import ollama" >&2 ; false ; }
 echo "    venv can import ollama"
+
+# The shim above is the whole reason the models' `apply_patch <<'PATCH'` reflex works, and
+# a broken one is invisible until it costs an emperor window -- the failure looks exactly
+# like the "not found" it was built to fix. Prove the name resolves and the parser runs.
+docker exec "$name" sh -c 'command -v apply_patch >/dev/null && apply_patch --help >/dev/null' \
+    || { echo "ERROR: apply_patch is not callable in the container" >&2 ; false ; }
+echo "    apply_patch resolves on PATH"
 
 container_template=$(docker exec -e "DOMAIN=$DOMAIN_NAME" -w /opt/master_agent "$name" \
     /opt/agents/venv/bin/python -c "

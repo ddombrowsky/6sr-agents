@@ -719,18 +719,33 @@ def _build_sdex_revision_system_prompt():
     # the whole reason it sits here rather than next to the tool descriptions above; the
     # retry loop in revise_strategy is the backstop for when it does not land.
     'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
-    'nothing: pasting the new config.json into your answer does not write it, quoting a '
-    'main.py diff does not apply it, and a `git commit` line inside a code fence does not '
-    'run. monitor.py reads the directory, never your summary, and a revision that left '
-    'the files untouched is discarded and replaced with a mechanical threshold nudge: '
-    'the slot is spent and your analysis is lost. So before you write your final reply, '
-    '`read_file` every path you claim to have changed and confirm the new content is '
-    'really on disk. And check the order you did things in -- a `backtest_strategy` '
-    'result from before you wrote the file describes the old code, not your revision, so '
-    're-run it rather than quoting it.\n\n'
-    'Note: `apply_patch` is not installed in this environment. Do not use it -- use '
-    '`write_file` to write the complete file contents instead.\n\n'
+    '`write_file`, `apply_patch` and `exec` tool calls you actually make. Text in your '
+    'reply reaches nothing: pasting the new config.json into your answer does not write '
+    'it, quoting a main.py diff does not apply it, and a `git commit` line inside a code '
+    'fence does not run. monitor.py reads the directory, never your summary, and a '
+    'revision that left the files untouched is discarded and replaced with a mechanical '
+    'threshold nudge: the slot is spent and your analysis is lost. So before you write '
+    'your final reply, `read_file` every path you claim to have changed and confirm the '
+    'new content is really on disk. And check the order you did things in -- a '
+    '`backtest_strategy` result from before you wrote the file describes the old code, '
+    'not your revision, so re-run it rather than quoting it.\n\n'
+    # Was the opposite instruction until apply_patch was actually implemented: the
+    # eighth emperor pass added a line here telling the model NOT to use it, after it
+    # tried `apply_patch <<'PATCH'` through exec eight times across the 2026-08-21
+    # cycles and got `/bin/sh: 1: apply_patch: not found` every time. The tool now
+    # exists (/opt/tools/apply_patch.py, registered as a tool AND on PATH), so this
+    # points the reflex at the working thing instead of suppressing it.
+    'To change a few lines of a large file, `apply_patch` is usually better than '
+    '`write_file`: it takes a V4A patch (`*** Begin Patch` / `*** Update File: <path>` '
+    '/ `@@` / `-` and `+` lines / `*** End Patch`) and edits in place, so you send only '
+    'the lines that change instead of re-emitting a 300-line main.py to add one '
+    'import. It is installed as a shell command as well as a tool, so '
+    "`apply_patch <<'PATCH' ... PATCH` through `exec` works too. Its `-` and context "
+    'lines must match the file exactly as it is on disk right now, and a hunk that '
+    'matches nothing -- or matches in two places -- aborts the whole patch and writes '
+    'NOTHING, so `read_file` the target first and copy the lines from it. If a patch '
+    'will not match after one retry, fall back to `write_file` with the complete '
+    'file.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
     )
@@ -756,7 +771,8 @@ def _build_sdex_revision_system_prompt():
 
 _GENERIC_TOOL_NAMES = frozenset((
     'calculate', 'get_current_time', 'get_uptime',
-    'read_file', 'write_file', 'fetch_url', 'install_package', 'update_package_list',
+    'read_file', 'write_file', 'apply_patch', 'fetch_url', 'install_package',
+    'update_package_list',
     'exec',
 ))
 
@@ -885,14 +901,14 @@ def _build_forecast_revision_system_prompt():
     # Same incident, same fix, same domain-agnostic reason it sits last -- see the sdex
     # prompt above for the measured counts this addresses.
     'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
-    'nothing: pasting the new config.json into your answer does not write it, quoting a '
-    'main.py diff does not apply it, and a `git commit` line inside a code fence does '
-    'not run. monitor.py reads the directory, never your summary, and a revision that '
-    'left the files untouched is discarded and replaced with a mechanical threshold '
-    'nudge. So before your final reply, `read_file` every path you claim to have '
-    'changed and confirm it, and re-run `backtest_forecast_strategy` if you wrote after '
-    'your last check -- a result from before you wrote the file describes the old '
+    '`write_file`, `apply_patch` and `exec` tool calls you actually make. Text in your '
+    'reply reaches nothing: pasting the new config.json into your answer does not write '
+    'it, quoting a main.py diff does not apply it, and a `git commit` line inside a code '
+    'fence does not run. monitor.py reads the directory, never your summary, and a '
+    'revision that left the files untouched is discarded and replaced with a mechanical '
+    'threshold nudge. So before your final reply, `read_file` every path you claim to '
+    'have changed and confirm it, and re-run `backtest_forecast_strategy` if you wrote '
+    'after your last check -- a result from before you wrote the file describes the old '
     'code.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
@@ -1110,12 +1126,12 @@ def _build_null_revision_system_prompt():
     "(`git checkout -b auto/<timestamp>` then `git add -A && git commit -m ...`).\n\n"
     # Same incident and same reason it sits last as in the four prompts above.
     'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Pasting a config.json into '
-    'your answer does not write it, quoting a main.py diff does not apply it, and a '
-    '`git commit` line inside a code fence does not run. monitor.py reads the directory, '
-    'never your summary, and a revision that left the files untouched is discarded and '
-    'replaced with a mechanical config nudge. Before your final reply, `read_file` every '
-    'path you claim to have changed and confirm it.\n\n'
+    '`write_file`, `apply_patch` and `exec` tool calls you actually make. Pasting a '
+    'config.json into your answer does not write it, quoting a main.py diff does not '
+    'apply it, and a `git commit` line inside a code fence does not run. monitor.py '
+    'reads the directory, never your summary, and a revision that left the files '
+    'untouched is discarded and replaced with a mechanical config nudge. Before your '
+    'final reply, `read_file` every path you claim to have changed and confirm it.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
     )
