@@ -17,7 +17,7 @@ differences between strategies are small relative to the number being compared -
 which waiting longer does not fix. Subtracting a contemporaneous null removes the common
 component and leaves the part the strategy is responsible for.
 
-THREE RULES THAT DECIDE RANKINGS, AND WHY THEY ARE HERE AND NOT IN A STRATEGY:
+FOUR RULES THAT DECIDE RANKINGS, AND WHY THEY ARE HERE AND NOT IN A STRATEGY:
 
   1. **Not running means flat.** A supplied position keeps paying whether or not the
      process that chose it is alive, so a strategy stopped by the cull would go on
@@ -46,6 +46,22 @@ THREE RULES THAT DECIDE RANKINGS, AND WHY THEY ARE HERE AND NOT IN A STRATEGY:
      emissions also made you earn more, the optimum would be "believe hardest", which
      measures nothing.
 
+  4. **Capital dilutes the rate it came for.** A lending APY is the borrowers' interest
+     divided over everything supplied, so it is not a constant a strategy may simply
+     take: entering a reserve with D against a supplied S pays the quoted rate on
+     S/(S+D). For a pool deep enough to hold this book the factor is ~1 and nothing
+     changes. For the dust pools that dominate the top of the rate table -- Solv/USDC
+     quotes 12.55% over $12 supplied -- it is the difference between a real edge and an
+     arithmetic mirage.
+
+     This rule closes a hole rather than adding a refinement. The capacity filter used
+     to live only in `_eligible`, which is consulted by the NULLS, so the benchmark was
+     barred from the dust pools while the strategies it judged were not. Excess is a
+     difference of two paths; filtering one of them is not conservatism, it is a free
+     185bp to any strategy that lowered `min_free_liquidity_usd`, and on 2026-08-22 the
+     first revision the emperor ever ran found exactly that and reported it as skill.
+     Capacity is now priced on every path, strategy and benchmark alike.
+
 WHAT THIS IS NOT. It is not a backtest: it replays decisions that were actually made
 against rates that were actually recorded. Simulating a *candidate* config over the same
 history is the next use of this engine and is what will finally give domain_yield.replay()
@@ -72,20 +88,76 @@ CROSS_ASSET_BP = 25.0
 # What a BLND emission is worth after it is sold. See rule 3.
 EMISSION_REALIZATION = 1.0 - 0.0175
 
-# The null holds one venue for the whole window, so it must be one that could actually
-# absorb capital. Without this the benchmark picks whatever dust pool tops the list --
-# on 2026-08-21 that was Solv/USDC at 12.55% with $0 of free liquidity and $11 supplied,
-# a rate no allocation could have earned.
-NULL_MIN_LIQUIDITY_USD = 1000.0
+# The book every path here is priced for. YIELD.md's "Capacity, honestly" section puts
+# the real balance at roughly $60, and the figure has to be explicit because rule 4 makes
+# the rate a function of it: what a venue pays depends on how much arrives. Raising this
+# makes the shallow venues worse and changes no deep one.
+BOOK_USD = 60.0
+
+# A venue has to be able to give the book back. Free liquidity is what a withdrawal is
+# paid out of -- YIELD.md's illiquidity section reduces the whole stuck-capital concern to
+# "boundable by sizing against free liquidity" -- so the floor is the book itself rather
+# than a round number picked near it. The $1000 this replaces was arbitrary, and being
+# arbitrary is how it came to be enforced against the benchmark and not against the
+# strategies the benchmark judges (rule 4).
+MIN_FREE_LIQUIDITY_USD = BOOK_USD
 
 CASH = ('cash', 'cash')
 CASH_ASSET = 'cash'
 
 
 def realized_apy(row):
-    """What a venue actually pays a holder: base rate plus emissions after exit cost."""
+    """What a venue actually pays a holder: base rate plus emissions after exit cost.
+
+    The QUOTED rate, before rule 4. Nothing that scores a path should call this directly;
+    call diluted_apy, which prices the same venue for the capital actually arriving.
+    """
     return (row.get('supply_apy') or 0.0) + EMISSION_REALIZATION * (
         row.get('emission_apr_gross') or 0.0)
+
+
+def implied_supply_usd(row):
+    """Dollars supplied to this reserve, derived from what the recorder actually logs.
+
+    There is no total-supply field in the history -- there is free liquidity and there is
+    utilization, and utilization IS borrowed/supplied, so free = supplied * (1 - u)
+    inverts to this. Deriving it beats adding a field the recorder would have to backfill
+    across every sample already on disk.
+
+    At u = 1 the pool is fully lent and the inversion diverges, so it is clamped. That
+    direction is deliberate: a clamped supply is LARGE, dilution goes to zero, and the
+    strategy is credited the full quoted rate. Erring generous is right for a number this
+    module derives rather than observes -- the costs, which it also does not observe, err
+    the other way for the same reason.
+    """
+    free = row.get('free_liquidity_usd')
+    if not isinstance(free, (int, float)) or free < 0.0:
+        return None
+    util = row.get('utilization') or 0.0
+    return float(free) / max(1.0 - min(float(util), 0.999), 0.001)
+
+
+def diluted_apy(row, dollars):
+    """Rule 4: what `dollars` entering this venue earns once its own arrival is priced in.
+
+    Both components dilute. supply_apy is interest over supplied and emission_apr_gross is
+    emissions over supplied, so the same S/(S+D) applies to the pair -- which is why this
+    scales realized_apy rather than reaching past it into the row.
+
+    Returns 0.0 when capacity cannot be established at all. That is the fail-closed
+    direction the module docstring's split demands: free liquidity comes from the
+    recorder, not from the strategy, and a venue whose depth cannot be read is not a
+    venue whose rate can be claimed.
+    """
+    rate = realized_apy(row)
+    if rate <= 0.0:
+        return rate
+    if dollars <= 0.0:
+        return rate
+    supply = implied_supply_usd(row)
+    if supply is None:
+        return 0.0
+    return rate * supply / (supply + dollars)
 
 
 # ------------------------------------------------------------------ strategy evidence
@@ -287,7 +359,15 @@ def run(history, changes, since, until, name=None):
             row = venues.get(key)
             if row is None:
                 continue        # venue gone or frozen this sample: that leg earns nothing
-            rate += weight * realized_apy(row)
+            dollars = weight * BOOK_USD
+            free = row.get('free_liquidity_usd')
+            if not isinstance(free, (int, float)) or free < dollars:
+                # Cannot pay this leg's share of the book back out. Same treatment as a
+                # venue that vanished: an allocation that could not have been exited at
+                # this size is not one the strategy gets credited for having made. Per
+                # LEG, not per book -- a 20% leg only has to return 20%.
+                continue
+            rate += weight * diluted_apy(row, dollars)
             weight_used += weight
         if weight_used <= 0:
             flat_s += span
@@ -309,7 +389,7 @@ def run(history, changes, since, until, name=None):
 
 # ------------------------------------------------------------------------- the nulls
 
-def _eligible(venues, floor=NULL_MIN_LIQUIDITY_USD):
+def _eligible(venues, floor=MIN_FREE_LIQUIDITY_USD):
     out = []
     for key, row in venues.items():
         if row.get('utilization', 0.0) >= row.get('max_utilization', 1.0):
@@ -335,7 +415,7 @@ def null_static_best(history, since, until):
         eligible = _eligible(venues)
         if not eligible:
             continue
-        key, _row = max(eligible, key=lambda item: realized_apy(item[1]))
+        key, _row = max(eligible, key=lambda item: diluted_apy(item[1], BOOK_USD))
         return run(history, [(ts, {key: 1.0})], since, until)
     return None
 
@@ -443,7 +523,7 @@ def optimal_rotation(history, since, until):
         gain = {}
         for v in states:
             row = venues.get(v)
-            rate = realized_apy(row) if row is not None else 0.0
+            rate = diluted_apy(row, BOOK_USD) if row is not None else 0.0
             gain[v] = math.log1p(rate * span / SECONDS_PER_YEAR)
         nxt, choice = {}, {}
         for w in states:

@@ -315,6 +315,26 @@ def _ppid(pid):
         return None
 
 
+def _pid_age_s(pid):
+    """Seconds this process has been alive, or None.
+
+    For the lock message: a holder alive for minutes is mid-cycle, while one
+    alive for hours is almost certainly in its long CYCLE_SLEEP. That
+    distinction is exactly what the next emperor pass or an operator needs to
+    decide whether to wait or to reclaim a stuck lock.
+    """
+    try:
+        ticks = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+        stat = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        # field 22 (starttime) is index 19 in the tail after the rsplit strips
+        # pid + comm, matching _ppid's use of index 1 for ppid (field 4).
+        starttime_ticks = int(stat[19])
+        uptime_s = float(Path('/proc/uptime').read_text().split()[0])
+        return max(0.0, uptime_s - starttime_ticks / ticks)
+    except Exception:
+        return None
+
+
 def _reap_orphaned_revisions():
     """Kill any revise-strategy / retry-after-smoke-failure subprocess whose parent
     monitor.py has already died (reparented to init, ppid 1).
@@ -363,9 +383,11 @@ def _acquire_lock():
         except (OSError, ValueError):
             old_pid = None
         if old_pid and _pid_is_alive(old_pid) and 'monitor.py' in _cmdline(old_pid):
-            print(f'{LOCK_FILE} held by live pid {old_pid}; refusing to start a second '
-                  f'monitor.py cycle against the same state. If that process is really '
-                  f'gone, remove {LOCK_FILE} by hand.')
+            age = _pid_age_s(old_pid)
+            age_str = f' for {age / 3600:.1f}h' if age is not None else ''
+            print(f'{LOCK_FILE} held by live pid {old_pid} (running{age_str}); '
+                  f'refusing to start a second monitor.py cycle against the same '
+                  f'state. If that process is really gone, remove {LOCK_FILE} by hand.')
             raise SystemExit(1)
         print(f'{LOCK_FILE} is stale (pid {old_pid} is not a live monitor.py); reclaiming it.')
     LOCK_FILE.write_text(str(os.getpid()))

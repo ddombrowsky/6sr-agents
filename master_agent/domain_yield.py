@@ -1007,7 +1007,13 @@ def _replay_facts():
         'rotation_cost_same_asset_bp': replay.SAME_ASSET_BP,
         'rotation_cost_cross_asset_bp': replay.CROSS_ASSET_BP,
         'emission_realization': replay.EMISSION_REALIZATION,
-        'null_min_liquidity_usd': replay.NULL_MIN_LIQUIDITY_USD,
+        # Renamed from null_min_liquidity_usd when the floor stopped being the null's
+        # private business: it is enforced on every path now (yield_replay rule 4), and
+        # a name saying otherwise is exactly the drift group 7 of the contract exists to
+        # prevent. book_usd is published with it because under rule 4 the rate a venue
+        # pays depends on how much arrives, so the floor alone no longer explains itself.
+        'min_free_liquidity_usd': replay.MIN_FREE_LIQUIDITY_USD,
+        'book_usd': replay.BOOK_USD,
     }
 
 

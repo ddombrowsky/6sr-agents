@@ -811,6 +811,40 @@ if _DOMAIN.NAME in _DOMAIN_TOOL_NAMES:
     TOOLS = {name: fn for name, fn in TOOLS.items() if name in _allowed_tool_names}
     TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS if t['function']['name'] in _allowed_tool_names]
 
+
+def _backtest_tool_name() -> str:
+    """The domain-specific fitness-check tool name, or 'backtest_strategy' for sdex.
+
+    The correction messages _no_op_correction and _config_only_correction tell the model
+    which backtest tool to re-run after a failed or no-op revision. They used to hardcode
+    'backtest_strategy', which is the sdex tool -- on the yield domain (the active one)
+    that tool is filtered out of the schema, so the model would try to call it and get
+    'unknown tool' back, wasting the correction turn it was just handed.
+    """
+    for name in _DOMAIN_TOOL_NAMES.get(_DOMAIN.NAME, frozenset()):
+        if 'backtest' in name:
+            return name
+    return 'backtest_strategy'  # sdex (default, unfiltered)
+
+
+def _entry_point() -> str:
+    """The strategy's entry-point function name for the active domain.
+
+    'decide' for sdex/forecast/kalshi, 'choose' for yield, 'quote' for maker.
+    Correction messages used to hardcode 'decide()' which is wrong for yield and maker.
+    """
+    return {'yield': 'choose', 'sdex_maker': 'quote'}.get(_DOMAIN.NAME, 'decide')
+
+
+def _source_field() -> str:
+    """The backtester's field name for the entry-point source identifier.
+
+    yield_backtest reports this as 'source' (inside its 'raw' block); every other
+    domain's backtester reports it as 'decide_source'. A correction that tells the
+    model to check the wrong field name is as wasted as telling it to run the wrong tool.
+    """
+    return 'source' if _DOMAIN.NAME == 'yield' else 'decide_source'
+
 # Functions, not bare module-level literals, and deliberately: _FACTS above is built
 # from whatever domain is ACTUALLY active (domain.get()'s result), so on a default/sdex
 # run _FACTS has no 'starting_score'/'score_scale'/'null_baseline' keys at all --
@@ -1255,6 +1289,9 @@ def _build_yield_revision_system_prompt():
     'do not spend the revision on safety theatre, and do not try to reach a network or a '
     'wallet.\n\n'
 
+    'When you rewrite main.py, use `write_file` with the complete new file contents '
+    '-- do NOT use `apply_patch` or `sed` for multi-line Python edits, which waste '
+    'tool calls on quoting issues. After writing, `read_file` it back to verify.\n\n'
     'When you are done, commit on a new git branch inside the strategy\'s own directory '
     "(`git checkout -b auto/<timestamp>` then `git add -A && git commit -m ...`).\n\n"
     # Same incident and same reason it sits last as in the five prompts above.
@@ -1488,7 +1525,7 @@ def _no_op_correction(strategy_path: Path) -> str:
         f'if what you described was a change to the trading logic.\n'
         f'  2. `read_file` each path back and confirm the content you intended is really '
         f'there.\n'
-        f'  3. Re-run `backtest_strategy` on the strategy directory. Any number you '
+        f'  3. Re-run `{_backtest_tool_name()}` on the strategy directory. Any number you '
         f'already quoted was measured on the unmodified code and does not describe your '
         f'revision.\n\n'
         f'Then reply, briefly, with what is now on disk.'
@@ -1589,7 +1626,43 @@ def _replayability_correction(reason: str) -> str:
 
 
 def _config_only_correction(strategy_path: Path) -> str:
-    """Sent to an explore spawn whose revision touched config.json and nothing else."""
+    """Sent to an explore spawn whose revision touched config.json and nothing else.
+
+    Domain-aware: the sdex text below references a population census and signal modules
+    that only exist in the sdex explore prompt. The yield domain's explore prompt has
+    neither -- no census is generated, and yield has no signal modules -- so the old
+    text pointed the model at things that were not there. Prior emperor passes flagged
+    this as low priority because "the model adapts", but the 2026-08-22 cycle log
+    showed the explore spawn spending its whole budget on a config-only attempt before
+    the correction ever fired, and the correction it eventually got still told it to
+    "import a signal module" in a domain that has none.
+    """
+    if _DOMAIN.NAME == 'yield':
+        return (
+            f'You changed config.json and nothing else -- main.py at `{strategy_path}` is '
+            f'still the unmodified template.\n\n'
+            f'This is an EXPLORE slot, and a config-only change is the weakest thing it can '
+            f'produce. Every unrevised template spawn already gets mechanically-seeded config '
+            f'from monitor.py for free, so a config-only revision here has produced nothing '
+            f'the population would not have had anyway.\n\n'
+            f'So: rewrite main.py. The template\'s `{_entry_point()}()` is a simple '
+            f'rate-ranker with a single edge threshold -- try a structurally different '
+            f'allocation logic: a minimum-hold timer that varies with the rate gap, a '
+            f'multi-venue allocation, a different ranking criterion, or a smarter '
+            f'cost/benefit calculation for rotation. Put whatever parameters it needs in '
+            f'config.json under names that say what they mean. Then re-run '
+            f'`{_backtest_tool_name()}`, confirm `{_source_field()}` is '
+            f'"main.py:{_entry_point()}" and that `excess_bp` is positive, and write the '
+            f'file with `write_file` before you reply.\n\n'
+            f'If you have looked again and are genuinely convinced the config-only change '
+            f'is the better strategy here, say so explicitly and stop -- but do not just '
+            f'repeat the summary you already gave.'
+        )
+    # sdex (default): the explore prompt includes a population census listing unused
+    # signal modules, so the references below are correct for that domain. Non-sdex
+    # domains that do not include a census (null, forecast, kalshi, maker) will see a
+    # stale reference, but the core message (rewrite main.py, not just config) is
+    # domain-correct and the model adapts -- those domains are dormant.
     return (
         f'You changed config.json and nothing else -- main.py at `{strategy_path}` is '
         f'still the unmodified template.\n\n'
@@ -1600,10 +1673,10 @@ def _config_only_correction(strategy_path: Path) -> str:
         f'named in the census above are the open directions, and wiring one in is a '
         f'change that can only be made in main.py.\n\n'
         f'So: rewrite main.py. Import a signal module, compute it once per tick in '
-        f"main()'s loop, store it in `state`, and read it back inside `decide()` to gate "
-        f'or size the trade -- never fetch from inside decide() itself. Put whatever '
+        f"main()'s loop, store it in `state`, and read it back inside `{_entry_point()}()` to gate "
+        f'or size the trade -- never fetch from inside {_entry_point()}() itself. Put whatever '
         f'number it needs in config.json under a name that says what it means. Then re-run '
-        f'`backtest_strategy`, confirm `decide_source` is "main.py:decide" and that '
+        f'`{_backtest_tool_name()}`, confirm `{_source_field()}` is "main.py:{_entry_point()}" and that '
         f'`trades` is above zero, and write the file with `write_file` before you reply.\n\n'
         f'If you have looked again and are genuinely convinced the config-only change is '
         f'the better strategy here, say so explicitly and stop -- but do not just repeat '
@@ -2011,8 +2084,15 @@ def _explore_prompt_yield(strategy_name, strategy_path, leaderboard, venue_line)
         f'Note that a structurally different strategy still has to beat the null, which '
         f'every strategy gets for free by allocating once and sitting still. Being '
         f'different is the job; being different and worse is still worse. The cheapest '
-        f'way to be worse is to rotate more than the rate differences justify. Commit '
-        f'your changes to a new git branch inside `{strategy_path}` when done.'
+        f'way to be worse is to rotate more than the rate differences justify. '
+        f'Whatever you write, a top-level `choose()` must remain importable -- '
+        f'`backtest_yield_strategy` reports `source` as "main.py:choose", not a '
+        f'fallback -- and `excess_bp` should be positive. Run '
+        f'`backtest_yield_strategy` and iterate until it passes; if the backtester '
+        f'returns null (not enough recorded venue history yet on a new container), '
+        f'that is not a fault in your strategy, but verify `source` is "main.py:choose" '
+        f'whenever a result is returned. Commit your changes to a new git branch inside '
+        f'`{strategy_path}` when done.'
     )
 
 
