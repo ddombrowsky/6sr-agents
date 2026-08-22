@@ -375,9 +375,18 @@ def best_static_ex_post(history, since, until):
     cannot be the bound.
     """
     samples = _sample_index(history)
+    # Only venues that could actually have been ENTERED at the start of the window. The
+    # same filter the null and the optimum apply, and leaving it off here is not a
+    # rounding difference: on 2026-08-22 it let the benchmark "hold" Solv/USDC at 12.55%
+    # with $0 of free liquidity and $11 supplied, which reported measurement 2 as -596bp
+    # -- rotation looking catastrophically worse than a static allocation nothing could
+    # have made. Three policies compared on three different universes is not a comparison.
     keys = set()
-    for _ts, venues, _live in samples:
-        keys.update(venues)
+    for ts, venues, _live in samples:
+        eligible = _eligible(venues)
+        if eligible:
+            keys = {key for key, _row in eligible}
+            break
     best = None
     for key in keys:
         result = run(history, [(since, {key: 1.0})], since, until)

@@ -15,12 +15,12 @@ produces as evidence:
      state.json is ignored. What is ranked is EXCESS over a contemporaneous null, not
      yield, because every strategy here collects roughly the base rate and ranking on the
      total sorts the population mostly by beta.
-  2. **There is still no replay.** `replay()` returns None -- the contract's "could not
-     be measured", which every caller in the loop fails open on. Scoring replays
-     decisions that were actually made; a revision gate needs to simulate a candidate
-     config over history it never ran in, which is the same engine pointed at a different
-     input and is not built. Until it is, revision gating here proves that code parses and
-     runs, and nothing more.
+  2. ~~There is no replay.~~ **Fixed, with a caveat.** `replay()` runs the candidate's
+     own `choose()` over the recorded history via tools/yield_backtest.py. The caveat is
+     that the history only goes back as far as the recorder has been running -- there is
+     no archive behind it, so on a fresh container the gate is silent for the first six
+     hours and short-windowed for the first few days. YIELD.md step 2's backfill is still
+     the thing that would make it deep.
   3. **Blend only.** Aquarius is in YIELD.md and not in this module. Its pools cannot be
      entered single-sided, so an allocation there is an LP position carrying impermanent
      loss plus two book crossings, and nothing in this system prices either yet
@@ -109,7 +109,15 @@ SCORE_WINDOW_S = RANK_GRACE_S
 # an hour of luck multiplies it by 8,760, and a newborn that happened to catch one good
 # interval would out-rank everything that has actually been running -- which is the
 # failure YOUNG_GRACE_S exists to prevent, arriving through the score instead of the cull.
-MIN_SCORING_S = 6 * 3600
+#
+# DERIVED from the window rather than fixed, and the 2026-08-22 shakedown is why. At the
+# production window this is 6h, exactly what it was as a literal. But that run set
+# YIELD_RANK_GRACE_S=1800 to make the loop turn over quickly, which shortened the window
+# to 30 minutes while this stayed at 6h -- so nothing could be scored, every strategy sat
+# at exactly STARTING_SCORE, and twenty of them were ranked and culled purely on
+# monitor.py's trade-count tiebreak. That is the churn-rewarding failure this domain is
+# built to avoid, reached by shortening one constant and not the other.
+MIN_SCORING_S = SCORE_WINDOW_S // 12
 
 # One bad sample -- a venue misreported at 400% for one interval -- must not be able to
 # produce an unrankable number. +/-200%/yr is far outside anything real here and still
@@ -129,9 +137,11 @@ SMOKE_ENV = {'PAPER_ONLY': '1'}
 OBSERVE_FAILURE_NOTE = ('Could not read Blend pool rates (no fresh snapshot and the '
                         'chain read failed)')
 
-# There is no replay, so these describe what a replay WOULD cover once step 2 exists.
+# What the replay covers: however much rate history the recorder has, up to this. It is
+# not a fixed archive like the other domains have -- the window grows as the container
+# runs, and below yield_backtest.MIN_HISTORY_S there is no replay at all.
 REPLAY_DAYS = 7
-REPLAY_WINDOW = 'the recorded rate history (does not exist yet -- YIELD.md step 2)'
+REPLAY_WINDOW = 'the recorded rate history'
 
 # A snapshot older than this is not shown to the population. See yield_venues.read_snapshot:
 # stale reads as absent, because an hour-old APY presented as current is the quiet failure.
@@ -438,21 +448,51 @@ def config_signature(state_entry):
             cfg.get('emission_weight'), cfg.get('min_free_liquidity_usd'))
 
 
-def replay(strategy_dir):
-    """None -- "could not be measured", which every caller fails open on.
+def _backtest():
+    try:
+        import yield_backtest
+        return yield_backtest
+    except Exception:
+        return None
 
-    This is not a stub that someone forgot to fill in; there is nothing to replay against.
-    A rotation backtest needs a rate history per venue, public RPC retains about a week of
-    events and no state history at all, and reconstructing months of it out of an archive
-    is YIELD.md step 2. Returning a fabricated pass here would be worse than returning
-    nothing: the gates would report that a revision beat a null it was never tested on.
+
+def replay(strategy_dir):
+    """Run the candidate's own choose() over the recorded history. None if unmeasurable.
+
+    None -- not False -- on every failure, including "the recorder has not collected
+    enough history yet", which on a fresh container is the normal state for the first
+    several hours. This guards a fitness signal rather than money, and failing closed on
+    a tooling outage would revert every revision in the population at once.
+
+    `trades` counts allocation decisions INCLUDING THE FIRST, not rotations. monitor.py
+    discards a revision that replays zero trades, and in this domain never rotating is
+    frequently the right answer -- counting rotations would revert the null for being
+    the null. See tools/yield_backtest.py.
     """
-    return None
+    bt = _backtest()
+    if bt is None:
+        return None
+    try:
+        return bt.replay(str(strategy_dir))
+    except Exception as e:
+        print(f'  yield replay unavailable ({e}); not gating on it')
+        return None
 
 
 def importability(source_or_path):
-    """No replay engine imports the genome, so there is nothing to check."""
-    return None
+    """(ok, reason) for whether choose() survives being imported out of main.py.
+
+    Now that the backtester imports the genome, the template's "module top level holds
+    only definitions" rule has a checker behind it instead of only a docstring.
+    """
+    bt = _backtest()
+    if bt is None:
+        return None
+    try:
+        return bt.importability_report(source_or_path)
+    except Exception as e:
+        print(f'importability check unavailable ({e}); not gating on it')
+        return None
 
 
 # ------------------------------------------------------------------- money boundary
@@ -695,6 +735,19 @@ def prepare_smoke_config(cfg, obs):
 
 
 def check_smoke_state(raw, cfg, obs):
+    """Did the candidate allocate, and did it log that in the shape the scorer reads?
+
+    The second half matters more than it looks. Scoring replays the activity log, not
+    state.json, so a revision that renames `pool_address` or drops `weight` produces a log
+    the scorer resolves to nothing -- and a strategy that resolves to nothing is scored as
+    though it sat in cash for its entire life, which is a worse result than any allocation
+    it could have made and one it has no way to see. The revision prompt says so in
+    capitals; this is what makes saying so unnecessary. Breaking the log contract now
+    reverts the revision instead of silently killing it.
+
+    Fails OPEN if yield_replay cannot be imported: this guards a fitness signal, not
+    money, and a tooling outage must not revert every revision in the population at once.
+    """
     try:
         nav = float(raw.get('nav'))
     except (TypeError, ValueError):
@@ -702,10 +755,36 @@ def check_smoke_state(raw, cfg, obs):
     legs = raw.get('allocation')
     if not isinstance(legs, list):
         return False, 'main.py wrote no allocation list'
-    if not legs:
-        return False, 'main.py allocated to nothing'
-    where = ', '.join(f"{leg.get('pool')}/{leg.get('asset')}" for leg in legs[:3])
-    return True, f'nav {nav:.6f} across {len(legs)} venue(s): {where}'
+    # NOT `if not legs: fail`. The harness ends the run with SIGTERM, and a strategy
+    # handles SIGTERM by flattening -- recording that it is out of the market and clearing
+    # its own allocation before it exits. So an empty allocation here is what a CORRECTLY
+    # shutting-down strategy leaves behind, and requiring a non-empty one failed the
+    # unmodified template against its own smoke test. Both of the first two LLM revisions
+    # on 2026-08-21 were discarded by that check, one of them for perfectly good code.
+    #
+    # The log below is the right place to ask the question anyway: it is what the scorer
+    # reads, it survives the shutdown, and it records what the strategy did rather than
+    # what it happened to be holding at the instant it was killed.
+    detail = f'nav {nav:.6f}'
+
+    replay = _replay()
+    scratch = (cfg or {}).get('name')
+    if replay is None or not scratch:
+        return True, detail + ' (log contract unchecked)'
+
+    events = replay.load_events(activity_log_path(scratch))
+    if not events:
+        return False, ('main.py ran but logged nothing to '
+                       f'{activity_log_path(scratch)} -- the scorer reads that log, not '
+                       'state.json, so this strategy would score as if it held cash')
+    changes = [alloc for _ts, alloc in replay.intent_changes(events) if alloc]
+    if not changes:
+        return False, ('main.py logged events the scorer cannot resolve to a venue: an '
+                       'allocate/rotate entry needs an `allocation` list whose legs each '
+                       'carry pool_address, asset_address and weight')
+    venues = {key for _ts, alloc in replay.intent_changes(events) for key in alloc}
+    return True, (detail + f', {len(changes)} resolvable allocation event(s) '
+                  f'across {len(venues)} venue(s)')
 
 
 def cleanup_scratch(scratch_name):
@@ -940,19 +1019,24 @@ def prompt_facts():
     """
     facts = {
         'starting_score': STARTING_SCORE,
-        'score_formula': ('STARTING_SCORE + annualized EXCESS over the null in basis '
-                          'points, recomputed from your logged allocations priced '
-                          'against the recorded rate history. Matching the null scores '
-                          '1000; beating it by 1%/yr scores 1100'),
+        # Built from STARTING_SCORE rather than quoting it, for the reason this whole
+        # group exists: the sdex prompt stated a haircut of 0.999 for weeks while
+        # score.py enforced 0.899.
+        'score_formula': (f'{STARTING_SCORE:.0f} plus the annualized EXCESS over the '
+                          f'null in basis points, recomputed from your logged '
+                          f'allocations priced against the recorded rate history. '
+                          f'Matching the null scores exactly {STARTING_SCORE:.0f}; '
+                          f'beating it by 1%/yr scores {STARTING_SCORE + 100:.0f}'),
         'score_is_self_reported': ('no. Nothing in state.json is read for scoring -- not '
                                    'apy_bp, not nav. Only the allocations you log, the '
                                    'rates the recorder saw, and whether your process was '
                                    'observed running'),
         'scoring_window_hours': SCORE_WINDOW_S / 3600,
+        # No basis-point figure here on purpose: what downtime costs depends on the
+        # null's rate, which is live data. The prompt derives the number from the window.
         'flat_when_stopped': ('a strategy the recorder does not see running earns '
                               'nothing for that time while the null keeps earning, so '
-                              'downtime lowers the score rather than freezing it. About '
-                              '73bp of annualized excess per 8h down, at a 6.6% null'),
+                              'downtime lowers the score rather than freezing it'),
         'cost_amplification': ('a one-off cost annualized over the scoring window is '
                                'multiplied by ~%.0f, so 1bp paid to rotate reads as '
                                '~%.0fbp of score. Rotating across ASSETS has to earn a '
@@ -968,9 +1052,10 @@ def prompt_facts():
                                       'book crossings that nothing here prices yet'),
         'emissions_are_gross': ('BLND emission APRs are quoted before the cost of selling '
                                 'BLND into its own book, which is why emission_weight is '
-                                'a knob and not a constant'),
+                                'a knob and not a constant.'),
         'live_trading': 'off, permanently, in this domain',
-        'replay': 'none -- no rate history exists, so revisions are not backtested',
+        'replay': ('your choose() is replayed over however much venue history the '
+                   'recorder has collected, which grows as the container runs'),
         'rank_grace_s': RANK_GRACE_S,
         'knobs': sorted(DEFAULTS),
     }

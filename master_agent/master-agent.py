@@ -794,6 +794,10 @@ _DOMAIN_TOOL_NAMES = {
     # no price, no assets and a replay() that never runs the genome. It has no fitness
     # tool of its own to add, so generic-only is the right answer and this says so.
     'null': frozenset(),
+    # Its own backtest and nothing else: this domain has no price to fetch, no asset to
+    # verify and no order book to read, and backtest_strategy replays a decide() it does
+    # not have.
+    'yield': frozenset({'backtest_yield_strategy'}),
     'forecast': frozenset({'backtest_forecast_strategy'}),
     'kalshi': frozenset({'backtest_kalshi_strategy'}),
     'sdex_maker': frozenset({
@@ -1137,6 +1141,135 @@ def _build_null_revision_system_prompt():
     )
 
 
+# Reads domain_yield.prompt_facts() keys that exist on no other domain, so like the four
+# builders above it must not be evaluated unless yield is the domain actually selected.
+#
+# Longer than null's and much shorter than sdex's. The game has one decision -- where to
+# put the money -- but the arithmetic that decides whether moving it is worth anything is
+# genuinely counter-intuitive, and a model that has not been told the amplification below
+# will rotate the strategy into the ground while believing it is chasing an edge.
+def _build_yield_revision_system_prompt():
+    # Derived here rather than stated, so the two can never disagree: what a one-off cost
+    # is worth once it is annualized over the scoring window, and therefore how much rate
+    # improvement a move has to buy to pay for itself if it is held for that whole window.
+    amplification = 8760.0 / float(_FACTS['scoring_window_hours'])
+    same_bp = float(_FACTS['rotation_cost_same_asset_bp'])
+    cross_bp = float(_FACTS['rotation_cost_cross_asset_bp'])
+    same_breakeven = same_bp / 10000.0 * amplification * 100.0
+    cross_breakeven = cross_bp / 10000.0 * amplification * 100.0
+    return (
+    'You are the strategy-revision agent for an evolutionary system running the YIELD '
+    'domain: allocating paper capital across Blend lending pools on Stellar. There is no '
+    'trading here and no order book -- a strategy decides which lending reserve to supply '
+    'to, and earns what that reserve pays for as long as it holds it. Each cycle '
+    'monitor.py creates a small batch of new strategies (clones of the best current '
+    'performers, plus one pulled fresh from the template) and hands each to you before it '
+    'starts. The user message says which job you have: `refine` (improve on a parent with '
+    'a track record) or `explore` (a fresh template spawn, where the job is to try '
+    'something the population is not already doing). You have full read/write/exec access '
+    "to the strategy's directory.\n\n"
+
+    'THE GAME. Every tick main.py reads the allocatable venues -- one row per (pool, '
+    'reserve) -- and `choose(rows, current, state, config, now)` returns the rows to hold. '
+    'A row carries `supply_apy` (what that reserve pays a supplier right now, computed '
+    "from the pool's own interest curve), `emission_apr_gross` (BLND emissions on top), "
+    '`utilization` and `max_utilization`, and `free_liquidity_usd` (what could actually be '
+    'withdrawn today). Holding costs nothing. Moving does, and that is the whole '
+    f'problem.\n\n'
+
+    'THE TWO COSTS DIFFER BY 25x, AND THE ARITHMETIC IS COUNTER-INTUITIVE. Moving between '
+    'two pools that lend the SAME asset is a withdraw and a supply: no order book is '
+    f'crossed, and it costs about {same_bp:.0f}bp. Moving to a DIFFERENT asset means '
+    f'swapping into it and eventually back out -- two crossings -- and costs about '
+    f'{cross_bp:.0f}bp. Now the part that catches people out: a one-off cost annualized '
+    f'over the {float(_FACTS["scoring_window_hours"]):.0f}h scoring window is multiplied '
+    f'by about {amplification:.0f}. Held for that whole window, a same-asset move has to '
+    f'buy roughly {same_breakeven:.1f}%/yr of extra rate to pay for itself, and a '
+    f'cross-asset move roughly {cross_breakeven:.0f}%/yr. Held for half as long, double '
+    'both. Cross-asset rotation is almost never worth it at the rate dispersion these '
+    'pools actually show; same-asset rotation usually is, if you hold it long enough. '
+    'Chasing a headline rate across assets is the single most reliable way to lose here, '
+    'and it will look like activity while it happens.\n\n'
+
+    f'SCORING, AND IT IS NOT WHAT YOU WRITE DOWN. Fitness is {_FACTS["score_formula"]}. '
+    f'The null is "{_FACTS["null_baseline"]}" -- matching it is not success, it is the '
+    f'baseline every strategy gets for free. '
+    f'**Nothing in state.json is read for scoring**: not `nav`, not `apy_bp`. Writing a '
+    f'large number into either changes nothing at all. The score is recomputed from '
+    f'outside, by replaying the allocations your main.py LOGS against a recorded history '
+    f'of what each venue paid, charging the costs above, and crediting only the time your '
+    f'process was observed running. You choose; the system prices.\n\n'
+
+    f'BEING STOPPED IS NOT NEUTRAL: {_FACTS["flat_when_stopped"]} -- at a 6%/yr null, '
+    f'eight hours down costs about {0.06 * (8.0 / 8760.0) * amplification * 10000:.0f}bp '
+    f'of score, and eight hours is one monitor cycle. So do not exit on an error you '
+    f'could survive: catch it, log it, hold the position and keep ticking. A strategy '
+    f'that crashes cleanly still loses to one that limps.\n\n'
+
+    f'EMISSIONS ARE QUOTED GROSS. {_FACTS["emissions_are_gross"]} Accrual credits them at '
+    f'{float(_FACTS["emission_realization"]):.4f} of face, a haircut no config can reach. '
+    'What `emission_weight` changes is only which venue you RANK highest -- if believing '
+    'in emissions also made you earn more, the answer would be "believe hardest", which '
+    'measures nothing. Treat it as your estimate of how much of an advertised emission '
+    'rate is real.\n\n'
+
+    'WITHDRAWAL IS NOT GUARANTEED. A reserve at or above its `max_utilization` has no '
+    'free liquidity to pay a withdrawal with until someone repays, and a pool can be '
+    'frozen by its admin between ticks. `min_free_liquidity_usd` is the config knob that '
+    'refuses a venue you could not get out of; a venue that disappears from the row list '
+    'while you hold it earns you nothing until it comes back.\n\n'
+
+    f'THE VENUES ARE {_FACTS["venues"]}. Aquarius is deliberately absent: '
+    f'{_FACTS["aquarius_excluded_because"]}. Do not try to add it, and do not add assets '
+    f'-- there is no asset-admission path in this domain.\n\n'
+
+    'THE LOG IS THE INTERFACE, AND BREAKING IT SCORES YOU AS IF YOU HELD NOTHING. '
+    'main.py writes one JSON object per line to /opt/trades/<name>.log. The scorer reads '
+    'the `allocate` and `rotate` events and their `allocation` list, and needs '
+    '`pool_address`, `asset_address` and `weight` on every leg. Rename or drop those and '
+    'your strategy is scored as if it sat in cash for its whole life, which is far worse '
+    'than any allocation you could have made. Keep logging a periodic `hold` event too: '
+    'that is what distinguishes a strategy that is correctly holding from one that is '
+    'wedged. If you restructure main.py, `exec` it once and read the log back before you '
+    'finish.\n\n'
+
+    f'CONFIG. The knobs monitor validates are {", ".join(_FACTS["knobs"])}, all of which '
+    'must stay present and in range or monitor repairs them back to defaults. '
+    'config.json is otherwise yours to extend -- the whole dict reaches choose() '
+    'unchanged -- but read anything you add as `config.get("your_key", <default>)`, '
+    'never `config["your_key"]`, or the first tick raises and the smoke test reverts you. '
+    '`name` must stay exactly the strategy\'s directory name.\n\n'
+
+    f'CHECK YOUR WORK WITH `backtest_yield_strategy`, which replays your choose() over '
+    f'the recorded venue history and reports `excess_bp` -- the same quantity you are '
+    f'scored on. {_FACTS["replay"]}, so early in a container\'s life it may return null '
+    f'for want of history; that is not a fault in your strategy. Read `source` first: '
+    f'anything but "main.py:choose" means it could not import your code and replayed a '
+    f'fallback, so the numbers are not yours. Keep main()\'s '
+    "tick loop and its `if __name__ == '__main__':` guard intact, and keep the SIGTERM "
+    'handler: strat_manager starts main.py once as a standalone process, so a file that '
+    'defines choose() and then reaches the bottom exits immediately, fails the smoke test '
+    'and reverts your whole revision.\n\n'
+
+    f'Real execution is {_FACTS["live_trading"]} -- nothing you write can move money, so '
+    'do not spend the revision on safety theatre, and do not try to reach a network or a '
+    'wallet.\n\n'
+
+    'When you are done, commit on a new git branch inside the strategy\'s own directory '
+    "(`git checkout -b auto/<timestamp>` then `git add -A && git commit -m ...`).\n\n"
+    # Same incident and same reason it sits last as in the five prompts above.
+    'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
+    '`write_file` and `exec` tool calls you actually make. Pasting a config.json into '
+    'your answer does not write it, quoting a main.py diff does not apply it, and a '
+    '`git commit` line inside a code fence does not run. monitor.py reads the directory, '
+    'never your summary, and a revision that left the files untouched is discarded and '
+    'replaced with a mechanical config nudge. Before your final reply, `read_file` every '
+    'path you claim to have changed and confirm it.\n\n'
+    'Finish by replying with a short summary of the changes you have already written to '
+    'disk, and why.'
+    )
+
+
 if _DOMAIN.NAME == 'null':
     REVISION_SYSTEM_PROMPT = _build_null_revision_system_prompt()
 elif _DOMAIN.NAME == 'forecast':
@@ -1145,6 +1278,8 @@ elif _DOMAIN.NAME == 'sdex_maker':
     REVISION_SYSTEM_PROMPT = _build_maker_revision_system_prompt()
 elif _DOMAIN.NAME == 'kalshi':
     REVISION_SYSTEM_PROMPT = _build_kalshi_revision_system_prompt()
+elif _DOMAIN.NAME == 'yield':
+    REVISION_SYSTEM_PROMPT = _build_yield_revision_system_prompt()
 else:
     REVISION_SYSTEM_PROMPT = _build_sdex_revision_system_prompt()
 
@@ -1790,6 +1925,97 @@ def _explore_prompt_null(strategy_name, strategy_path, leaderboard, tick_line) -
     )
 
 
+def _refine_prompt_yield(strategy_name, parent_name, strategy_path, parent_score,
+                         leaderboard, venue_line) -> str:
+    """The yield domain's clone case.
+
+    Shows the parent's log rather than its state.json numbers, because the log is what
+    the parent was actually scored on -- its allocations, what they cost and how long it
+    held them. Quoting `nav` and `apy_bp` as though they were the result would teach the
+    model to optimize the one thing that is not read.
+    """
+    parent_path = STRATEGIES_DIR / parent_name
+    parent_config = _read_json(parent_path / 'config.json', {})
+    parent_state = _read_json(parent_path / 'state.json', {})
+    allocation_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
+    clone_main_py = _read_text(strategy_path / 'main.py')
+    # `history` is the raw rolling NAV window, the single largest thing in this file and
+    # of no interest to a revision: it is the strategy's own estimate, not its score.
+    parent_state = {k: v for k, v in parent_state.items() if k != 'history'}
+    return (
+        f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
+        f'`{strategy_path}`. It has not allocated anything yet.\n\n'
+        f'{venue_line}'
+        f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
+        f"Parent `{parent_name}`'s current state.json (its own bookkeeping -- `nav` and "
+        f"`apy_bp` are the strategy's estimate of itself and are NOT what it is scored "
+        f"on; the rolling window is omitted here): {json.dumps(parent_state)}\n"
+        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
+        f"Parent `{parent_name}`'s most recent allocation events -- this log IS what it "
+        f"was scored on:\n{allocation_tail}\n\n"
+        f"The clone's main.py (identical to the parent's right now -- this is what you'd "
+        f"edit to change the allocation logic, not just config.json):\n"
+        f"```python\n{clone_main_py}\n```\n\n"
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running, including any you revised in previous cycles): '
+        f'{json.dumps(leaderboard)}\n\n'
+        f'Scores near {_FACTS["starting_score"]:.0f} mean the strategy is tracking the '
+        f'null; well below it means it either paid for rotations that did not pay off or '
+        f'spent time out of the market. Revise the clone at `{strategy_path}` however you '
+        f'think will improve on its parent, then commit your changes to a new git branch '
+        f'inside that directory.'
+    )
+
+
+def _explore_prompt_yield(strategy_name, strategy_path, leaderboard, venue_line) -> str:
+    """The yield domain's template-spawn case.
+
+    Omits _population_census() for the same reason the null and forecast ones do: the
+    census is sdex-specific machinery built around a population with months of
+    accumulated variety.
+    """
+    own_config = _read_json(strategy_path / 'config.json', {})
+    own_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
+        f'unmodified checkout of /opt/template_repo_yield -- NOT a clone of any existing '
+        f'strategy. It has no parent, no allocation history and no track record, so there '
+        f'is nothing here to improve on. Your job this time is EXPLORATION: give the '
+        f'population a strategy that is structurally different from what it already '
+        f'runs.\n\n'
+        f'{venue_line}'
+        f'Its config.json right now: {json.dumps(own_config)}\n'
+        f'monitor.py checks the config you leave behind: `name` must still be exactly '
+        f'"{strategy_name}", and {", ".join(_FACTS["knobs"])} must all be present and '
+        f'within range. Even if your logic does not use a plain rate threshold at all, '
+        f'you must still leave those knobs in range -- otherwise monitor repairs them '
+        f'back to safe defaults.\n\n'
+        f'CONFIG.JSON IS YOURS TO EXTEND beyond those keys -- nothing validates it '
+        f'against a schema, and the whole dict reaches your `choose(rows, current, '
+        f'state, config, now)` unchanged. A minimum hold that varies with how far apart '
+        f'the top two venues are, a rule that only ever moves within one asset, a '
+        f'preference for depth over rate -- whatever your logic needs belongs in '
+        f'config.json under a name that says what it means, not hardcoded in main.py. '
+        f'Two rules:\n'
+        f'  * ALWAYS read your own keys as `config.get("your_key", <sensible '
+        f'default>)`, never `config["your_key"]` -- a KeyError on the first tick fails '
+        f'the smoke test and is reverted.\n'
+        f'  * Do not rename, repurpose or drop the validated knobs above. Add alongside '
+        f'them.\n\n'
+        f'Its main.py (the unmodified template -- a starting point, not a parent\'s '
+        f'proven code, so you are free to restructure it, but keep main(), its '
+        f'`__main__` guard, the SIGTERM handler and the shape of what it logs):\n'
+        f'```python\n{own_main_py}\n```\n\n'
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running): {json.dumps(leaderboard)}\n\n'
+        f'Note that a structurally different strategy still has to beat the null, which '
+        f'every strategy gets for free by allocating once and sitting still. Being '
+        f'different is the job; being different and worse is still worse. The cheapest '
+        f'way to be worse is to rotate more than the rate differences justify. Commit '
+        f'your changes to a new git branch inside `{strategy_path}` when done.'
+    )
+
+
 def _explore_prompt_forecast(strategy_name, strategy_path, leaderboard, tick_line) -> str:
     """The forecast domain's template-spawn case. Parallel to _explore_prompt.
 
@@ -1979,6 +2205,13 @@ def _compose_revision_messages(strategy_name: str, parent_name: str, parent_scor
         else:
             prompt = _refine_prompt_kalshi(strategy_name, parent_name, strategy_path,
                                            parent_score, leaderboard, price_line)
+    elif _DOMAIN.NAME == 'yield':
+        if role == ROLE_EXPLORE:
+            prompt = _explore_prompt_yield(strategy_name, strategy_path, leaderboard,
+                                           price_line)
+        else:
+            prompt = _refine_prompt_yield(strategy_name, parent_name, strategy_path,
+                                          parent_score, leaderboard, price_line)
     elif role == ROLE_EXPLORE:
         prompt = _explore_prompt(strategy_name, strategy_path, leaderboard, price_line)
     else:

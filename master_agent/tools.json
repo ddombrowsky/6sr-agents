@@ -510,5 +510,24 @@
         "required": []
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "backtest_yield_strategy",
+      "description": "Replay a yield-allocation strategy over the recorded venue rate history and return trades, beats_null, null_pct and a raw block with strategy_apy_pct, excess_bp, rotations, cost_bp and source. Use it as your fitness check instead of guessing. excess_bp is annualized basis points against the null and is what the strategy is scored on. NOTE that `trades` counts allocation decisions INCLUDING THE FIRST, not rotations -- allocating once and holding is the null, not a broken strategy, and 0 means choose() never allocated at all. A large negative excess_bp alongside a high rotations count means the strategy is paying for moves that do not pay for themselves, which is the commonest way to lose in this domain. Always check `source` first: 'main.py:choose' means your code was replayed; anything else means the backtester could not import choose() from main.py and replayed a mechanical config-only fallback instead, in which case a top-level WARNING key is present and every number describes the fallback rather than your code. A null result with a `reason` means the recorder has not collected enough history yet, which is normal on a new container and is not a fault in your strategy.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {
+            "type": "string",
+            "description": "Directory of the strategy to test, e.g. /opt/strategies/clone_ab12cd34ef56"
+          }
+        },
+        "required": [
+          "strategy_path"
+        ]
+      }
+    }
   }
 ]

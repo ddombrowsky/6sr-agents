@@ -15,6 +15,13 @@ holds ONLY imports, assignments, function/class definitions, the docstring and t
 `if __name__ == '__main__'` guard. The tick loop lives in `main()` under the guard, so
 importing this module never starts it.
 
+Unlike those two, the rule is CHECKED here: tools/yield_backtest.py imports `choose` out
+of this file to replay a candidate over recorded history, and refuses any main.py whose
+top level does anything else. Break it and the backtest silently falls back to the
+template's own rule -- so your revision is gated on code you did not write. Even a bare
+`sys.path.append(...)` at the top is enough to trip it, which is why the one this file
+needs sits inside venue_rows().
+
 ## The game
 
 Each tick the strategy reads the allocatable venue list -- one row per (pool, reserve),
@@ -75,8 +82,6 @@ import signal
 import sys
 import time
 from pathlib import Path
-
-sys.path.append('/opt/tools')
 
 CONFIG_PATH = Path('config.json')
 STATE_PATH = Path('state.json')
@@ -164,6 +169,15 @@ def venue_rows():
     Refreshing is a ~50s chain read, so it happens only when the shared snapshot is
     missing or badly stale -- every ordinary tick is a file read.
     """
+    # The path fix lives here rather than at module level, and that is not style: the
+    # module top level must contain only imports, assignments, definitions, the docstring
+    # and the __main__ guard, or tools/yield_backtest.py refuses to import choose() out of
+    # this file and the strategy is backtested against the template's rule instead of its
+    # own. A bare `sys.path.append(...)` at the top is an expression statement and fails
+    # that check -- which this template itself did until the backtester was written and
+    # rejected it.
+    if '/opt/tools' not in sys.path:
+        sys.path.append('/opt/tools')
     try:
         import yield_venues
     except Exception as e:

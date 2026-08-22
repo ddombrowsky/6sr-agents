@@ -254,6 +254,49 @@ def backtest_forecast_strategy(strategy_path: str, n: int = 2000) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def backtest_yield_strategy(strategy_path: str) -> str:
+    """Replay a yield-allocation strategy over the recorded venue rate history.
+
+    The yield-domain analogue of backtest_strategy. Two things to read carefully:
+
+    `trades` counts ALLOCATION DECISIONS INCLUDING THE FIRST, not rotations -- in this
+    domain allocating once and never moving again is the null, not a broken strategy, and
+    a 0 here means choose() never put the money anywhere at all.
+
+    `excess_bp` is the number that matters: annualized basis points against the null,
+    which is what the strategy is scored on. A large negative excess with a high
+    `rotations` count means the strategy is paying for moves that do not pay for
+    themselves, which is by far the commonest way to lose here.
+
+    Imported lazily for the same reason backtest_strategy is: a broken or missing
+    /opt/tools module must never stop the agent from starting.
+    """
+    try:
+        from yield_backtest import replay
+        result = replay(strategy_path)
+        if result is None:
+            return json.dumps({
+                'result': None,
+                'reason': ('not enough recorded venue history yet -- the recorder needs '
+                           'several hours before a replay means anything. This is normal '
+                           'on a freshly created container and is not a fault in your '
+                           'strategy.')})
+        source = (result.get('raw') or {}).get('source')
+        if source != 'main.py:choose':
+            result['WARNING'] = (
+                f"source is {source!r}: the backtester could NOT import choose() from "
+                f"main.py, so every number here describes the mechanical config-only "
+                f"fallback, NOT this strategy's code. Fix the structure first: main.py's "
+                f"top level may contain only imports, assignments, defs, the docstring "
+                f"and an `if __name__ == '__main__'` guard -- even a bare "
+                f"sys.path.append() up there fails it -- with the logic in a top-level "
+                f"choose(rows, current, state, config, now). Then re-run this tool and "
+                f"check that source is 'main.py:choose' before trusting any result.")
+        return json.dumps(result)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 def backtest_maker_strategy(strategy_path: str, days: float = 7) -> str:
     """Replay a market-making strategy over recorded order book and executed tape.
 
@@ -443,6 +486,7 @@ TOOLS = {
     'get_news_sentiment': get_news_sentiment,
     'backtest_strategy': backtest_strategy,
     'backtest_forecast_strategy': backtest_forecast_strategy,
+    'backtest_yield_strategy': backtest_yield_strategy,
     'backtest_maker_strategy': backtest_maker_strategy,
     'get_tape_stats': get_tape_stats,
     'backtest_kalshi_strategy': backtest_kalshi_strategy,
