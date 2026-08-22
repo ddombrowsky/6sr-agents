@@ -5,3 +5,5 @@ requests
 numpy
 pandas
 scipy
+stellar-sdk
+aquarius-sdk

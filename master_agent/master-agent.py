@@ -188,6 +188,17 @@ _STARTUP_MTIMES = _watched_mtimes()
 def dispatch(tool_call) -> dict:
     name = tool_call['function']['name']
     args = tool_call['function']['arguments']
+    # Some Ollama versions return arguments as a JSON string rather than a parsed
+    # dict. Parse it so fn(**args) works either way; an unparseable string degrades
+    # to an empty dict, which produces a clear "missing required argument" error
+    # rather than an AttributeError on .items().
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
     print(f'  -> {name}({", ".join(f"{k}={v!r}" for k, v in args.items())})')
     fn = TOOLS.get(name)
     if not fn:
@@ -195,6 +206,25 @@ def dispatch(tool_call) -> dict:
     else:
         try:
             result = fn(**args)
+        except TypeError as e:
+            # The default TypeError for a missing or wrong argument is opaque to the
+            # model ("missing 1 required positional argument: "path""). Give it
+            # the concrete list of what it sent so it can self-correct in one retry
+            # instead of three. Found in the wild 2026-08-20: glm-5.2:cloud called
+            # write_file(content="...") without path three times in one revision
+            # and calculate(path="...") once, wasting tool-call budget each time.
+            msg = str(e)
+            provided = list(args.keys())
+            if 'missing' in msg and 'argument' in msg:
+                result = (f'error: {name}() {msg} -- you provided arguments '
+                         f'{provided}. Every required argument must be passed as a '
+                         f'keyword pair (e.g. {name}(path="...", content="...")).')
+            elif 'unexpected keyword' in msg:
+                result = (f'error: {name}() {msg} -- you provided arguments '
+                         f'{provided}. Check the tool schema for the correct '
+                         f'argument names.')
+            else:
+                result = f'error: {type(e).__name__}: {e}'
         except Exception as e:
             result = f'error: {type(e).__name__}: {e}'
     result = str(result)
@@ -689,16 +719,33 @@ def _build_sdex_revision_system_prompt():
     # the whole reason it sits here rather than next to the tool descriptions above; the
     # retry loop in revise_strategy is the backstop for when it does not land.
     'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
-    'nothing: pasting the new config.json into your answer does not write it, quoting a '
-    'main.py diff does not apply it, and a `git commit` line inside a code fence does not '
-    'run. monitor.py reads the directory, never your summary, and a revision that left '
-    'the files untouched is discarded and replaced with a mechanical threshold nudge: '
-    'the slot is spent and your analysis is lost. So before you write your final reply, '
-    '`read_file` every path you claim to have changed and confirm the new content is '
-    'really on disk. And check the order you did things in -- a `backtest_strategy` '
-    'result from before you wrote the file describes the old code, not your revision, so '
-    're-run it rather than quoting it.\n\n'
+    '`write_file`, `apply_patch` and `exec` tool calls you actually make. Text in your '
+    'reply reaches nothing: pasting the new config.json into your answer does not write '
+    'it, quoting a main.py diff does not apply it, and a `git commit` line inside a code '
+    'fence does not run. monitor.py reads the directory, never your summary, and a '
+    'revision that left the files untouched is discarded and replaced with a mechanical '
+    'threshold nudge: the slot is spent and your analysis is lost. So before you write '
+    'your final reply, `read_file` every path you claim to have changed and confirm the '
+    'new content is really on disk. And check the order you did things in -- a '
+    '`backtest_strategy` result from before you wrote the file describes the old code, '
+    'not your revision, so re-run it rather than quoting it.\n\n'
+    # Was the opposite instruction until apply_patch was actually implemented: the
+    # eighth emperor pass added a line here telling the model NOT to use it, after it
+    # tried `apply_patch <<'PATCH'` through exec eight times across the 2026-08-21
+    # cycles and got `/bin/sh: 1: apply_patch: not found` every time. The tool now
+    # exists (/opt/tools/apply_patch.py, registered as a tool AND on PATH), so this
+    # points the reflex at the working thing instead of suppressing it.
+    'To change a few lines of a large file, `apply_patch` is usually better than '
+    '`write_file`: it takes a V4A patch (`*** Begin Patch` / `*** Update File: <path>` '
+    '/ `@@` / `-` and `+` lines / `*** End Patch`) and edits in place, so you send only '
+    'the lines that change instead of re-emitting a 300-line main.py to add one '
+    'import. It is installed as a shell command as well as a tool, so '
+    "`apply_patch <<'PATCH' ... PATCH` through `exec` works too. Its `-` and context "
+    'lines must match the file exactly as it is on disk right now, and a hunk that '
+    'matches nothing -- or matches in two places -- aborts the whole patch and writes '
+    'NOTHING, so `read_file` the target first and copy the lines from it. If a patch '
+    'will not match after one retry, fall back to `write_file` with the complete '
+    'file.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
     )
@@ -724,7 +771,8 @@ def _build_sdex_revision_system_prompt():
 
 _GENERIC_TOOL_NAMES = frozenset((
     'calculate', 'get_current_time', 'get_uptime',
-    'read_file', 'write_file', 'fetch_url', 'install_package', 'update_package_list',
+    'read_file', 'write_file', 'apply_patch', 'fetch_url', 'install_package',
+    'update_package_list',
     'exec',
 ))
 
@@ -853,14 +901,14 @@ def _build_forecast_revision_system_prompt():
     # Same incident, same fix, same domain-agnostic reason it sits last -- see the sdex
     # prompt above for the measured counts this addresses.
     'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Text in your reply reaches '
-    'nothing: pasting the new config.json into your answer does not write it, quoting a '
-    'main.py diff does not apply it, and a `git commit` line inside a code fence does '
-    'not run. monitor.py reads the directory, never your summary, and a revision that '
-    'left the files untouched is discarded and replaced with a mechanical threshold '
-    'nudge. So before your final reply, `read_file` every path you claim to have '
-    'changed and confirm it, and re-run `backtest_forecast_strategy` if you wrote after '
-    'your last check -- a result from before you wrote the file describes the old '
+    '`write_file`, `apply_patch` and `exec` tool calls you actually make. Text in your '
+    'reply reaches nothing: pasting the new config.json into your answer does not write '
+    'it, quoting a main.py diff does not apply it, and a `git commit` line inside a code '
+    'fence does not run. monitor.py reads the directory, never your summary, and a '
+    'revision that left the files untouched is discarded and replaced with a mechanical '
+    'threshold nudge. So before your final reply, `read_file` every path you claim to '
+    'have changed and confirm it, and re-run `backtest_forecast_strategy` if you wrote '
+    'after your last check -- a result from before you wrote the file describes the old '
     'code.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
@@ -1078,12 +1126,12 @@ def _build_null_revision_system_prompt():
     "(`git checkout -b auto/<timestamp>` then `git add -A && git commit -m ...`).\n\n"
     # Same incident and same reason it sits last as in the four prompts above.
     'A SUMMARY IS NOT A CHANGE. The only things that modify this strategy are the '
-    '`write_file` and `exec` tool calls you actually make. Pasting a config.json into '
-    'your answer does not write it, quoting a main.py diff does not apply it, and a '
-    '`git commit` line inside a code fence does not run. monitor.py reads the directory, '
-    'never your summary, and a revision that left the files untouched is discarded and '
-    'replaced with a mechanical config nudge. Before your final reply, `read_file` every '
-    'path you claim to have changed and confirm it.\n\n'
+    '`write_file`, `apply_patch` and `exec` tool calls you actually make. Pasting a '
+    'config.json into your answer does not write it, quoting a main.py diff does not '
+    'apply it, and a `git commit` line inside a code fence does not run. monitor.py '
+    'reads the directory, never your summary, and a revision that left the files '
+    'untouched is discarded and replaced with a mechanical config nudge. Before your '
+    'final reply, `read_file` every path you claim to have changed and confirm it.\n\n'
     'Finish by replying with a short summary of the changes you have already written to '
     'disk, and why.'
     )
