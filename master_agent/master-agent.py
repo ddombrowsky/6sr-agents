@@ -773,7 +773,7 @@ _GENERIC_TOOL_NAMES = frozenset((
     'calculate', 'get_current_time', 'get_uptime',
     'read_file', 'write_file', 'apply_patch', 'fetch_url', 'install_package',
     'update_package_list',
-    'exec',
+    'exec', 'search',
 ))
 
 # The one extra, domain-specific fitness-check tool each non-sdex domain gets on top of
@@ -1042,6 +1042,19 @@ def _build_maker_revision_system_prompt():
     f'{_FACTS["unrealized_haircut"]} on the XLM leg, resting offers included, starting '
     f'from ${_FACTS["starting_score"]}.\n\n'
 
+    'THE BID/ASK FORMULA IS CORRECT AS-IS. The template quotes with '
+    '`bid = min(best_bid * (1 + improve_bp / 10000), floor_bid)` and '
+    '`ask = max(best_ask * (1 - improve_bp / 10000), floor_ask)`. The `min` on the bid '
+    'and `max` on the ask are INTENTIONAL: they keep the quote at or inside the floor '
+    'set by half_width_bp, which is what keeps it inside the touch and fillable. '
+    '"Correcting" them to max/min respectively moves quotes OUTSIDE the touch and '
+    'collapses fills -- one revision that did this dropped from ~5600 to 872 trades. '
+    'Do not change this formula unless you are replacing the entire quoting approach.\n\n'
+    'DO NOT add a `decide()` wrapper. The entry point is `quote(book, state, config)`, '
+    'NOT `decide()`. The backtester imports `quote`, not `decide`. A `decide()` that '
+    'forwards to `quote()` is harmless but wastes tokens in every descendant that '
+    'inherits it. Some models add it reflexively from the threshold-trader prompt '
+    'pattern -- do not.\n\n'
     'Before your final reply, `read_file` every path you claim to have changed and confirm '
     'it, and re-run the replay if you wrote after your last check -- a result from before '
     'you wrote the file describes the old code. Finish by replying with a short summary of '
