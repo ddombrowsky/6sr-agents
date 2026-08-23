@@ -14,23 +14,34 @@ def get_uptime() -> str:
     return result.stdout.strip()
 
 
-def read_file(path: str, depth=None, line_start=None, line_end=None) -> str:
+def read_file(path: str = '', depth=None, line_start=None, line_end=None,
+              lines_start=None, lines_end=None) -> str:
+    # Accept line_start/line_end and lines_start/lines_end as aliases (the model
+    # uses both spellings interchangeably). Found in the wild 2026-08-23: the
+    # model tried to page through a 300-line main.py by calling
+    # read_file(path=..., line_start=200, line_end=400) and
+    # read_file(path=..., lines_start=200, lines_end=400), both wasting a
+    # tool-call round-trip on a TypeError.
+    start = line_start if line_start is not None else lines_start
+    end = line_end if line_end is not None else lines_end
     try:
         with open(path) as f:
             content = f.read()
-        # Some models pass line_start/line_end expecting 1-indexed line ranges
-        # (a parameter they know from other agent environments). Honour it when
-        # present, since it is more specific than depth. Found in the wild
-        # 2026-08-23: glm-5.2:cloud called read_file(depth=200, path=...,
-        # line_start=120, line_end=260) and got an opaque TypeError.
-        if line_start is not None or line_end is not None:
+        if start is not None or end is not None:
             lines = content.splitlines()
-            start = max(0, int(line_start) - 1) if line_start is not None else 0
-            end = min(len(lines), int(line_end)) if line_end is not None else len(lines)
-            selected = lines[start:end]
-            prefix = f'... ({start} lines before)\n' if start > 0 else ''
-            suffix = f'\n... ({len(lines) - end} more lines)' if end < len(lines) else ''
-            return prefix + '\n'.join(selected) + suffix
+            try:
+                s = int(start) - 1 if start is not None else 0
+                e = int(end) if end is not None else len(lines)
+            except (TypeError, ValueError):
+                s, e = 0, len(lines)
+            s = max(0, s)
+            e = max(s, min(e, len(lines)))
+            chunk = '\n'.join(lines[s:e])
+            if s > 0:
+                chunk = f'... ({s} lines before line {s + 1})\n' + chunk
+            if e < len(lines):
+                chunk += f'\n... ({len(lines) - e} more lines after line {e})'
+            return chunk
         # Some models pass depth=N expecting the first N lines (a parameter they
         # know from other agent environments). Honour it: it saves response
         # tokens and gives the model what it asked for. Found in the wild
@@ -42,13 +53,12 @@ def read_file(path: str, depth=None, line_start=None, line_end=None) -> str:
             except (TypeError, ValueError):
                 depth = None
             if depth is not None and depth > 0:
-                lines = content.splitlines()
-                if len(lines) > depth:
-                    content = '\n'.join(lines[:depth]) + f'\n... ({len(lines) - depth} more lines)'
+                file_lines = content.splitlines()
+                if len(file_lines) > depth:
+                    content = '\n'.join(file_lines[:depth]) + f'\n... ({len(file_lines) - depth} more lines)'
         return content
     except Exception as e:
         return f'error: {e}'
-
 
 def write_file(path: str = '', content: str = '') -> str:
     if not path:
@@ -529,7 +539,37 @@ def get_market_regime(hours: int = 720, buy_below: float = 0, sell_above: float 
         return f'error: {type(e).__name__}: {e}'
 
 
+def search_files(path: str = '', pattern: str = '', query: str = '', max_results: int = 20) -> str:
+    """Grep for a text pattern in files under a directory. Returns matching lines with file:line: prefixes.
+
+    The model sometimes calls this 'search' (a tool name it knows from other agent
+    environments). Accepted as a generic tool across all domains.
+    """
+    search_pattern = pattern or query
+    if not search_pattern:
+        return 'error: no search pattern provided (pass pattern= or query=)'
+    if not path:
+        path = '/opt/strategies'
+    try:
+        result = subprocess.run(
+            ['grep', '-rn', '--include=*.py', '--include=*.json', '-I',
+             search_pattern, path],
+            capture_output=True, text=True, timeout=30)
+        lines = (result.stdout or '').strip().splitlines()
+        if not lines:
+            return f'no matches for {search_pattern!r} in {path}'
+        max_results = int(max_results) if max_results else 20
+        if len(lines) > max_results:
+            shown = lines[:max_results]
+            return '\n'.join(shown) + f'\n... ({len(lines) - max_results} more matches)'
+        return '\n'.join(lines)
+    except subprocess.TimeoutExpired:
+        return 'error: search timed out after 30s'
+    except Exception as e:
+        return f'error: {e}'
+
 TOOLS = {
+    'search': search_files,
     'get_market_regime': get_market_regime,
     'get_dex_cex_basis': get_dex_cex_basis,
     'get_friction': get_friction,

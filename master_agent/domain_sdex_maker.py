@@ -30,6 +30,7 @@ at a fixed distance from the mid by 2.7x in net edge; adverse selection ate 82-9
 spread capture at every width; and the whole edge decays to zero if a quote takes more than
 ~10s to reach the book. The seeds and the gates below are sized against that, not a guess.
 """
+import bisect
 import json
 import math
 import os
@@ -338,8 +339,16 @@ def _haircut():
 
 
 def score(state_dict, obs):
-    """(score, unpriced_specs) from a raw state dict. Parity member; score_path is
-    authoritative and is what monitor actually calls."""
+    """(score, unpriced_specs) from a raw state dict: net worth, marked to market.
+
+    LEGACY -- kept as the parity member and as the comparison column for `--rescore`,
+    but score_path (what monitor calls) no longer uses it. Net worth proved to be the
+    wrong fitness for a maker: it credits inventory marked at mid, so in a trending
+    market the leaderboard ranks whoever holds the most XLM. Measured inverting the
+    population on 2026-08-23: the top-8 by net worth had fill-time execution edge of
+    -$20.59 and -$31.52 (seed_maker03/04), while the only two strategies with POSITIVE
+    edge (seed_maker00 +$1.68, seed_maker02 +$1.55) sat mid-pack. Realized edge below.
+    """
     score_mod = _tool('score')
     if score_mod is None:
         return (float(state_dict.get('balance_usd') or 0.0), [])
@@ -355,18 +364,190 @@ def score(state_dict, obs):
     return (total, unpriced)
 
 
+# --------------------------------------------------------------------------------------
+# Realized-edge scoring. score = STARTING_SCORE + execution_edge_usd + unrealized_floor.
+#
+#   execution_edge_usd: per fill, signed distance of the execution price from the
+#     recorded DEX mid AT THE MOMENT OF THE FILL, in USD:
+#         buy:  (mid_fill - exec_price) * qty
+#         sell: (exec_price - mid_fill) * qty
+#     Buying below the mid and selling above it is the whole job of a maker. Marking
+#     each leg against its own contemporaneous mid -- rather than a sell against the
+#     average cost of earlier buys -- is the load-bearing choice: cost-basis realized
+#     P&L still credits mid drift between the legs, so in the 2026-08 rally the same
+#     inventory beta reappeared, one hop later, inside "realized" numbers (seed_maker03
+#     read +$20.65 realized vs -$20.59 of actual execution edge on the same fills).
+#
+#   unrealized_floor: qty_held * (min(avg_cost, mid_now) - avg_cost), i.e. inventory
+#     valued at LOWER of cost or market. Never positive: rally gains on held inventory
+#     are ignored exactly because they are what we are removing. Losses are marked the
+#     moment the mid falls below cost instead of only on sale -- without this, a
+#     strategy that never sells its losers is indistinguishable from an honest one that
+#     cut them (the disposition effect becomes a selected trait), and the 2026-08-23
+#     data had every "leader" doing exactly that with $95-247 of held inventory.
+#
+# The inputs come from /opt/trades/<name>.log (written ONLY by quote_executor on a fill)
+# and .market_history.jsonl (written ONLY by market_recorder). state.json is deliberately
+# NOT an input to the realized term: the strategy process can write it, and a fitness the
+# model can write is the domain_null failure with a leaderboard attached. The log is
+# resolved by DIRECTORY name, never state.json's model-writable `name`; the one surviving
+# indirection is activity_log_path's config.json self-rename alias, which a revision could
+# abuse to point at a peer's log -- cheap to audit (`grep '"name"' strategies/*/config.json
+# vs dirname`), and promotion still has to pass live_track_record against the replay,
+# which reads source code, not logs.
+#
+# What this scoring deliberately does to incentives: quoting captures score only when it
+# beats the contemporaneous mid; carrying inventory through a rally earns nothing; carrying
+# it through a dump costs immediately; the only way UP the board is filling both sides
+# inside the touch. Standing down entirely parks a strategy at exactly STARTING_SCORE --
+# above the chronic losers, below anyone with a positive edge -- which is also honest.
+# --------------------------------------------------------------------------------------
+
+_MARKET_HISTORY = TRADES_DIR / '.market_history.jsonl'   # market_recorder.HISTORY_PATH
+_MARKS_CACHE = {'key': None, 'ts': [], 'mid': []}
+
+
+def _mark_series():
+    """(ts_list, mid_list) of the recorded dex_mid series, ([] ,[]) when unreadable.
+
+    Cached by (mtime, size): one cycle scores every strategy, and re-parsing 26k rows
+    per strategy per cycle would dominate the cycle's I/O for no new information.
+    """
+    try:
+        st = _MARKET_HISTORY.stat()
+    except OSError:
+        return [], []
+    key = (st.st_mtime_ns, st.st_size)
+    if _MARKS_CACHE['key'] == key:
+        return _MARKS_CACHE['ts'], _MARKS_CACHE['mid']
+    ts, mid = [], []
+    try:
+        with open(_MARKET_HISTORY) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                m, t = row.get('dex_mid'), row.get('ts')
+                if m and t:
+                    ts.append(t)
+                    mid.append(m)
+    except Exception:
+        return [], []
+    _MARKS_CACHE.update(key=key, ts=ts, mid=mid)
+    return ts, mid
+
+
+def _mid_at(ts_list, mid_list, t):
+    """Nearest recorded mid to t, or None when the series is empty."""
+    if not ts_list:
+        return None
+    i = bisect.bisect_left(ts_list, t)
+    if i == 0:
+        return mid_list[0]
+    if i == len(ts_list):
+        return mid_list[-1]
+    return mid_list[i] if ts_list[i] - t < t - ts_list[i - 1] else mid_list[i - 1]
+
+
+def realized_edge(name, obs=None):
+    """Walk the fill log: {'fills', 'edge_usd', 'qty', 'cost', 'unrealized_usd'} or None.
+
+    None ONLY when the activity log cannot be opened; a strategy that has never filled
+    returns a zeroed dict, not None. Cost accounting runs over EVERY fill (even those
+    older than the mark series, whose edge is skipped), so inventory and cost basis
+    stay consistent with the ledger. The template's XLM endowment predates the log: it
+    is detected on the first fill from the post-fill balance and given a cost basis at
+    that fill's mid -- approximation, but the honest end of the error, since endowment
+    gains are never credited under either convention.
+    """
+    path = activity_log_path(name)
+    ts_list, mid_list = _mark_series()
+    mid_now = (obs.mid if obs and obs.mid else None) or (
+        mid_list[-1] if mid_list else None) or _observed_mid()
+    edge_usd = 0.0
+    qty = cost = 0.0
+    fills = 0
+    endowed = False
+    try:
+        f = open(path)
+    except OSError:
+        return None
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            action = entry.get('action')
+            if action not in ('maker_buy', 'maker_sell'):
+                continue
+            t = entry.get('timestamp')
+            exec_price = entry.get('fill_price') or entry.get('price')
+            usd = float(entry.get('amount_usd') or 0.0)
+            xlm = abs(float(entry.get('amount_xlm') or 0.0))
+            if xlm <= 0 and usd > 0 and exec_price:
+                xlm = usd / exec_price
+            if xlm <= 0 or not exec_price:
+                continue
+            mid_fill = _mid_at(ts_list, mid_list, t) if t else None
+            if not endowed:
+                # Back the endowment out of the post-fill balance and cost it at this
+                # fill's mid. Records before schema 2 may lack balance_xlm: then the
+                # endowment prices at zero cost, which only suppresses the floor term.
+                endowed = True
+                bal_xlm = entry.get('balance_xlm')
+                signed = xlm if action == 'maker_buy' else -xlm
+                if bal_xlm is not None and mid_fill:
+                    endow = float(bal_xlm) - signed
+                    if endow > 0:
+                        qty += endow
+                        cost += endow * mid_fill
+            if mid_fill:
+                sign = 1.0 if action == 'maker_sell' else -1.0
+                edge_usd += sign * (exec_price - mid_fill) * xlm
+            if action == 'maker_buy':
+                qty += xlm
+                cost += exec_price * xlm
+            else:
+                avg = cost / qty if qty > 0 else 0.0
+                qty -= xlm
+                cost -= avg * xlm
+            fills += 1
+    unrealized = 0.0
+    if qty > 0 and mid_now:
+        avg = cost / qty
+        unrealized = qty * (min(avg, mid_now) - avg)
+    return {'fills': fills, 'edge_usd': edge_usd, 'qty': qty, 'cost': cost,
+            'unrealized_usd': unrealized}
+
+
 def score_path(strategy_path, obs):
     """The authoritative fitness call. None ONLY when state.json is genuinely unreadable.
 
-    "Quoting but not yet filled" must return STARTING_SCORE, never None: None becomes
-    -inf upstream, which sorts last AND is excluded from max_score, so a whole population
-    of freshly spawned makers would look like a total scoring outage.
+    STARTING_SCORE + realized execution edge + the lower-of-cost-or-market floor on held
+    inventory (see the block above). A strategy quoting but not yet filled returns exactly
+    STARTING_SCORE -- never None, for the same reason as before: None becomes -inf
+    upstream, which sorts last AND is excluded from max_score, so a population of freshly
+    spawned makers would read as a total scoring outage.
+
+    monitor.MIN_LIVE_SCORE (1000.0) keeps its meaning: "up on where it started". Under
+    this accounting that bar is now strictly harder than the old net-worth reading, which
+    could clear 1000 on inventory beta alone.
     """
     raw = _read_json(Path(strategy_path) / 'state.json')
     if not isinstance(raw, dict):
         return None
-    total, _unpriced = score(raw, obs)
-    return total
+    name = Path(strategy_path).name
+    result = realized_edge(name, obs)
+    if result is None:
+        # No fill log at all: a maker that has never filled. STARTING_SCORE, as the
+        # docstring requires -- this is the young-strategy path, not a failure.
+        return STARTING_SCORE
+    return STARTING_SCORE + result['edge_usd'] + result['unrealized_usd']
 
 
 def activity_log_path(name):
@@ -1496,6 +1677,15 @@ def prompt_facts():
         'unrealized_haircut': _haircut(),
         'executor': 'quote_executor.sync_quotes',
         'entry_point': 'quote(book, state, config)',
+        # The scoring sentence itself, built here rather than written as prose in
+        # master-agent.py, for exactly the reason in this function's docstring: the
+        # prompt stated a haircut the code did not enforce for weeks. score_path is
+        # the enforcer, so the sentence describing it lives next to it.
+        'score_formula': (
+            f'{STARTING_SCORE:.0f} + your execution edge in USD + a '
+            f'lower-of-cost-or-market floor on inventory you still hold'),
+        'score_source': ('/opt/trades/<name>.log (written only by the executor, on a '
+                         'fill) joined to the recorded mid at each fill time'),
     }
     st = _tool('stellar_trader')
     for key, attr in (('max_open_offers', 'MAX_OPEN_OFFERS'),
@@ -1548,7 +1738,64 @@ def observation_line(obs):
     return '\n'.join(lines) + '\n'
 
 
+def _rescore_main():
+    """`--rescore`: the population under BOTH scorings, side by side. Changes nothing.
+
+    Exists so a scoring change can be argued about against the live population before it
+    touches a cycle: monitor.py --live-status answers "may real money move", this answers
+    "who would the loop be selecting for if it ran right now". Old = net worth marked to
+    market (the score() parity member), new = STARTING_SCORE + execution edge + the
+    lower-of-cost-or-market floor. Reads exactly what score_path reads.
+    """
+    mid = _observed_mid()
+    if not mid:
+        ts_list, mid_list = _mark_series()
+        mid = mid_list[-1] if mid_list else 0.0
+    obs = Observation(mid=mid, marks={'XLM': mid})
+    rows = []
+    for path in sorted(STRATEGIES_DIR.iterdir()):
+        if not path.is_dir():
+            continue
+        raw = _read_json(path / 'state.json')
+        if not isinstance(raw, dict):
+            continue
+        old, _ = score(raw, obs)
+        result = realized_edge(path.name, obs)
+        if result is None:
+            new, fills, edge, unreal = STARTING_SCORE, 0, 0.0, 0.0
+        else:
+            fills = result['fills']
+            edge = result['edge_usd']
+            unreal = result['unrealized_usd']
+            new = STARTING_SCORE + edge + unreal
+        rows.append({'name': path.name, 'old': old, 'new': new,
+                     'fills': fills, 'edge': edge, 'unreal': unreal})
+    by_old = sorted(rows, key=lambda r: -r['old'])
+    by_new = sorted(rows, key=lambda r: -r['new'])
+    old_rank = {r['name']: i for i, r in enumerate(by_old)}
+    top_n = int(os.environ.get('KEEP_TOP_N', '8'))
+    new_top = {r['name'] for r in by_new[:top_n]}
+    old_top = {r['name'] for r in by_old[:top_n]}
+    print(f'rescore dry run: {len(rows)} strategies, mid {mid:.6f}, '
+          f'KEEP_TOP_N={top_n}')
+    print(f"{'strategy':<26} {'old_rank':>8} {'old$':>9} | {'new_rank':>8} "
+          f"{'new$':>9} {'fills':>6} {'edge$':>8} {'unreal$':>8}")
+    for i, r in enumerate(by_new):
+        marker = '*' if (r['name'] in new_top) != (r['name'] in old_top) else ' '
+        print(f"{r['name']:<26} {old_rank[r['name']]:>8} {r['old']:>9.2f} | "
+              f"{i:>8} {r['new']:>9.2f} {r['fills']:>6} {r['edge']:>8.2f} "
+              f"{r['unreal']:>8.2f} {marker}")
+    gained = sorted(new_top - old_top)
+    lost = sorted(old_top - new_top)
+    print(f"top-{top_n} turnover: enters {gained or '[]'}  exits {lost or '[]'}"
+          f"   (* = crosses the keep line)")
+    print('dry run only: no state, flag or rank was changed')
+    return 0
+
+
 if __name__ == '__main__':
+    if '--rescore' in sys.argv:
+        sys.exit(_rescore_main())
     problems = domain.check(sys.modules[__name__])
     print(f'domain: {NAME}')
     for problem in problems:
