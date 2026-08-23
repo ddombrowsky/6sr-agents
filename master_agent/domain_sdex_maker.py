@@ -1677,6 +1677,15 @@ def prompt_facts():
         'unrealized_haircut': _haircut(),
         'executor': 'quote_executor.sync_quotes',
         'entry_point': 'quote(book, state, config)',
+        # The scoring sentence itself, built here rather than written as prose in
+        # master-agent.py, for exactly the reason in this function's docstring: the
+        # prompt stated a haircut the code did not enforce for weeks. score_path is
+        # the enforcer, so the sentence describing it lives next to it.
+        'score_formula': (
+            f'{STARTING_SCORE:.0f} + your execution edge in USD + a '
+            f'lower-of-cost-or-market floor on inventory you still hold'),
+        'score_source': ('/opt/trades/<name>.log (written only by the executor, on a '
+                         'fill) joined to the recorded mid at each fill time'),
     }
     st = _tool('stellar_trader')
     for key, attr in (('max_open_offers', 'MAX_OPEN_OFFERS'),
