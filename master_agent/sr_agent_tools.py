@@ -1,6 +1,7 @@
 import ast
 import json
 import operator
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -13,10 +14,23 @@ def get_uptime() -> str:
     return result.stdout.strip()
 
 
-def read_file(path: str, depth=None) -> str:
+def read_file(path: str, depth=None, line_start=None, line_end=None) -> str:
     try:
         with open(path) as f:
             content = f.read()
+        # Some models pass line_start/line_end expecting 1-indexed line ranges
+        # (a parameter they know from other agent environments). Honour it when
+        # present, since it is more specific than depth. Found in the wild
+        # 2026-08-23: glm-5.2:cloud called read_file(depth=200, path=...,
+        # line_start=120, line_end=260) and got an opaque TypeError.
+        if line_start is not None or line_end is not None:
+            lines = content.splitlines()
+            start = max(0, int(line_start) - 1) if line_start is not None else 0
+            end = min(len(lines), int(line_end)) if line_end is not None else len(lines)
+            selected = lines[start:end]
+            prefix = f'... ({start} lines before)\n' if start > 0 else ''
+            suffix = f'\n... ({len(lines) - end} more lines)' if end < len(lines) else ''
+            return prefix + '\n'.join(selected) + suffix
         # Some models pass depth=N expecting the first N lines (a parameter they
         # know from other agent environments). Honour it: it saves response
         # tokens and gives the model what it asked for. Found in the wild
@@ -148,7 +162,14 @@ def exec(command: str = '', cmd=None) -> str:
     # call; join it into a string so /bin/sh -c can run it.
     if not command and cmd is not None:
         if isinstance(cmd, list):
-            command = ' '.join(str(c) for c in cmd)
+            # shlex.join, not plain space-join: the model passes lists like
+            # ['bash', '-lc', 'some command with spaces'], and naive space-join
+            # produces 'bash -lc some command with spaces' where bash -c only
+            # takes 'some' as the command. shlex.join quotes the element with
+            # spaces: bash -lc 'some command with spaces'. Found in the wild
+            # 2026-08-23: clone_ae4a117bcfdd wasted ~10 tool calls on broken
+            # exec(cmd=[...]) invocations before working around it.
+            command = shlex.join(str(c) for c in cmd)
         else:
             command = str(cmd)
     if not command:
@@ -167,6 +188,36 @@ def exec(command: str = '', cmd=None) -> str:
     except Exception as e:
         return f'error: {e}'
 
+def search(path: str = '/opt', query: str = '', max_results: int = 20) -> str:
+    """Search for a text pattern in files under a directory (grep -rn).
+
+    Found in the wild 2026-08-23: the revision model tried calling a 'search'
+    tool that did not exist, wasting tool-call round-trips. This provides the
+    grep-based file content search the model was looking for.
+    """
+    if not query:
+        return 'error: no query provided'
+    if not path:
+        path = '/opt'
+    try:
+        result = subprocess.run(
+            ['grep', '-rn',
+             '--include=*.py', '--include=*.json', '--include=*.md',
+             '--include=*.txt', '--include=*.sh', '--include=*.cfg',
+             query, path],
+            capture_output=True, text=True, timeout=30)
+        output = result.stdout
+        if not output.strip():
+            return f'no matches for {query!r} in {path}'
+        lines = output.strip().splitlines()
+        if len(lines) > max_results:
+            shown = lines[:max_results]
+            return '\n'.join(shown) + f'\n... ({len(lines) - max_results} more matches)'
+        return '\n'.join(lines)
+    except subprocess.TimeoutExpired:
+        return 'error: search timed out after 30s'
+    except Exception as e:
+        return f'error: {e}'
 
 def backtest_strategy(strategy_path: str, days: float = 30, ticks_per_candle: int = 1,
                       interval: int = 60) -> str:
@@ -501,4 +552,5 @@ TOOLS = {
     'install_package': install_package,
     'update_package_list': update_package_list,
     'exec': exec,
+    'search': search,
 }

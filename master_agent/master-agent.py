@@ -610,6 +610,9 @@ def _build_sdex_revision_system_prompt():
     'back:\n'
     '  * Do NOT add an `assets` key to config.json. monitor deletes it on the next cycle, '
     'so it is wasted output, not a proposal.\n'
+    '  * config.json is strict JSON: no `//` or `/* */` comments, no trailing '
+    'commas. A config that does not parse is treated as an unreadable revision '
+    'and discarded.\n'
     '  * Do NOT define `decide_asset()`. Nothing calls it.\n'
     '  * Do NOT pass `asset=` to execute_trade. It refuses any asset this strategy does '
     'not declare, and the only thing a strategy can declare now is XLM. A candidate whose '
@@ -773,7 +776,7 @@ _GENERIC_TOOL_NAMES = frozenset((
     'calculate', 'get_current_time', 'get_uptime',
     'read_file', 'write_file', 'apply_patch', 'fetch_url', 'install_package',
     'update_package_list',
-    'exec',
+    'exec', 'search',
 ))
 
 # The one extra, domain-specific fitness-check tool each non-sdex domain gets on top of

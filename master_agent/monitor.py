@@ -751,6 +751,21 @@ def commit_revision(path, name, message):
     return True
 
 
+# After this many consecutive zero-budget cycles, force a revision to prevent
+# long droughts that waste the evolutionary purpose of the system. Found in the
+# wild 2026-08-22: three consecutive zero-budget cycles (10:14, 18:14, 02:18)
+# across 16+ hours at 8h/cycle, during which every newcomer got a random
+# parameter tweak and several clones of top performers never traded at all --
+# the market dropped ~5% over those cycles, and the tweaked thresholds no
+# longer intersected the price. Two consecutive zeros is still a meaningful
+# control arm; three is a drought. The counter is per-process, so it resets
+# when emperor.sh starts a new monitor window -- which is fine, since the
+# concern is consecutive cycles within a single long-running monitor, not
+# across restarts.
+MAX_CONSECUTIVE_ZERO_BUDGET = 2
+_consecutive_zero_budget = 0
+
+
 def _revision_budget():
     """How many revise-strategy calls this cycle may make: REVISIONS_PER_CYCLE or 0.
 
@@ -764,9 +779,23 @@ def _revision_budget():
     alone, which is what the revised batches are compared against.
 
     When in 'manual' mode, there is effectively no revision budget limit.
+
+    Hysteresis: after MAX_CONSECUTIVE_ZERO_BUDGET consecutive zero-budget cycles, force
+    a budget. This preserves the control-arm concept (some cycles have no LLM revision)
+    while preventing multi-cycle droughts where the system devolves to pure random jitter.
     """
+    global _consecutive_zero_budget
     if REVISION_MODE == 'manual': return 999999
-    return REVISIONS_PER_CYCLE if random.random() < REVISION_CHANCE else 0
+    if random.random() < REVISION_CHANCE:
+        _consecutive_zero_budget = 0
+        return REVISIONS_PER_CYCLE
+    _consecutive_zero_budget += 1
+    if _consecutive_zero_budget > MAX_CONSECUTIVE_ZERO_BUDGET:
+        print(f'Forcing revision budget after {MAX_CONSECUTIVE_ZERO_BUDGET} consecutive '
+              f'zero-budget cycles (REVISION_CHANCE={REVISION_CHANCE})')
+        _consecutive_zero_budget = 0
+        return REVISIONS_PER_CYCLE
+    return 0
 
 _REVISION_INTERPRETER_CHECKED = []
 
@@ -1153,6 +1182,24 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     if fired is not None:
         note = '  <-- will never trade; it is starting sterile' if fired == 0 else ''
         print(f'Backtest for {name}: {fired} trades over {DOMAIN.REPLAY_DAYS}d{note}')
+
+    # A random-tweak fallback that produces 0 trades is worse than a seeded config:
+    # the tweak nudged the parent's thresholds, but if the market moved since the
+    # parent's config was set, the tweaked band may not intersect the current price
+    # at all. Re-seed from the current observation so the clone at least fires.
+    # Found in the wild 2026-08-22: clones of top performers (clone_f43df64b3ded,
+    # clone_3e987c5823b9) that got random tweaks and never traded in 8h of
+    # production, while their parents traded actively -- the market dropped ~5%
+    # over those cycles.
+    if fired == 0 and fallback == 'random tweak' and cfg_path.exists():
+        print(f'Tweak produced 0 trades for {name}; re-seeding thresholds from current price')
+        DOMAIN.seed_config(cfg_path, name, obs)
+        result = DOMAIN.replay(strategy_dir)
+        fired = result['trades'] if result else None
+        if fired is not None:
+            note = '  <-- still sterile after re-seed' if fired == 0 else ''
+            print(f'Backtest for {name} (after re-seed): {fired} trades over {DOMAIN.REPLAY_DAYS}d{note}')
+
 
     origin = f'seed {name}' if seed_fallback else f'revise {name} from {parent_name}'
     commit_revision(strategy_dir, name,
