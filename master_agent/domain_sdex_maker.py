@@ -73,9 +73,9 @@ REPLAY_WINDOW = f'{REPLAY_DAYS}d of recorded order book joined to the executed t
 STRATEGIES_DIR = domain.STRATEGIES_DIR
 TRADES_DIR = domain.TRADES_DIR
 
-# Background daemons this domain needs alive. TWO, not one: the book recorder AND the tape
-# syncer. A maker with a book and no tape cannot tell whether anything filled, and a
-# strategy that fetched its own tape would be the rate-limit incident the single-writer
+# Background daemons this domain needs alive. TWO required, not one: the book recorder AND
+# the tape syncer. A maker with a book and no tape cannot tell whether anything filled, and
+# a strategy that fetched its own tape would be the rate-limit incident the single-writer
 # rule already exists to prevent.
 _RECORDER = {'script': Path('/opt/tools/market_recorder.py'), 'args': ['--daemon'],
              'pid': TRADES_DIR / '.market_recorder.pid',
@@ -84,6 +84,18 @@ _TAPE = {'script': Path('/opt/tools/dex_trades.py'), 'args': ['--sync-daemon'],
          'pid': TRADES_DIR / '.dex_trades.pid',
          'log': TRADES_DIR / 'dex_trades.log', 'match': 'dex_trades'}
 _JOBS = (_RECORDER, _TAPE)
+
+# And one OPTIONAL daemon: the per-ledger book from the Stellar RPC. Optional because it
+# is the only job here that needs a credential -- a bearer token for a private RPC -- and a
+# credential is a thing a fresh container legitimately does not have. Nothing in the loop
+# reads its output yet; it records at 5-second resolution what market_recorder records at
+# 60, and MAKER_PHASE1's edge decays to zero by 15 seconds, so the data has to start
+# accruing well before the replay that wants it. The RPC keeps only ~4 hours of history and
+# there is no backfill: a day not recorded is a day that cannot be recovered.
+_LEDGER = {'script': Path('/opt/tools/ledger_recorder.py'), 'args': ['--daemon'],
+           'pid': TRADES_DIR / '.ledger_recorder.pid',
+           'log': TRADES_DIR / 'ledger_recorder.log', 'match': 'ledger_recorder'}
+_OPTIONAL_JOBS = (_LEDGER,)
 
 # Genome bounds. The upper size bound is deliberately NOT a cap -- the real cap is
 # stellar_trader.MAX_RESTING_USD_PER_SIDE and it applies to live money only. This bounds
@@ -1593,21 +1605,59 @@ def _job_alive(job):
     return job['match'] in cmdline
 
 
+def _ledger_enabled():
+    """True when the ledger recorder is deployed AND has a bearer token configured.
+
+    Quiet on every failure, unlike _tool: this is asked once a cycle and the two "no"
+    answers -- the file has not been deployed, the token has not been set -- are both
+    normal states for a container that was never meant to run it. A line per cycle for a
+    job nobody asked for is how a log stops being read.
+    """
+    try:
+        if '/opt/tools' not in sys.path:
+            sys.path.append('/opt/tools')
+        import ledger_recorder
+        return bool(ledger_recorder.available())
+    except Exception:
+        return False
+
+
+def _active_jobs():
+    """The daemons that should be running right now: the required pair, plus the ledger
+    recorder only when it is both deployed and credentialled."""
+    return _JOBS + (_OPTIONAL_JOBS if _ledger_enabled() else ())
+
+
 def background_jobs_alive():
-    """True only if BOTH daemons are confirmed. A book with no tape cannot detect a fill."""
-    return all(_job_alive(job) for job in _JOBS)
+    """True only if every ACTIVE daemon is confirmed. A book with no tape cannot detect a
+    fill, so the required pair gates unconditionally.
+
+    The ledger recorder gates only once a token is configured, and that asymmetry is the
+    point. Gating on it unconditionally would make `monitor.py --ensure-recorder` exit 1 on
+    every container that never had an RPC credential -- turning a green check red for a job
+    nobody asked for, which trains an operator to ignore it. Not gating on it at all would
+    let a job somebody DID ask for die silently for a week, which on a feed with a 4-hour
+    retention window and no backfill is a week of data that cannot be recovered. Configuring
+    the token is the signal that it is wanted; from then on it is held to the same standard
+    as the other two.
+    """
+    return all(_job_alive(job) for job in _active_jobs())
 
 
 def ensure_background_jobs():
-    """Start the book recorder and the tape syncer if either is down, then report.
+    """Start any active daemon that is down, then report on all of them.
 
     _strategy_python(), never a bare python3: /usr/bin/python3 cannot import the packages
     in /opt/agents/venv, and a bare python3 is what made every revision fail silently for
     weeks in this codebase's history. setsid so the daemons outlive a TERM to monitor's
     process group -- they must survive a cycle and an emperor window.
+
+    The ledger recorder inherits this process's environment, which is where its
+    STELLAR_RPC_TOKEN comes from when it is set in the emperor environment rather than
+    written to /opt/.stellar_rpc.token.
     """
     TRADES_DIR.mkdir(parents=True, exist_ok=True)
-    for job in _JOBS:
+    for job in _active_jobs():
         if _job_alive(job):
             continue
         try:
@@ -1649,6 +1699,44 @@ def ensure_background_jobs():
                       f"{REPLAY_DAYS}d. Run dex_trades.backfill(days={REPLAY_DAYS}).")
         except Exception as e:
             print(f'trade tape unavailable ({e})')
+
+    _report_ledger_book()
+
+
+def _report_ledger_book():
+    """One line on the per-ledger book, or one line on why there is not one.
+
+    Silent when the recorder was never asked for; a container with no RPC credential is a
+    normal container and this is not a warning. Once a token IS configured, every failure
+    below is worth a line, because the data cannot be backfilled and a quiet failure is
+    indistinguishable from a quiet market until someone tries to replay the week.
+    """
+    if not _ledger_enabled():
+        return
+    ledger = _tool('ledger_recorder')
+    if ledger is None:
+        return
+    try:
+        covered = ledger.span()
+        rows = covered['rows']
+        if not rows:
+            print(f"Ledger book: no rows yet; check {_LEDGER['log']}")
+            return
+        age = round(time.time() - covered['last_ts']) if covered.get('last_ts') else None
+        print(f"Ledger book: {rows} ledgers over {covered['hours']}h, "
+              f"{covered['gaps']} gaps; last close {age}s ago")
+        # Ledgers close every ~5s, so a minute of silence is already many missed closes.
+        # Deliberately tighter than market_recorder's 300s threshold above: that file is
+        # written once a minute, this one twelve times as often, and reusing the same
+        # number would let this daemon be dead for fifty closes before anyone noticed.
+        if age is not None and age > 60:
+            print(f"WARNING: ledger book is {age}s stale; the RPC retains only ~4h and "
+                  f"nothing here can be backfilled. Check {_LEDGER['log']}")
+        if covered['gaps']:
+            print(f"NOTE: {covered['gaps']} gaps in the recorded ledger sequence -- "
+                  f"windows the recorder was down for. A replay must not span one.")
+    except Exception as e:
+        print(f'ledger book unavailable ({e})')
 
 
 # --------------------------------------------------------------------------------------
