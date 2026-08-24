@@ -187,6 +187,13 @@ _STARTUP_MTIMES = _watched_mtimes()
 
 def dispatch(tool_call) -> dict:
     name = tool_call['function']['name']
+    # Strip a leading 'functions/' prefix -- the model sometimes names tools with
+    # the Ollama API's nesting (e.g. 'functions/read_file'), which is not a registered
+    # tool name. Found in the wild 2026-08-23: the model called functions/read_file
+    # in two consecutive cycles, each wasting a tool-call round-trip on "unknown
+    # tool functions/read_file".
+    if name.startswith('functions/'):
+        name = name[len('functions/'):]
     args = tool_call['function']['arguments']
     # Some Ollama versions return arguments as a JSON string rather than a parsed
     # dict. Parse it so fn(**args) works either way; an unparseable string degrades
@@ -2317,6 +2324,102 @@ def _explore_prompt_kalshi(strategy_name, strategy_path, leaderboard, tick_line)
     )
 
 
+def _refine_prompt_maker(strategy_name, parent_name, strategy_path, parent_score,
+                          leaderboard, price_line) -> str:
+    """The maker domain's clone case. Parallel to _refine_prompt, minus the
+    threshold-trader concepts (buy_below/sell_above) that have no maker meaning.
+
+    The generic _refine_prompt ends with 'Any buy_below/sell_above you set must be
+    anchored to the current price' -- wrong for a maker that has no buy/sell thresholds,
+    only half_width_bp/quote_size_usd/inventory_skew_bp. The system prompt is already
+    maker-specific (_build_maker_revision_system_prompt); this makes the user prompt
+    match it.
+    """
+    parent_path = STRATEGIES_DIR / parent_name
+    parent_config = _read_json(parent_path / 'config.json', {})
+    parent_state = _read_json(parent_path / 'state.json', {})
+    trade_tail = _tail_lines(TRADES_DIR / f'{parent_name}.log')
+    clone_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'A new clone `{strategy_name}` of `{parent_name}` was just created at '
+        f'`{strategy_path}`. It has not started quoting yet.\n\n'
+        f'{price_line}'
+        f"Parent `{parent_name}`'s config.json: {json.dumps(parent_config)}\n"
+        f"Parent `{parent_name}`'s current state.json: {json.dumps(parent_state)}\n"
+        f"Parent `{parent_name}`'s score this cycle: {parent_score}\n"
+        f"Parent `{parent_name}`'s most recent trades:\n{trade_tail}\n\n"
+        f"The clone's main.py (identical to the parent's right now -- this is what you'd "
+        f"edit to change quoting logic, not just config.json):\n```python\n{clone_main_py}\n```\n\n"
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
+        f'Revise the clone at `{strategy_path}` however you think will improve on its '
+        f'parent, then commit your changes to a new git branch inside that directory. '
+        f'The entry point is `quote(book, state, config)` -- test your revision with '
+        f'`backtest_maker_strategy` and check that `decide_source` is '
+        f'"main.py:quote" and `beats_null` is true before committing.'
+    )
+
+
+def _explore_prompt_maker(strategy_name, strategy_path, leaderboard, price_line) -> str:
+    """The maker domain's template-spawn case. Parallel to _explore_prompt, but
+    references quote()/backtest_maker_strategy/beats_null instead of
+    decide()/backtest_strategy/beats_buy_hold, and maker config knobs instead
+    of buy_below/sell_above.
+
+    The generic _explore_prompt is written for the sdex threshold-trader domain
+    and sends the model wrong instructions about the entry point, fitness tool,
+    and config requirements. Found in the wild 2026-08-23: explore spawns on the
+    maker domain were told to check decide_source "main.py:decide" and run
+    backtest_strategy, neither of which exists for a maker strategy.
+    """
+    own_config = _read_json(strategy_path / 'config.json', {})
+    own_main_py = _read_text(strategy_path / 'main.py')
+    return (
+        f'`{strategy_name}` was just created at `{strategy_path}`. It is a fresh, '
+        f'unmodified checkout of /opt/template_repo_maker -- NOT a clone of any existing '
+        f'strategy. It has no parent, no trade history and no track record, so there is '
+        f'nothing here to improve on. Your job this time is EXPLORATION: give the '
+        f'population a strategy that is structurally different from what it already '
+        f'runs.\n\n'
+        f'{price_line}'
+        f'Its config.json right now: {json.dumps(own_config)}\n'
+        f'Note the template ships inert (half_width_bp=0, quote_size_usd=0). monitor.py '
+        f'checks the config you leave behind: `name` must still be exactly '
+        f'"{strategy_name}", and the maker knobs (half_width_bp, quote_size_usd, '
+        f'inventory_band_usd, inventory_skew_bp, refresh_interval_s) must be present and '
+        f'in range. If you leave them at 0, monitor will seed them from the current '
+        f'market -- but that is a mechanical default, not a revision. Even if your logic '
+        f'does not use the standard knobs at all, you must still leave a config that '
+        f'monitor can accept.\n\n'
+        f'CONFIG.JSON IS YOURS TO EXTEND beyond those required keys -- the whole dict '
+        f'reaches your `quote(book, state, config)` unchanged, in live trading and '
+        f'backtest_maker_strategy alike. A new width rule, a volatility-adjusted floor, '
+        f'a dynamic skew factor -- whatever your logic needs belongs in config.json under '
+        f'a name that says what it means, not hardcoded in main.py. Two rules:\n'
+        f'  * ALWAYS read your own keys as `config.get("your_key", <sensible '
+        f'default>)`, never `config["your_key"]` -- a KeyError on the first tick fails '
+        f'the smoke test and is reverted.\n'
+        f'  * Do not rename, repurpose or drop `name`, `schema_version`, or the '
+        f'standard maker knobs. Add alongside them.\n\n'
+        f'Its main.py (the unmodified maker template -- a starting point, not a '
+        f"parent's proven code, so you are free to restructure it, but keep main() and "
+        f"its `if __name__ == '__main__':` guard):\n"
+        f'```python\n{own_main_py}\n```\n\n'
+        f'{_population_census()}\n\n'
+        f'Current leaderboard (strategy name -> score, all strategies currently '
+        f'running): {json.dumps(leaderboard)}\n\n'
+        f'Write something the census above shows the population is NOT already doing -- '
+        f'a config-only nudge is a wasted slot here, since every unrevised template spawn '
+        f'gets one for free. The unused signal modules named above are the concrete open '
+        f'directions. Whatever you write, the entry point is `quote(book, state, config)` '
+        f'-- a top-level `quote()` must remain importable (decide_source "main.py:quote", '
+        f'not a fallback) and `beats_null` must come back true. Run '
+        f'`backtest_maker_strategy` and iterate until it passes. Do NOT add a '
+        f'`decide()` wrapper -- the entry point is `quote()`, not `decide()`.\n\n'
+        f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
+    )
+
+
 def _compose_revision_messages(strategy_name: str, parent_name: str, parent_score: str,
                                 leaderboard_json: str, observation: str, role: str):
     """Build the exact messages a revision turn would open with, no model call.
@@ -2385,6 +2488,13 @@ def _compose_revision_messages(strategy_name: str, parent_name: str, parent_scor
                                            price_line)
         else:
             prompt = _refine_prompt_yield(strategy_name, parent_name, strategy_path,
+                                          parent_score, leaderboard, price_line)
+    elif _DOMAIN.NAME == 'sdex_maker':
+        if role == ROLE_EXPLORE:
+            prompt = _explore_prompt_maker(strategy_name, strategy_path, leaderboard,
+                                           price_line)
+        else:
+            prompt = _refine_prompt_maker(strategy_name, parent_name, strategy_path,
                                           parent_score, leaderboard, price_line)
     elif role == ROLE_EXPLORE:
         prompt = _explore_prompt(strategy_name, strategy_path, leaderboard, price_line)
