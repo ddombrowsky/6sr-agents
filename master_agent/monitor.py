@@ -412,26 +412,23 @@ def save_state(state):
 def compute_strategy_score(strategy_name, state_entry, obs):
     score = DOMAIN.score_path(state_entry['path'], obs)
     if score is None:
-        print(f'Error reading state for {strategy_name}')
+        # Distinguish "just started, no state.json yet" (expected for a strategy
+        # started in this cycle's backfill or clone loop) from a genuine read
+        # error. A strategy started moments before scoring may not have written
+        # state.json yet -- the null domain resolves instantly but the strategy
+        # still needs at least one tick to write state. The -inf is correct
+        # (sorts it below strategies that have proven something), but "Error
+        # reading state" read as a bug rather than the expected cold-start timing
+        # it is. Found in the wild 2026-08-23: seed_cd1093861021 scored -inf in
+        # the cycle it was started, then scored 1014.5 the next cycle with no
+        # intervention.
+        state_json = Path(state_entry['path']) / 'state.json'
+        if not state_json.exists():
+            print(f'No state.json yet for {strategy_name} (just started this cycle)')
+        else:
+            print(f'Error reading state for {strategy_name}')
         return -float('inf')
     return score
-
-
-def fmt_age(seconds):
-    """A duration a human can read at whatever cadence this domain runs at.
-
-    Every age and grace period in this loop used to be printed as `{s / 3600:.0f}h`,
-    which is fine at CYCLE_SLEEP=3600 and nonsense below it: with domain_null's PACING
-    (120s cycles, a 360s grace) the cull message read "only 0.1h old, below 0h grace
-    period" -- a strategy skipped for being younger than nothing. The numbers were right
-    and the sentence was not, which is the worst way for a log to be wrong.
-    """
-    seconds = max(0.0, float(seconds))
-    if seconds < 90:
-        return f'{seconds:.0f}s'
-    if seconds < 5400:
-        return f'{seconds / 60:.0f}m'
-    return f'{seconds / 3600:.1f}h'
 
 
 def strategy_age_s(state_entry):
@@ -505,10 +502,10 @@ def print_idle_report(performances, state, trade_counts, obs):
         trades = trade_counts.get(name, 0)
         if is_idle(name, trades, entry):
             age = strategy_age_s(entry) or 0
-            idle.append(f'{name} ({fmt_age(age)})')
+            idle.append(f'{name} ({age / 3600:.0f}h)')
     if idle:
         print(f'Idle: {len(idle)} of {len(performances)} strategies have never acted after '
-              f'{fmt_age(IDLE_GRACE_S)} (ranked below every strategy that has): '
+              f'{IDLE_GRACE_S / 3600:.0f}h (ranked below every strategy that has): '
               f'{domain.first_few(idle)}')
     stuck = DOMAIN.stuck_report(performances, state, obs)
     if stuck:
@@ -1807,8 +1804,8 @@ def run():
                     continue
                 age = strategy_age_s(info)
                 if age is not None and age < YOUNG_GRACE_S and name not in idle_names:
-                    print(f'Skipping cull for {name}: only {fmt_age(age)} old, below '
-                          f'the {fmt_age(YOUNG_GRACE_S)} grace period (rank alone is not '
+                    print(f'Skipping cull for {name}: only {age / 3600:.1f}h old, below '
+                          f'{YOUNG_GRACE_S / 3600:.0f}h grace period (rank alone is not '
                           f'enough evidence yet)')
                     continue
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')

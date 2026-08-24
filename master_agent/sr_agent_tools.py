@@ -22,6 +22,13 @@ def read_file(path: str = '', depth=None, line_start=None, line_end=None,
     # read_file(path=..., line_start=200, line_end=400) and
     # read_file(path=..., lines_start=200, lines_end=400), both wasting a
     # tool-call round-trip on a TypeError.
+    #
+    # Strip whitespace: the model sometimes passes a path with a leading or
+    # trailing space (found in the wild 2026-08-23: read_file(path=' /opt/...')
+    # returned "No such file or directory" for a file that existed), which
+    # wastes a round-trip on an opaque error.
+    if path:
+        path = path.strip()
     start = line_start if line_start is not None else lines_start
     end = line_end if line_end is not None else lines_end
     try:
@@ -47,6 +54,14 @@ def read_file(path: str = '', depth=None, line_start=None, line_end=None,
         # tokens and gives the model what it asked for. Found in the wild
         # 2026-08-22: glm-5.2:cloud called read_file(path=..., depth=200) and
         # got an opaque TypeError, wasting a tool-call round-trip.
+        #
+        # BUT: for small files (<= 50 lines), depth is almost always a mistake
+        # or a reflex -- the model called read_file(depth=1, path='config.json')
+        # and got just "{" (the first line of a 5-line JSON), then had to call
+        # read_file(depth=200, ...) to get the actual content (found in the wild
+        # 2026-08-23 on seed_f3bae3e23122). Returning the whole file when it is
+        # small costs nothing and saves a round trip. The threshold is generous:
+        # main.py files run 200-400 lines and should still be paged.
         if depth is not None:
             try:
                 depth = int(depth)
@@ -54,17 +69,20 @@ def read_file(path: str = '', depth=None, line_start=None, line_end=None,
                 depth = None
             if depth is not None and depth > 0:
                 file_lines = content.splitlines()
-                if len(file_lines) > depth:
+                if len(file_lines) <= 50:
+                    pass  # small file: return full content, ignore depth
+                elif len(file_lines) > depth:
                     content = '\n'.join(file_lines[:depth]) + f'\n... ({len(file_lines) - depth} more lines)'
         return content
     except Exception as e:
         return f'error: {e}'
 
 def write_file(path: str = '', content: str = '') -> str:
-    if not path:
+    if not path or not path.strip():
         return ('error: write_file requires a "path" argument. '
                 'You provided content but no path. '
                 'Call write_file(path="/path/to/file", content="...")')
+    path = path.strip()
     try:
         with open(path, 'w') as f:
             f.write(content)
@@ -149,6 +167,13 @@ def _eval_node(node):
         return _OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
         return _OPS[type(node.op)](_eval_node(node.operand))
+    if isinstance(node, ast.Name):
+        raise ValueError(
+            f'calculate does not support variables ({node.id!r}). It only '
+            f'evaluates literal numeric expressions with +, -, *, /, **. '
+            f'Use `exec` with Python for anything involving variables or '
+            f'symbolic math.'
+        )
     raise ValueError(f'unsupported expression: {ast.dump(node)}')
 
 
@@ -163,7 +188,7 @@ def get_current_time() -> str:
     return datetime.now().isoformat()
 
 
-def exec(command: str = '', cmd=None) -> str:
+def exec(command: str = '', cmd=None, timeout=None) -> str:
     # Accept cmd as an alias for command. glm-5.2:cloud repeatedly calls
     # exec(cmd=...) instead of exec(command=...) -- 5 times in one cycle
     # (2026-08-22), each wasting a tool-call round-trip even with the seventh
@@ -184,29 +209,45 @@ def exec(command: str = '', cmd=None) -> str:
             command = str(cmd)
     if not command:
         return 'error: no command provided'
+    # Accept a timeout parameter. Found in the wild 2026-08-23: the model
+    # called exec(cmd=[...], timeout=120000) and got a TypeError, wasting a
+    # round-trip. The model likely means milliseconds (120000 ms = 120 s), so
+    # values above 1000 are divided by 1000. Capped at 600s for safety.
+    exec_timeout = 120
+    if timeout is not None:
+        try:
+            t = int(timeout)
+            if t > 1000:
+                t = t // 1000  # treat as milliseconds
+            exec_timeout = max(1, min(t, 600))
+        except (TypeError, ValueError):
+            pass
     try:
         result = subprocess.run(
             ['/bin/sh', '-c', command],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=exec_timeout,
         )
         output = result.stdout + result.stderr
         if result.returncode != 0:
             output += f'\n[exit code {result.returncode}]'
         return output
     except subprocess.TimeoutExpired:
-        return 'error: timed out after 120s'
+        return f'error: timed out after {exec_timeout}s'
     except Exception as e:
         return f'error: {e}'
 
-def search(path: str = '/opt', query: str = '', max_results: int = 20) -> str:
+def search(path: str = '/opt', query: str = '', pattern: str = '', max_results: int = 20) -> str:
     """Search for a text pattern in files under a directory (grep -rn).
 
     Found in the wild 2026-08-23: the revision model tried calling a 'search'
     tool that did not exist, wasting tool-call round-trips. This provides the
-    grep-based file content search the model was looking for.
+    grep-based file content search the model was looking for. `pattern` is
+    accepted as an alias for `query` because the model uses both spellings
+    (some agent environments name the parameter `pattern`, others `query`).
     """
-    if not query:
-        return 'error: no query provided'
+    search_query = query or pattern
+    if not search_query:
+        return 'error: no query provided (pass query= or pattern=)'
     if not path:
         path = '/opt'
     try:
@@ -214,11 +255,11 @@ def search(path: str = '/opt', query: str = '', max_results: int = 20) -> str:
             ['grep', '-rn',
              '--include=*.py', '--include=*.json', '--include=*.md',
              '--include=*.txt', '--include=*.sh', '--include=*.cfg',
-             query, path],
+             search_query, path],
             capture_output=True, text=True, timeout=30)
         output = result.stdout
         if not output.strip():
-            return f'no matches for {query!r} in {path}'
+            return f'no matches for {search_query!r} in {path}'
         lines = output.strip().splitlines()
         if len(lines) > max_results:
             shown = lines[:max_results]
@@ -539,37 +580,7 @@ def get_market_regime(hours: int = 720, buy_below: float = 0, sell_above: float 
         return f'error: {type(e).__name__}: {e}'
 
 
-def search_files(path: str = '', pattern: str = '', query: str = '', max_results: int = 20) -> str:
-    """Grep for a text pattern in files under a directory. Returns matching lines with file:line: prefixes.
-
-    The model sometimes calls this 'search' (a tool name it knows from other agent
-    environments). Accepted as a generic tool across all domains.
-    """
-    search_pattern = pattern or query
-    if not search_pattern:
-        return 'error: no search pattern provided (pass pattern= or query=)'
-    if not path:
-        path = '/opt/strategies'
-    try:
-        result = subprocess.run(
-            ['grep', '-rn', '--include=*.py', '--include=*.json', '-I',
-             search_pattern, path],
-            capture_output=True, text=True, timeout=30)
-        lines = (result.stdout or '').strip().splitlines()
-        if not lines:
-            return f'no matches for {search_pattern!r} in {path}'
-        max_results = int(max_results) if max_results else 20
-        if len(lines) > max_results:
-            shown = lines[:max_results]
-            return '\n'.join(shown) + f'\n... ({len(lines) - max_results} more matches)'
-        return '\n'.join(lines)
-    except subprocess.TimeoutExpired:
-        return 'error: search timed out after 30s'
-    except Exception as e:
-        return f'error: {e}'
-
 TOOLS = {
-    'search': search_files,
     'get_market_regime': get_market_regime,
     'get_dex_cex_basis': get_dex_cex_basis,
     'get_friction': get_friction,

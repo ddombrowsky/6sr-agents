@@ -80,7 +80,7 @@ def _commit_clone_metadata(target, name):
     that replied in prose and never called a tool (clone_a006e0460235, 2026-08-04 --
     it printed a main.py diff in its final message and wrote nothing) was recorded as
     a successful "(llm)" revision, the apply_random_tweak fallback was skipped
-    because `revised` stayed True, and a byte-identical copy of the parent was
+    because `revised` stayed True, and a byte-identical copy of its parent was
     started. The gate's own docstring names that exact scenario as what it prevents.
 
     The rewrite belongs to the clone, not to the revision, so commit it here and let
@@ -224,6 +224,19 @@ def prune_zombies():
         del state[name]
     if zombies:
         save_state(state)
+        # When a full batch (3+) is pruned at once, the previous monitor.py run was
+        # almost certainly killed mid-cycle after provisioning but before the
+        # strategies could write state.json. The revision work (LLM calls, smoke
+        # tests, git commits) for those strategies is entirely wasted. Logging this
+        # prominently helps the emperor review pass distinguish "normal churn" from
+        # "a whole cycle was lost" when reading the monitor log. Found in the wild
+        # 2026-08-23: 3 strategies from the 21:54 cycle were pruned at 22:03 because
+        # the previous monitor (pid 663) had been killed.
+        if len(zombies) >= 3:
+            print(f'WARNING: {len(zombies)} strategies pruned this cycle -- the previous '
+                  f'monitor.py run was likely killed mid-cycle after provisioning but '
+                  f'before these strategies could write state.json. The previous cycle\'s '
+                  f'revision work for these strategies is lost.')
     return zombies
 
 def rm_strategy(name):
