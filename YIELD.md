@@ -1,8 +1,9 @@
 # YIELD.md — yield rotation across Stellar's lending and reward venues
 
-**Written 2026-08-21. Amended 2026-08-21** after the open questions at the bottom were
-answered; the amendments are marked inline, and every one of them narrows the case rather
-than widens it.
+**Written 2026-08-21. Amended 2026-08-21. CLOSED 2026-08-24** — see the OUTCOME
+section below, which supersedes everything after it. The amendments were made after the
+open questions at the bottom were answered; they are marked inline, and every one of them
+narrows the case rather than widens it.
 
 A candidate domain: allocate capital across Aquarius reward pools
 and Blend's two main lending pools (YieldBlox and Fixed), rotating as their rates move.
@@ -13,6 +14,218 @@ phase structure would be premature here, because the cheap test below can end th
 FUTURE.md's ranked item 9 is the one-line version. This is the argument.
 
 ---
+
+## OUTCOME — closed 2026-08-24. Killed by its own measurement 2.
+
+**Everything below this section is the plan as written on 2026-08-21, kept as history.**
+The domain was built, deployed to `ssr_agent01` as `DOMAIN=yield`, and run 2026-08-21 →
+2026-08-24. Measurement 2 — the kill criterion this document set — returns **zero**. Do
+not spend further time on rotation across Blend in the expectation that an edge is in
+there; there is not one, and the reason is structural rather than a tuning problem.
+
+**The machinery is not what failed**, again. The contract carried a fifth domain with no
+special-casing in `monitor.py`, `score_path` recomputed returns honestly from evidence,
+and the leaderboard reported the true answer on its first cycle. This is a negative result
+about the *venue*, and — see §5 — a positive result about how cheaply this system can now
+kill a bad domain, reached expensively.
+
+### 1. The kill criterion, answered: the ceiling is zero
+
+Measurement 2 asks what a perfect-foresight rotator earns against the best static
+allocation. Computed over the recorder's full history — 790 samples, 2026-08-21 17:52 →
+2026-08-24 11:44, 65.7h — net of `yield_replay.py`'s cost model, at a range of book sizes
+with the eligibility floor set equal to the book:
+
+| book = floor | null (static best) | optimal rotation | headroom | oracle rotations |
+|---|---|---|---|---|
+| $60 | 8.05% | 8.05% | **0.00 pp** | 0 |
+| $250 | 6.54% | 6.57% | 0.03 pp | 0 |
+| $1,000 | 6.54% | 6.57% | 0.02 pp | 0 |
+| $5,000 | 6.54% | 6.54% | 0.00 pp | 0 |
+| $25,000 | 6.54% | 6.54% | 0.00 pp | 0 |
+| $100,000 | 6.53% | 6.53% | 0.00 pp | 0 |
+
+An oracle holding the entire future rate history **declines to rotate at any size.** This
+document's test — "if it beats sitting still by one percent of APY, the domain is dead
+before it starts" — is not narrowly failed, it is failed at zero. There is no rotation
+edge, so no strategy, genome or revision model can find one.
+
+### 2. Measurement 1: the ranking does flip, and the flips are worth less than the trade
+
+Flip counts over the same 790 samples, by eligibility floor:
+
+- **$60** — zero flips. YieldBlox/PYUSD leads in 790 of 790 samples.
+- **$1,000 and $10,000** — one flip. YieldBlox/USDC leads 404 samples, Fixed/USDC 386.
+- **$100,000** — two flips. Fixed/USDC 700, YieldBlox/USDC 90.
+
+So the ordering is not frozen at realistic size, and measurement 1 taken alone looks
+survivable. It is not, because the two contenders are the same asset in two pools whose
+*diluted* rates sit within a few basis points of each other. §1's headroom is the entire
+value of acting on every flip with perfect foresight: **2–3 bp of annualized APY**. A flip
+persists roughly 32h, so capturing one is worth on the order of 0.01 bp of NAV, against
+`SAME_ASSET_BP = 1.0` — one basis point of NAV, paid outright, per rotation. The crossing
+costs about two orders of magnitude more than the flip is worth. That is why the oracle
+sits still.
+
+This is the trap in measurement 1 as this document wrote it. "How often does the ranking
+flip, and by how much?" treats the two clauses as equally weighted; the second one carries
+the entire result, and the first can pass while the domain is dead. **Measurement 2 is the
+only one that matters, and it is the one that was run last.**
+
+### 3. The leaderboard was correct, and it read as broken
+
+At shutdown: 51 registered strategies, 45 with enough covered history to score, 6 too young.
+Eighteen of the top thirty sat at exactly **1000.00**.
+
+That is `STARTING_SCORE` plus an annualized excess of zero over the null — i.e. tied the
+benchmark, which §1 establishes is the ceiling. The score looking stuck was the domain
+reporting, correctly and on its first cycle, that the population had found the optimum and
+there was nothing above it. Scores *below* 1000 are strategies that failed to sit still;
+`seed_dcdbb185a679` earned 2.4 bp against the null's 4.2 bp over 46.1h, which annualizes to
+−342 bp and a score of 657.
+
+The population held **46 distinct genomes across 51 strategies** — variance was not the
+problem — and all of them converged on the same score, because all five knobs are inert
+here:
+
+- `min_edge_bp` never binds; the ordering effectively never changes.
+- `max_venues > 1` is strictly punished. The equal-weight null returns **−2.3% to −3.3%**
+  annualized depending on book size: breadth pays turnover for nothing.
+- `min_free_liquidity_usd` is worse than inert, it is *inverted* — see §4.
+- `rebalance_hours` gates a rotation that should never happen.
+- `emission_weight` multiplied **zero for the entire run**: across all 15,840 venue-samples
+  in the window, not one venue reported a non-zero `emission_apr`. The knob this document
+  called "section 1's asymmetric friction made searchable" could not be searched at all.
+
+  **Unresolved:** `domain_yield.py`'s own docstring records Etherfuse paying "1.67% + 2.98%
+  of BLND emissions" on 2026-08-21, the day the recorder started. Either Blend emissions
+  genuinely went to zero across the whole reward zone that day, or `yield_venues.py` stopped
+  populating `emission_apr`. Worth ten minutes before any of this code is reused, and it
+  does not affect §1 either way — emissions would have to be large *and* volatile to create
+  rotation headroom, and the base-rate result says the venues do not diverge.
+
+### 4. A benchmark bug hid the shape of it
+
+`yield_replay.py:392`:
+
+```python
+def _eligible(venues, floor=MIN_FREE_LIQUIDITY_USD):
+```
+
+Default arguments bind at import. `MIN_FREE_LIQUIDITY_USD = BOOK_USD` is evaluated once, so
+**raising `BOOK_USD` does not raise the eligibility floor** — every call site that omits
+`floor` keeps judging at $60 forever, and both nulls plus `optimal_rotation` omit it.
+Raising the book makes shallow venues worse through dilution, exactly as the `BOOK_USD`
+comment promises, but never excludes them, exactly as the `MIN_FREE_LIQUIDITY_USD` comment
+promises it will.
+
+```python
+def _eligible(venues, floor=None):
+    floor = MIN_FREE_LIQUIDITY_USD if floor is None else floor
+```
+
+Consequence for this run: the entire live population was ranked against **YieldBlox/PYUSD,
+a pool holding $220–221 of free liquidity, constant across all 790 samples** — 3.7 books at
+the $60 floor. Any strategy whose genome drew a sane real-money `min_free_liquidity_usd`
+was structurally barred from the only venue that could tie the null, and could therefore
+only score below 1000. The loop spent three days selecting *against* the one trait you would
+want before touching real money.
+
+Note what this is an instance of. The comment above `MIN_FREE_LIQUIDITY_USD` explains that
+the arbitrary $1000 it replaced "came to be enforced against the benchmark and not against
+the strategies the benchmark judges." The replacement reintroduced an inconsistency of the
+same shape, by a different mechanism, in the same expression that fixed it. It did not
+change the verdict — §1's table applies the floor correctly and still returns zero — but it
+is why the run's own leaderboard was measuring a dust pool.
+
+### 5. Criterion 9 called this in advance, and the process failure is the reusable part
+
+FUTURE.md's criterion 9 names this exact failure by name: *"a domain where the null strategy
+is the optimal strategy (passively supplying a lending pool, say) — there the population
+converges in one cycle and there is nothing left to evolve."*
+
+This document's opening section answers that objection directly: cross-venue allocation is a
+fourth design, and "null equals optimal" was an argument about *one* pool, defeated by
+venues "whose rates are driven by independent mechanisms — Aquarius by voted emissions,
+Blend by utilization."
+
+**That rebuttal did not survive its own amendment.** The Aquarius half was retired the same
+day — "one moving, one nearly static" — which leaves Blend alone, and Blend alone is the
+single-pool case criterion 9 named. The amendment even states the consequence ("a direct hit
+on measurement 1: a ranking flip needs both sides to move"). The premise for the whole domain
+was withdrawn in writing before implementation began, and implementation began anyway.
+
+The cost of not stopping there:
+
+| | lines |
+|---|---|
+| `master_agent/domain_yield.py` | 1,069 |
+| `tools/yield_venues.py` | 737 |
+| `tools/yield_replay.py` | 559 |
+| `template_repo_yield/main.py` | 478 |
+| `tools/yield_recorder.py` | 269 |
+| `tools/yield_backtest.py` | 258 |
+| **total** | **3,370** |
+
+plus a container bootstrap and a three-day run of 51 strategies against a frontier model.
+This document said: *"Get the number before writing a line of `domain_yield.py`."* The
+number was obtained after all 3,370 of them, and once the recorder had data it took
+minutes to compute. `MAKER.md` got this ordering right — phase 0 records, phase 1 answers
+a pre-registered kill criterion, and only then does a domain module exist. This document
+declared the same discipline and did not follow it.
+
+**The lesson is not "measure first" — that was already written down.** It is that a
+kill criterion has to be attached to something that *blocks*, because a plan cannot enforce
+itself. The recorder needed to run before the measurement either way; the mistake was
+building the domain during the wait rather than only the measurement.
+
+### The honest caveat
+
+This is 2.7 days of live recorder, not the months of backfill this document asked for.
+That is the one real reservation and it should be stated plainly.
+
+The mechanism argues the answer will not change. Blend supply APY is a mechanical function
+of utilization; a deep pool's utilization moves slowly; and the two contenders at realistic
+size are USDC in two pools that track each other. §1's result is not a small-sample
+artifact — an oracle declining to rotate at *every* size tested is a statement that the
+gaps are narrower than the crossing cost, and gaps that narrow do not widen because you
+observed them longer.
+
+What a longer history could show is a **stressed regime**: a utilization spike driving one
+pool's supply rate far above another's, for long enough to pay the crossing. Nothing like
+that occurred in the window. That is the only thing that could reopen the item, and §"What
+would have to be true" says how to check it without rebuilding anything.
+
+### What would have to be true to revisit this
+
+1. **A stressed regime, verified offline.** Replay archived pool events (the Hubble/BigQuery
+   `crypto-stellar` or Galexie route already flagged above — pick the source before promising
+   the backfill) and re-run §1's table across a period containing a real utilization shock.
+   If the oracle still declines to rotate, the item is closed permanently. This needs no
+   capital, no domain module and no population, and it is the *only* measurement worth
+   spending time on here.
+2. **Not Aquarius**, per the amendment above. A mechanism being replaced cannot be
+   backtested, and a perfect-foresight number computed against the outgoing voting system
+   measures a game no longer on offer.
+3. **Not by making the domain smarter.** Every knob in the genome operates on a decision the
+   oracle says should never be made. Revision, tweaking, a better `main.py` and a longer
+   `RANK_GRACE_S` all search a space whose maximum is zero.
+
+### What the run left behind
+
+Stopped 2026-08-24: 51 strategy processes wound down and `emperor` stopped via supervisor at
+11:37 (verified — zero `strategies/*/main.py` processes remain, `supervisorctl` reports
+`emperor STOPPED`). Nothing was promoted and nothing could have been: `live_enabled()` and
+`can_execute_live()` are constant `False` in this domain, so no real money was ever at risk.
+
+The code is kept rather than deleted. `domain_yield.py`, `template_repo_yield/` and
+`tools/yield_*.py` are the record that the domain contract carried a fifth domain with none
+of sdex's furniture and no special-casing in `monitor.py` — the same reusable positive
+`KALSHI.md` recorded. `yield_recorder.py`'s accumulated history is the input to revisit-test
+1 and should not be discarded.
+
+---
+
 
 ## First: correcting the rejection
 

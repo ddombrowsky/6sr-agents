@@ -48,7 +48,16 @@ from.
    `MAX_TOTAL_NONBASE_EXPOSURE_USD` $8, no domain here earns meaningfully, so the real
    question a candidate must answer is **what running it teaches** that the last run
    didn't. Two paper domains have already returned "the loop selects noise"; a third that
-   returns the same is not worth a week.
+   returns the same is not worth a week. **Updated 2026-08-24:** `domain_yield.py` made it
+   three, with a variant worth distinguishing — it did not select noise, it had nothing to
+   select, because the null was optimal (criterion 9) and every genome tied it. Across five
+   domains the evolving population has now never once found an edge, and the one real edge
+   in this repo — `MAKER_PHASE1.md`'s 5–6bp ridge — was found by a human sweeping
+   parameters, not by the loop. Whether the loop works at all is therefore still untested,
+   because every domain so far had scoring that was either noise-dominated or zero-variance.
+   Testing it needs a *deterministic* scorer (a fixed dataset and a held-out split), which
+   is item 6's infrastructure minus the competition, and it is the precondition for
+   believing any answer this system gives.
 9. **Can the mutation operator produce real variance?** The population once held 141
    `main.py` files with ~10 distinct hashes because `apply_random_tweak` only scales
    thresholds. If a candidate's genome is also a bag of numbers, it degenerates the same
@@ -279,9 +288,29 @@ information as the only route that creates a forecasting edge *and* the one most
 already occupied — but that judgement was about NWS data behind a 1.0¢ professional quote.
 Stellar on-chain flow at $4 a trade is a much less crowded corner.
 
-### 9. Yield rotation across Aquarius and Blend — **see `YIELD.md`**
+### 9. [CLOSED 2026-08-24] Yield rotation across Aquarius and Blend — **see `YIELD.md`**
 
-**Added 2026-08-21. Planned in `YIELD.md`, which supersedes this summary.** Allocate capital
+**Built, run for three days, and closed. Killed by its own pre-registered kill criterion —
+see `YIELD.md`'s OUTCOME section.** A perfect-foresight rotator holding the entire future
+rate history earns **0.00pp** over allocate-once-and-sit, and declines to rotate at every
+book size from $60 to $100k. The ranking does flip at realistic size, but the contenders
+sit within 2–3bp of each other while a same-asset crossing costs 1bp of NAV outright, so
+capturing a flip is worth roughly a hundredth of what it costs. There is no rotation edge
+to find, and the population correctly reported so on its first cycle: 18 of the top 30
+strategies tied the null exactly, which *is* the ceiling.
+
+**Criterion 9 named this failure in advance** — "a domain where the null strategy is the
+optimal strategy (passively supplying a lending pool, say)". `YIELD.md`'s opening section
+rebutted that with "Aquarius and Blend are driven by independent mechanisms", and then
+retired the Aquarius half by amendment the same day, which restores the single-pool case
+the criterion described. The premise was withdrawn in writing before implementation began
+and implementation began anyway, at a cost of 3,370 lines and a three-day run. That
+sequencing failure, not the venue, is the reusable lesson: **a kill criterion has to be
+attached to something that blocks, because a plan cannot enforce itself.**
+
+The optimistic case as written on 2026-08-21 is kept verbatim below.
+
+Allocate capital
 across Aquarius reward pools and Blend's two main lending pools (YieldBlox and Fixed),
 rotating as their rates move. This replaces a "considered and rejected" entry written the
 same day, which evaluated passive supply, liquidations and looping and dismissed all three;
@@ -407,14 +436,16 @@ is worth keeping.
    - item 6 (competition leaderboards) — read the automated-submission terms of two or
      three candidate venues. A "no" ends the item for the cost of an afternoon.
    - item 8 (on-chain flow) — a day of Horizon event-rate recording answers criterion 5.
-   - item 9 (yield rotation) — backfill the venue rate history and compute the
-     perfect-foresight ceiling, net of emission-exit friction. See `YIELD.md`. Needs no
-     capital and touches no money boundary, so it can run alongside anything else here.
+   - item 9 (yield rotation) — **[CLOSED 2026-08-24]** the perfect-foresight ceiling was
+     computed and is zero. See `YIELD.md`'s OUTCOME. Note the ceiling test cost minutes
+     once the recorder had data; it was run after the domain was built rather than before,
+     which is the whole expense of the item.
    - item 2's pair extension — a day of the recorder on the candidate pairs, which is the
      same phase-0 work item 5 above already wants and therefore nearly free.
 
    Item 6 is the one to run first on merit: it is the only candidate that answers criterion
-   8 rather than conceding it. Item 9's ceiling test is the cheapest thing on the list and
-   is Stellar-native, so it can run in parallel rather than queueing. Item 10 should not
+   8 rather than conceding it. (Item 9's ceiling test *was* the cheapest thing on this list,
+   ran, and returned zero — see above.) Item 10 should not
    start until at least one of the above has produced a result, per criterion 8's note
-   about third paper domains.
+   about third paper domains — and note that item 9 has now produced one, which is a
+   negative.
