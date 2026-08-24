@@ -1327,6 +1327,13 @@ def _build_yield_revision_system_prompt():
     f'${float(_FACTS["min_free_liquidity_usd"]):.0f} to match the replay engine\'s own '
     f'eligibility floor.\n\n'
 
+    f'DO NOT re-derive the dilution formula by reading yield_replay.py or computing '
+    f'diluted rates with exec — the formula above is exactly what the replay engine '
+    f'uses. Implement `diluted_apy = realized_apy * S / (S + D)` in your choose() '
+    f'ranking (estimate S from `free_liquidity_usd / (1 - utilization)`), set '
+    f'min_free_liquidity_usd to ${float(_FACTS["min_free_liquidity_usd"]):.0f} to match '
+    f'the replay floor, and move on to the actual strategy logic.\n\n'
+
     f'THE VENUES ARE {_FACTS["venues"]}. Aquarius is deliberately absent: '
     f'{_FACTS["aquarius_excluded_because"]}. Do not try to add it, and do not add assets '
     f'-- there is no asset-admission path in this domain.\n\n'
@@ -1358,6 +1365,17 @@ def _build_yield_revision_system_prompt():
     'handler: strat_manager starts main.py once as a standalone process, so a file that '
     'defines choose() and then reaches the bottom exits immediately, fails the smoke test '
     'and reverts your whole revision.\n\n'
+
+    'IMPORTABILITY: THE COMMONEST FAILURE. If your first `backtest_yield_strategy` '
+    'reports `source: "config-only (main.py not importable)"`, the cause is almost '
+    'always `sys.path.append(\'/opt/tools\')` at the module top level — it is a bare '
+    'call expression, which the replay engine\'s importability check rejects. The '
+    'template already puts it inside `venue_rows()`, but parent strategies cloned '
+    'before that fix may still have it at top level. Fix it immediately: move the '
+    '`sys.path.append` inside `venue_rows()` (or replace with '
+    '`if \'/opt/tools\' not in sys.path: sys.path.append(\'/opt/tools\')` inside a '
+    'function), then re-run the backtest. Do NOT spend multiple tool calls debugging '
+    'this — it is a known, mechanical fix.\n\n'
 
     f'Real execution is {_FACTS["live_trading"]} -- nothing you write can move money, so '
     'do not spend the revision on safety theatre, and do not try to reach a network or a '

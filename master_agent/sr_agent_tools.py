@@ -15,7 +15,7 @@ def get_uptime() -> str:
 
 
 def read_file(path: str = '', depth=None, line_start=None, line_end=None,
-              lines_start=None, lines_end=None) -> str:
+              lines_start=None, lines_end=None, start=None, end=None) -> str:
     # Accept line_start/line_end and lines_start/lines_end as aliases (the model
     # uses both spellings interchangeably). Found in the wild 2026-08-23: the
     # model tried to page through a 300-line main.py by calling
@@ -29,16 +29,16 @@ def read_file(path: str = '', depth=None, line_start=None, line_end=None,
     # wastes a round-trip on an opaque error.
     if path:
         path = path.strip()
-    start = line_start if line_start is not None else lines_start
-    end = line_end if line_end is not None else lines_end
+    range_start = line_start if line_start is not None else (start if start is not None else lines_start)
+    range_end = line_end if line_end is not None else (end if end is not None else lines_end)
     try:
         with open(path) as f:
             content = f.read()
-        if start is not None or end is not None:
+        if range_start is not None or range_end is not None:
             lines = content.splitlines()
             try:
-                s = int(start) - 1 if start is not None else 0
-                e = int(end) if end is not None else len(lines)
+                s = int(range_start) - 1 if range_start is not None else 0
+                e = int(range_end) if range_end is not None else len(lines)
             except (TypeError, ValueError):
                 s, e = 0, len(lines)
             s = max(0, s)

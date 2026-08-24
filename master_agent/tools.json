@@ -225,7 +225,7 @@
     "type": "function",
     "function": {
       "name": "read_file",
-      "description": "Read and return the contents of a file at the given path. Use depth=N to read only the first N lines, or line_start/line_end to page through a range of lines (1-indexed). If neither is given, reads the whole file.",
+      "description": "Read and return the contents of a file at the given path. Use depth=N to read only the first N lines, or line_start/line_end (or their aliases start/end) to page through a range of lines (1-indexed). If neither is given, reads the whole file.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -244,6 +244,14 @@
           "line_end": {
             "type": "integer",
             "description": "1-indexed line number to stop reading at (inclusive). If omitted, reads to the end."
+          },
+          "start": {
+            "type": "integer",
+            "description": "Alias for line_start. 1-indexed line number to start reading from."
+          },
+          "end": {
+            "type": "integer",
+            "description": "Alias for line_end. 1-indexed line number to stop reading at (inclusive)."
           }
         },
         "required": [
