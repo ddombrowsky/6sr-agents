@@ -581,13 +581,28 @@ def retire_live(old_name):
     Lines are returned rather than printed so the loop owns the cycle log's ordering, but
     their text (including the leading indentation) is the domain's: they name XLM, chunks
     and stuck legs.
+
+    The native leg is flattened only down to MIN_LIVE_TRADING_CUSHION_USD, not to zero,
+    because monitor calls this immediately before promoting someone and then calls
+    ensure_trading_cushion() on the new leader seconds later -- which buys back up to that
+    same amount of the XLM this just sold. Selling it and re-buying it crosses the spread
+    twice for nothing (2026-08-24: $8.00 of XLM sold at 15:21:50-56, $20.00 bought back at
+    15:22:01-32, ~15bp and four swaps of pure friction). Handing it over instead is safe
+    precisely because it is bounded by the cushion the incoming strategy is entitled to
+    anyway; wind_down clamps it there and drops it to zero on the paths where the cushion
+    buy will not happen, so this cannot become a way to skip the flatten. Every non-XLM leg
+    is still sold outright -- nothing buys those back.
+
+    This is the only retire_live in the tree that passes keep_usd. domain_sdex_maker's does
+    not: that domain declares no ensure_trading_cushion, so nothing would re-buy the
+    handover and it would just be an unflattened position.
     """
     lines = []
     try:
         import sys as _sys
         _sys.path.append('/opt/tools')
-        from stellar_trader import wind_down
-        result = wind_down()
+        from stellar_trader import wind_down, MIN_LIVE_TRADING_CUSHION_USD
+        result = wind_down(keep_usd=MIN_LIVE_TRADING_CUSHION_USD)
     except Exception as e:
         # Fails CLOSED, unlike the fitness gates: not being able to confirm the outgoing
         # strategy is flat is exactly the case where promoting anyway would leave real
@@ -600,6 +615,12 @@ def retire_live(old_name):
                      f"{old_name} stays live, retrying next cycle")
         return False, lines
     lines.append(f"wind_down flattened {old_name} ({result['chunks']} chunk(s))")
+    retained = result.get('retained_xlm') or 0.0
+    if retained:
+        # Says it out loud, because the account is NOT empty after a "flattened" line and
+        # a human reading the log against Horizon deserves to know why.
+        lines.append(f"  handed {retained:.4f} XLM straight over as the incoming leader's "
+                     f"trading cushion instead of selling it back and forth")
     if result.get('stuck'):
         # Computed by wind_down and, until now, thrown away here. A stuck leg denies
         # that asset permanently, suspends every non-XLM buy system-wide, and counts
