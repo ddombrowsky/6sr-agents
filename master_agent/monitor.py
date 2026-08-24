@@ -1219,6 +1219,19 @@ def provision_strategy(name, source_repo, *, parent_name, parent_cfg, score, lea
     commit_revision(strategy_dir, name,
                     f'auto: {origin} ({"llm" if revised else (fallback or "unchanged")})')
 
+    # Delete any state.json the revision model may have written. A freshly cloned
+    # strategy must start from the default balance ($1000), not from a number the
+    # model typed into state.json to inflate its starting score. Found in the wild
+    # 2026-08-24: clone_f40a24a22163 wrote {"balance_usd":1250.0,...} to state.json
+    # during its revision, which would have started the strategy with an inflated
+    # balance and corrupted the scoring comparison against its parent.
+    state_json = strategy_dir / 'state.json'
+    if state_json.exists():
+        try:
+            state_json.unlink()
+        except OSError as e:
+            print(f'Warning: could not delete state.json for {name}: {e}')
+
 def bootstrap_initial_strategies(obs, count=2, budget=0):
     # Either the first run (strategy_state.json doesn't exist yet, so there's nothing to
     # stop or clone-from in the normal cycle) or a backfill after the population dropped
@@ -1807,6 +1820,22 @@ def run():
                     print(f'Skipping cull for {name}: only {age / 3600:.1f}h old, below '
                           f'{YOUNG_GRACE_S / 3600:.0f}h grace period (rank alone is not '
                           f'enough evidence yet)')
+                    continue
+                if age is not None and age < YOUNG_GRACE_S and name in idle_names:
+                    # A young strategy that has not traded yet is NOT the same as an
+                    # old one that stopped trading: the young one may simply be waiting
+                    # for the price to reach its threshold band, and at 8h/cycle it
+                    # has only had one cycle to find out. Culling it before the grace
+                    # period expires wastes the revision slot that produced it. Found
+                    # in the wild 2026-08-24: 5 of 6 LLM revisions across two cycles
+                    # were idle after 8h (price sat between buy_below and sell_above),
+                    # got stopped and retired -- every revision slot was wasted. The
+                    # idle demotion still ranks them at the bottom, so they don't
+                    # clog the leaderboard; this just delays the cull until they have
+                    # had a fair chance to act.
+                    print(f'Skipping cull for {name}: only {age / 3600:.1f}h old and '
+                          f'idle, below {YOUNG_GRACE_S / 3600:.0f}h grace period '
+                          f'(has not had enough market to prove its thresholds fire)')
                     continue
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
                 subprocess.run(['/opt/strat_manager.py', 'stop', name])
