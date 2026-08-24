@@ -38,10 +38,47 @@ TEMPLATE_REPO = os.environ.get('NULL_TEMPLATE_REPO', 'file:///opt/template_repo_
 
 STARTING_SCORE = 1000.0
 
-# See domain_sdex.RANK_GRACE_S's comment: this is the value every domain shared as
+# How fast this domain wants to be RUN. create.sh writes these into v/env.sh (see
+# domain.py's group 8), so `./create.sh null` brings up a container whose monitor cycles
+# every 2 minutes and whose emperor window is 5 minutes, instead of the image's 8h/12h.
+#
+# The point of this domain is to exercise the loop, and the loop's unit of progress is a
+# cycle: score, rank, cull, clone, revise, gate. At the sdex cadence a full turnover of
+# the population takes most of a day, which is the right speed when each observation is a
+# real market and the wrong speed when the whole game resolves in 5-second ticks and
+# costs nothing. Two minutes is comfortably longer than one cycle's own work (the
+# SMOKE_TEST_SECONDS=120 smoke run is the slow part, and cycles that overrun simply
+# arrive late -- monitor sleeps between cycles, it does not schedule them).
+#
+# EMPEROR_RUN_HOURS is a *window*, not a period: emperor.sh runs monitor.py for it, then
+# asks it to stop and spends however long the self-revision LLM call takes before the
+# next window opens. So five minutes is the floor of the emperor cycle, not its length.
+# It is deliberately more than one CYCLE_SLEEP: a window shorter than a cycle would stop
+# monitor at its first sleep every time and the emperor would review a log of one cycle.
+#
+# IDLE_GRACE_S is monitor.py's, not this module's, and is scaled for the same reason
+# RANK_GRACE_S below is: at 3h it is 90 cycles here, so a strategy whose main.py died
+# would go on being ranked for three hours of a test that is meant to show turnover.
+#
+# EMPEROR_LOG_RETENTION is here because emperor.sh prunes to a count of cycles, not a span
+# of time: its default 48 is 24 days at the sdex window and under four hours at this one,
+# on the domain whose entire job is to leave a readable record of what the loop did. 288
+# is a day's worth at five minutes.
+PACING = {
+    'CYCLE_SLEEP': '120',
+    'EMPEROR_RUN_HOURS': '5m',
+    'IDLE_GRACE_S': '360',
+    'EMPEROR_LOG_RETENTION': '288',
+}
+
+# See domain_sdex.RANK_GRACE_S's comment: 3h is the value every domain shared as
 # monitor.py's bare YOUNG_GRACE_S constant before it became domain-owned. Ticks resolve
-# instantly here, so unchanged.
-RANK_GRACE_S = 3 * 3600
+# instantly here and PACING above runs cycles 30x faster than monitor.py's own 3600s
+# default, so this is the same *three cycles* that constant always meant -- expressed against this domain's cadence rather
+# than sdex's. Left at 3h it would exempt every newcomer from the rank cull for 90
+# cycles, which is a population that never turns over: exactly the behaviour this domain
+# exists to test.
+RANK_GRACE_S = 3 * 120
 
 # No money exists in this domain, so there is no execution to suppress. An empty dict is
 # the honest answer and the contract explicitly allows it -- unlike sdex, where omitting

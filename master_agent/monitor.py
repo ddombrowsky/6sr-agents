@@ -1632,6 +1632,20 @@ def run():
               f'{cycles_per_day:.1f} cycles/day, ~{revisions_per_day:.1f} revisions/day. '
               f'Default 3600s gives 24 cycles/day, ~{default_revisions:.1f} revisions/day. '
               f'Evolutionary throughput is {revisions_per_day / default_revisions * 100:.0f}% of default.')
+    # And a one-time note if the domain asked for a cadence this process did not get.
+    # DOMAIN.PACING (domain.py's group 8) is written into /opt/env.sh by create.sh and
+    # reaches us only because emperor.sh sources that file before launching us -- so the
+    # settings are real, and their absence is silent. A volume created before its domain
+    # declared a PACING keeps the old env.sh forever (copy.sh never deploys env.sh), and
+    # the only symptom is a loop running 240x slower than the domain intended, which reads
+    # in the log as a system that is simply idle. Say so instead.
+    for key, wanted in getattr(DOMAIN, 'PACING', {}).items():
+        actual = os.environ.get(key)
+        if actual != wanted:
+            print(f'NOTE: domain {DOMAIN.NAME} asks for {key}={wanted}, but this process '
+                  f'has {key}={actual!r}. That setting lives in /opt/env.sh and is written '
+                  f'by create.sh; add `export {key}={wanted}` there (or re-run create.sh) '
+                  f'if the cadence matters.')
     while True:
         print('--- Monitoring cycle', datetime.datetime.now(), '---')
         # Rolled once here, then drawn down by whichever path creates strategies this

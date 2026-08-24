@@ -169,7 +169,7 @@ sixth is one the list omits.
      check_smoke_state(raw_state, cfg, obs) -> (ok, detail)
      cleanup_scratch(scratch_name)  -> None
 
-And one group that is not a criterion at all but has to live somewhere:
+And two groups that are not criteria at all but have to live somewhere:
 
 7. FACTS THE REVISION PROMPT MUST NOT RESTATE.
      prompt_facts()                -> dict
@@ -179,6 +179,33 @@ And one group that is not a criterion at all but has to live somewhere:
    enforced 0.899, so the model was optimizing an objective it was not ranked on. Any
    number the prompt states about the domain is read live through prompt_facts() and never
    written as a literal in prose. Adding a number to a prompt means adding it here.
+
+8. HOW FAST TO RUN IT. OPTIONAL.
+     PACING                        dict[str, str]  env vars create.sh writes into env.sh
+
+   Not a member the loop ever calls -- it is read once, on the host, by create.sh, which
+   appends `export K=V` for each pair to the v/env.sh it writes. emperor.sh sources that
+   file before it reads EMPEROR_RUN_HOURS or launches monitor.py, so both processes come
+   up at the domain's cadence with no per-container hand-editing.
+
+   It exists because cadence is domain knowledge and had nowhere to live. CYCLE_SLEEP and
+   EMPEROR_RUN_HOURS were baked into the image (supervisor's `environment=` line and
+   emperor.sh's own default), one setting for every domain -- and a cadence sized for a
+   real exchange is meaningless for a game that resolves in seconds. domain_null exists to
+   test the loop, and testing the loop means running cycles; at 8h per cycle it could not.
+
+   Kept as a dict of environment variables, rather than as named constants the loop reads,
+   for two reasons. The audience is three different processes (emperor.sh, monitor.py and
+   whatever they spawn), only one of which is Python; and every one of these settings
+   already HAS an env-var override that an operator can use per-run. This just gives the
+   domain a way to set the default.
+
+   Values must be plain single-line strings with no shell metacharacters -- they are
+   written into a file that gets sourced as root. check() enforces that; create.sh
+   refuses to bootstrap a domain that fails it rather than writing the file anyway.
+
+   Omitting it entirely is fine and means "the image's settings are right for me": every
+   domain but null does exactly that.
 
 
 WHAT IS DELIBERATELY NOT HERE
@@ -199,9 +226,11 @@ WHAT IS DELIBERATELY NOT HERE
   sdex-specific. The later seam is `domain.llm_tools() -> (callables, schemas)` merged
   with a generic core; it is orthogonal to this boundary.
 """
+import ast
 import importlib
 import inspect
 import os
+import re
 from pathlib import Path
 
 # Which domain this process is playing. One per process, deliberately: see "what is
@@ -281,6 +310,71 @@ def live_switch():
     if setting is not None and setting.strip().lower() not in LIVE_ON_VALUES:
         return False, f'{LIVE_ENV_VAR}={setting!r} in the environment'
     return True, ''
+
+
+# What a domain's optional PACING dict may contain (group 8). Both halves are
+# deliberately narrow: create.sh turns these pairs into `export K=V` lines in the env.sh
+# that emperor.sh sources as root, so a value is code. Anything with a space, a quote, a
+# `$` or a `;` in it is refused rather than quoted -- every setting this is for is a
+# number or a duration like `5m`, and a domain that needs shell syntax to express its
+# cadence is doing something this hook is not for.
+PACING_KEY_RE = re.compile(r'[A-Z][A-Z0-9_]*\Z')
+PACING_VALUE_RE = re.compile(r'[A-Za-z0-9_.:+-]+\Z')
+
+
+def check_pacing(pacing, label='PACING'):
+    """Every way `pacing` is unfit to be written into env.sh, as a list of strings.
+
+    Split out of check() because create.sh validates the same dict on the host, read out
+    of the domain's *source* (see pacing_from_source) rather than out of an imported
+    module -- and a safety check with two implementations is one that will disagree with
+    itself about what is safe.
+    """
+    problems = []
+    if not isinstance(pacing, dict):
+        return [f'{label} is {type(pacing).__name__}, not a dict']
+    for key, value in pacing.items():
+        if not isinstance(key, str) or not PACING_KEY_RE.match(key):
+            problems.append(f'{label} key {key!r} is not an UPPER_SNAKE env var name')
+            continue
+        if not isinstance(value, str):
+            problems.append(f'{label}[{key!r}] is {type(value).__name__}, not a str '
+                            f'(write the number as a string: it becomes an env var)')
+        elif not PACING_VALUE_RE.match(value):
+            problems.append(f'{label}[{key!r}] = {value!r} is not a bare '
+                            f'[A-Za-z0-9_.:+-]+ value safe to write into env.sh')
+    return problems
+
+
+def pacing_from_source(path):
+    """The PACING dict declared in the domain module at `path`, or {} if it declares none.
+
+    Parses rather than imports, because the one caller is create.sh, running on the HOST
+    before the container exists: importing domain_sdex there would need requests, httpx
+    and a /opt that is not mounted yet, and a bootstrap script must not be able to fail on
+    a dependency of a module it only wants one constant out of. ast.literal_eval also
+    means a domain module cannot compute its pacing at import time, which is the point --
+    this is read once, by a shell script, and has to be a constant.
+
+    Raises ValueError if PACING is present but is not a literal, or fails check_pacing.
+    """
+    tree = ast.parse(open(path).read())
+    found = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == 'PACING' for t in node.targets):
+            continue
+        try:
+            found = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f'{path}: PACING is not a literal dict ({e})')
+    if found is None:
+        return {}
+    problems = check_pacing(found, label=f'{path}: PACING')
+    if problems:
+        raise ValueError('; '.join(problems))
+    return found
 
 
 # What check() insists on: (member_name, minimum_positional_args) for callables,
@@ -397,6 +491,12 @@ def check(mod):
         if required > min_args:
             problems.append(f'{mod.__name__}.{member} requires {required} positional '
                             f'arg(s), the loop passes {min_args}')
+    # Group 8, and the only optional member checked here: absent is a legal answer, but a
+    # PACING that IS present has to be safe, because create.sh writes it into a file that
+    # is sourced as root. Not in CONTRACT for the same reason live_track_record is not --
+    # that table is what a domain must have, not what it must not get wrong.
+    if hasattr(mod, 'PACING'):
+        problems += [f'{mod.__name__}.{p}' for p in check_pacing(mod.PACING)]
     return problems
 
 

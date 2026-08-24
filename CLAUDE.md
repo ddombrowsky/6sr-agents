@@ -67,6 +67,25 @@ network, no API rate limits, and a game that resolves every few seconds instead 
 few hours. Use it to check that a change to `monitor.py` or the loop still scores, ranks,
 culls, clones, revises and gates — then run the real domain.
 
+It also runs *fast*, because `domain_null.py` declares a `PACING` dict (`domain.py`'s
+group 8) that `create.sh` appends to `v/env.sh` as `export` lines: **a 120s monitor cycle
+and a 5m emperor window**, against the image's 8h and 12h. `emperor.sh` sources `env.sh`
+before it reads `EMPEROR_RUN_HOURS` or launches `monitor.py`, so those exports beat
+supervisor's `environment=` line for both processes. `EMPEROR_RUN_HOURS` is a *window*,
+not a period — the self-revision LLM call runs after it — so five minutes is the floor of
+an emperor cycle, not its length. Two other settings ride along for the same reason:
+`IDLE_GRACE_S` (3h would be 90 cycles here) and `EMPEROR_LOG_RETENTION` (prunes by cycle
+count, so 48 is under four hours at this window). `domain_null.RANK_GRACE_S` is scaled the
+same way, in the module itself, since it is already a domain-owned constant.
+
+Every other domain declares no `PACING` and runs at the image's cadence, unchanged. The
+dict is read off the domain module's *source* by `ast.literal_eval` on the host — never
+imported, so `create.sh` cannot fail on a dependency — and its values are validated by
+`domain.check_pacing` (which `domain.check` also calls) because they are written into a
+file `emperor.sh` sources as root. The exports are written **by `create.sh` only**:
+`copy.sh` never touches `v/env.sh`, so an existing volume keeps the cadence it was created
+with until you re-run `create.sh` or add the lines by hand.
+
 `v/agents/` holds a working copy of the agent scripts for execution/testing inside that
 container. `v/` has since grown well beyond a script mirror into a separate multi-repo
 trading-agent system (`master_agent/`, `template_repo/`, `tools/`, `strategies/`,
@@ -116,7 +135,8 @@ Everything that *is* about a specific way of making money sits behind one module
   that has none of sdex's furniture, and was the skeleton for the real benchmark domain
   below. It is also the domain to reach for when testing the loop itself: `./create.sh
   null` brings the whole system up — emperor loop, revision cycles and all — against a
-  game that costs nothing and resolves in seconds.
+  game that costs nothing and resolves in seconds, at the 2-minute/5-minute cadence its
+  `PACING` dict asks for (above).
 
   Its seed genome is `template_repo_null/`. A question shows one number, `feature` in
   [0, 1], which is the true probability it resolves True; `decide()` answers True, False

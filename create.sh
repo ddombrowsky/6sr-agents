@@ -27,7 +27,8 @@
 #     each print a `not a git repository` fatal, and switching DOMAIN in v/env.sh would
 #     otherwise land on a template that cannot be cloned.
 #   * /opt/env.sh -- emperor.sh does `. ./env.sh` before anything else, and copy.sh
-#     deliberately does NOT deploy it (it holds the key, and it is where DOMAIN is set).
+#     deliberately does NOT deploy it (it holds the key, and it is where DOMAIN and the
+#     domain's cadence are set).
 #
 # The container is created STOPPED. It is brought up once, with the emperor kill switch
 # (/opt/emperor.sh.UNMANAGED) already in place so supervisor's emperor sits inert, only
@@ -66,11 +67,17 @@
 
 # -n flag = nodaemon, required to exist as init proc
 #
-# The `environment=` line is where a container's CYCLE_SLEEP and MASTER_AGENT_MODEL come
-# from -- NOT from env.sh, which this script writes and which sets neither. Worth knowing
-# before wondering why a fresh container sleeps 8h between cycles when monitor.py's own
-# default is 3600: override per-run with `docker exec -e CYCLE_SLEEP=... `, or rebuild the
-# image to change it for good.
+# The `environment=` line is where a container's MASTER_AGENT_MODEL comes from, and
+# CYCLE_SLEEP too unless the domain overrides it. Worth knowing before wondering why a
+# fresh container sleeps 8h between cycles when monitor.py's own default is 3600: override
+# per-run with `docker exec -e CYCLE_SLEEP=... `, or rebuild the image to change it for
+# good.
+#
+# The per-domain route is a PACING dict in the domain module (domain.py's group 8), which
+# this script appends to v/env.sh as `export` lines. env.sh is sourced by emperor.sh
+# BEFORE it reads EMPEROR_RUN_HOURS or launches monitor.py, so those exports beat the
+# supervisor line for both processes -- which is how `./create.sh null` gets a 2-minute
+# monitor cycle and a 5-minute emperor window out of an image built for 8h and 12h.
 
 set -e
 
@@ -152,6 +159,35 @@ if ! grep -q "SYNCED_DIRS=.*\b${TEMPLATE_DIR}\b" copy.sh ; then
     echo "ERROR: $TEMPLATE_DIR is not in copy.sh's SYNCED_DIRS, so ./copy.sh --to would" >&2
     echo "       never deploy it. Add it there first." >&2
     exit 1
+fi
+
+# How fast this domain wants to be run, as `export K=V` lines for v/env.sh below. Read the
+# same way TEMPLATE_URL was: out of the domain module, which is where cadence belongs (see
+# domain.py's group 8). Empty for every domain but null, which means "the image's
+# settings are right for me".
+#
+# Parsed, not imported -- domain.pacing_from_source ast-parses the file, so this cannot
+# fail because the host has no `requests` or no /opt. Validation lives in domain.py beside
+# the contract, and a domain that fails it is refused HERE, before anything is created:
+# these lines are sourced as root by emperor.sh, and a half-built volume is easier to
+# explain than an env.sh with someone else's shell in it.
+PACING_LINES=
+if command -v python3 >/dev/null 2>&1 ; then
+    PACING_LINES=$(python3 -c '
+import sys
+sys.path.insert(0, "master_agent")
+import domain
+for k, v in domain.pacing_from_source(sys.argv[1]).items():
+    print(f"export {k}={v}")
+' "$DOMAIN_SRC") || {
+        echo "ERROR: $DOMAIN_SRC declares a PACING that cannot be written into env.sh" >&2
+        echo "       (see the traceback above, and domain.py's group 8)." >&2
+        exit 1
+    }
+else
+    echo "WARNING: no python3 on the host, so $DOMAIN_SRC's PACING (if it declares one)" >&2
+    echo "         will not reach v/env.sh: this container will run at the image's" >&2
+    echo "         cadence. Add the exports to v/env.sh by hand if that matters." >&2
 fi
 
 if [ "$REUSE_VOLUME" -eq 0 ] && [ -d v ] && [ -n "$(ls -A v 2>/dev/null)" ] ; then
@@ -251,6 +287,17 @@ export CLAUDE_CODE_DISABLE_MOUSE=1
 export OLLAMA_API_KEY=$API_KEY
 export DOMAIN=$DOMAIN_NAME
 ENV_EOF
+if [ -n "$PACING_LINES" ] ; then
+    {
+        echo ""
+        echo "# Cadence, from ${DOMAIN_SRC}'s PACING. Sourced by emperor.sh before it reads"
+        echo "# EMPEROR_RUN_HOURS or launches monitor.py, so these beat the image's"
+        echo "# supervisor environment= line for both processes."
+        echo "$PACING_LINES"
+    } >> v/env.sh
+    echo "--- cadence for $DOMAIN_NAME:"
+    echo "$PACING_LINES" | sed 's/^/      /'
+fi
 chmod 600 v/env.sh
 
 # ------------------------------------------------------------- 5. the git repos

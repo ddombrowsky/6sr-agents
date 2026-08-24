@@ -3,7 +3,8 @@
 # Emperor script (higher than master)
 #
 # Runs forever by default, repeating this cycle:
-# 1. Run monitor.py for a bounded window (default 12h), capturing its log,
+# 1. Run monitor.py for a bounded window (EMPEROR_RUN_HOURS, default 12h, set
+#    per-domain via env.sh -- 5m for DOMAIN=null), capturing its log,
 #    then ask it to stop by touching /opt/.monitor.py.exit (it exits at its
 #    next cycle-boundary sleep); TERM its process group only if that is still
 #    not enough after another full window.
@@ -100,8 +101,18 @@ done
 cd /opt
 . ./env.sh
 
+# How long monitor.py runs before this script asks it to stop and does its review pass.
+# A WINDOW, not a period: the self-revision LLM call that follows it takes however long it
+# takes, so the emperor cycle is this plus that.
+#
+# Read AFTER env.sh is sourced, deliberately -- that is how a domain sets its own cadence
+# (a PACING dict in its domain module, which create.sh turns into exports in /opt/env.sh;
+# see domain.py's group 8). DOMAIN=null runs a 5m window against a 120s CYCLE_SLEEP; sdex
+# leaves both alone. Both are still overridable per-run from the environment.
 RUN_HOURS=${EMPEROR_RUN_HOURS:-12h}
 LOG_DIR=/opt/emperor_logs
+# Cycles of logs kept, not hours of them: a domain that shortens the window above should
+# raise this to match, or it keeps proportionally less history.
 LOG_RETENTION_CYCLES=${EMPEROR_LOG_RETENTION:-48}
 # Cooperative stop request read by monitor.py at every cycle-boundary sleep
 # (see EXIT_FILE / sleep_or_exit there). Must match that path.
@@ -220,7 +231,7 @@ while true; do
     # monitor.py exit at its next cycle-boundary sleep, so it stops between
     # cycles with no revision subprocess, config rewrite or git commit in
     # flight. It only reads the file at those sleeps, so an already-sleeping
-    # monitor takes up to CYCLE_SLEEP (1h) to notice, and one still mid-cycle
+    # monitor takes up to one CYCLE_SLEEP to notice, and one still mid-cycle
     # takes however long that cycle has left -- hence a whole extra
     # $RUN_SECONDS of grace before falling back to the old behaviour of
     # killing the process group.

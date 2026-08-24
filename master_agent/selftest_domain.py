@@ -408,16 +408,60 @@ check('the registry is cached', domain.get('sdex') is SDEX)
 
 # RANK_GRACE_S used to be the single constant YOUNG_GRACE_S, applied by monitor.py to
 # every domain alike -- see domain.py's contract entry for why it became per-domain.
-# sdex/null/forecast/sdex_maker all resolve fast enough that the old flat 3h default
-# still applies; pin that so nobody "tunes" it differently by accident. kalshi is the one
-# domain this was built for, so its value must genuinely differ, not just be present.
-check('sdex/null/forecast/maker RANK_GRACE_S is unchanged from the old shared default (3h)',
-      SDEX.RANK_GRACE_S == NULL.RANK_GRACE_S == FORECAST.RANK_GRACE_S
-      == MAKER.RANK_GRACE_S == 3 * 3600,
-      f'{SDEX.RANK_GRACE_S}, {NULL.RANK_GRACE_S}, {FORECAST.RANK_GRACE_S}, '
-      f'{MAKER.RANK_GRACE_S}')
+# sdex/null/forecast/sdex_maker all resolve fast enough that the old flat 3h default still
+# applies, and what that default MEANT was three cycles of grace before a newcomer's score
+# is trusted enough to cull it. Pinned as three cycles rather than as the literal 10800 so
+# that a domain which changes its own cadence (domain_null's PACING, group 8) has to move
+# this with it: at 120s cycles a flat 3h is 90 cycles of exemption, which is a population
+# that cannot turn over at all. kalshi is the one domain the per-domain split was built
+# for, so its value must genuinely differ, not just be present.
+for mod in (SDEX, NULL, FORECAST, MAKER):
+    cycle = int(getattr(mod, 'PACING', {}).get('CYCLE_SLEEP', 3600))
+    check(f'{mod.NAME} RANK_GRACE_S is three of its own cycles ({3 * cycle}s)',
+          mod.RANK_GRACE_S == 3 * cycle,
+          f'RANK_GRACE_S={mod.RANK_GRACE_S}, CYCLE_SLEEP={cycle}')
 check('kalshi RANK_GRACE_S exceeds the generic default to match slow real-world resolution',
       KALSHI.RANK_GRACE_S > 3 * 3600, KALSHI.RANK_GRACE_S)
+
+# ------------------------------------------------------------------------- group 8: PACING
+#
+# Optional, and read on the HOST by create.sh out of the module's source rather than out of
+# an imported module -- so the thing that has to hold is that the source-parsed answer and
+# the imported one agree. A PACING that only exists after an import would be written into
+# no env.sh and silently do nothing.
+for mod in (SDEX, NULL, FORECAST, MAKER, KALSHI):
+    from_source = domain.pacing_from_source(mod.__file__)
+    check(f'{mod.NAME} PACING parses the same from source as from the module',
+          from_source == getattr(mod, 'PACING', {}),
+          f'{from_source} vs {getattr(mod, "PACING", {})}')
+
+check('null asks for the fast cadence its whole purpose depends on',
+      NULL.PACING.get('CYCLE_SLEEP') == '120'
+      and NULL.PACING.get('EMPEROR_RUN_HOURS') == '5m',
+      NULL.PACING)
+# A window shorter than a cycle would stop monitor.py at its first sleep every time, and
+# the emperor would review a log with one cycle in it.
+check('null emperor window is longer than one null monitor cycle',
+      60 * 5 > int(NULL.PACING['CYCLE_SLEEP']))
+for other in (SDEX, FORECAST, MAKER, KALSHI):
+    check(f'{other.NAME} declares no PACING and keeps the image cadence',
+          not hasattr(other, 'PACING'), getattr(other, 'PACING', None))
+
+# These values are written into a file emperor.sh sources as root, so the validator is a
+# safety boundary and not a style check.
+check('check_pacing rejects a non-dict', domain.check_pacing(['CYCLE_SLEEP=1']))
+check('check_pacing rejects a lowercase key', domain.check_pacing({'cycle_sleep': '1'}))
+check('check_pacing rejects a non-string value', domain.check_pacing({'CYCLE_SLEEP': 120}))
+check('check_pacing rejects shell metacharacters',
+      domain.check_pacing({'CYCLE_SLEEP': '1; rm -rf /'}))
+check('check_pacing rejects a value with a space',
+      domain.check_pacing({'CYCLE_SLEEP': '1 2'}))
+check('check_pacing accepts a bare number and a duration',
+      not domain.check_pacing({'CYCLE_SLEEP': '120', 'EMPEROR_RUN_HOURS': '5m'}))
+_bad = types.ModuleType('domain_fake')
+_bad.PACING = {'X': 'a b'}
+check('domain.check() carries check_pacing, so a bad PACING fails the contract',
+      any('PACING' in p for p in domain.check(_bad)))
 
 # ------------------------------------------------------------------ the live kill switch
 #
