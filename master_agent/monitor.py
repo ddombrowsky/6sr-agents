@@ -417,6 +417,23 @@ def compute_strategy_score(strategy_name, state_entry, obs):
     return score
 
 
+def fmt_age(seconds):
+    """A duration a human can read at whatever cadence this domain runs at.
+
+    Every age and grace period in this loop used to be printed as `{s / 3600:.0f}h`,
+    which is fine at CYCLE_SLEEP=3600 and nonsense below it: with domain_null's PACING
+    (120s cycles, a 360s grace) the cull message read "only 0.1h old, below 0h grace
+    period" -- a strategy skipped for being younger than nothing. The numbers were right
+    and the sentence was not, which is the worst way for a log to be wrong.
+    """
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return f'{seconds:.0f}s'
+    if seconds < 5400:
+        return f'{seconds / 60:.0f}m'
+    return f'{seconds / 3600:.1f}h'
+
+
 def strategy_age_s(state_entry):
     """Seconds since this strategy was actually cloned, or None.
 
@@ -488,10 +505,10 @@ def print_idle_report(performances, state, trade_counts, obs):
         trades = trade_counts.get(name, 0)
         if is_idle(name, trades, entry):
             age = strategy_age_s(entry) or 0
-            idle.append(f'{name} ({age / 3600:.0f}h)')
+            idle.append(f'{name} ({fmt_age(age)})')
     if idle:
         print(f'Idle: {len(idle)} of {len(performances)} strategies have never acted after '
-              f'{IDLE_GRACE_S / 3600:.0f}h (ranked below every strategy that has): '
+              f'{fmt_age(IDLE_GRACE_S)} (ranked below every strategy that has): '
               f'{domain.first_few(idle)}')
     stuck = DOMAIN.stuck_report(performances, state, obs)
     if stuck:
@@ -1790,8 +1807,8 @@ def run():
                     continue
                 age = strategy_age_s(info)
                 if age is not None and age < YOUNG_GRACE_S and name not in idle_names:
-                    print(f'Skipping cull for {name}: only {age / 3600:.1f}h old, below '
-                          f'{YOUNG_GRACE_S / 3600:.0f}h grace period (rank alone is not '
+                    print(f'Skipping cull for {name}: only {fmt_age(age)} old, below '
+                          f'the {fmt_age(YOUNG_GRACE_S)} grace period (rank alone is not '
                           f'enough evidence yet)')
                     continue
                 print(f'Stopping strategy below rank {KEEP_TOP_N}: {name}')
