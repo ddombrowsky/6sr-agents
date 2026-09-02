@@ -100,6 +100,29 @@ def _is_xlm(entry):
     return (entry.get('asset_spec') or entry.get('asset') or 'XLM') == 'XLM'
 
 
+# Which pubnet.log lines are executed trades, and which are offer lifecycle.
+#
+# stellar_trader._log_pubnet_trade is called from both kinds of execution path. On the
+# TAKER path (domain_sdex) every line is a fill: submit_trade writes `buy`/`sell` and
+# wind_down writes `wind_down_sell`. On the MAKER path (domain_sdex_maker) not one line
+# is a fill -- place_offer and cancel_offer write `offer_bid`, `offer_ask` and
+# `offer_cancel`, which are the placement, re-price and cancellation of a RESTING offer.
+# A maker's fills never reach this file at all: quote_executor._live_sync detects them by
+# reconciling against Horizon and records them through trade_logger instead.
+#
+# So `offer_*` lines cannot be counted against trade_logger's fill count. Several of them
+# describe one offer (a re-price reuses the offer id) and an `offer_cancel` carries no
+# notional at all -- which is how this check came to report "6 trades / $15.00" against 13
+# real fills and print MISMATCH on every sdex_maker cycle while nothing was wrong.
+#
+# Classified by exclusion on purpose. A new lifecycle action mistaken for a fill costs a
+# spurious MISMATCH, which is loud; a new FILL action mistaken for lifecycle would quietly
+# drop real money out of the audit. Only the known-inert names are excluded.
+_PUBNET_LIFECYCLE_PREFIX = 'offer_'
+# monitor liquidating a leader change, not a strategy decision.
+_PUBNET_IGNORED_ACTIONS = frozenset({'wind_down_sell'})
+
+
 def _pubnet_cross_check(name, since, log_submitted, log_usd):
     """Compare the paper log's recorded fills against stellar_trader's own ledger.
 
@@ -107,25 +130,51 @@ def _pubnet_cross_check(name, since, log_submitted, log_usd):
     (trade_logger vs stellar_trader._log_pubnet_trade, which attributes by reading
     live_strategy.json rather than trusting its caller), so agreement is real audit
     evidence and a mismatch is a finding worth surfacing rather than a rounding note.
+
+    `match` is TRI-STATE. True and False mean what they say. None means the two records
+    are not comparable at all, because this domain writes only offer lifecycle here (see
+    _PUBNET_LIFECYCLE_PREFIX) and its fills are recorded elsewhere. Callers must test
+    `is False`: a falsy None is "no evidence either way", and reporting that as a mismatch
+    is exactly the bug this distinction removes.
     """
     path = TRADES_DIR / f'{name}.pubnet.log'
     if not path.exists():
         return {'available': False, 'match': log_submitted == 0,
                 'note': f'no {path.name}; expected when nothing has ever filled',
                 'log_submitted': log_submitted, 'log_usd': round(log_usd, 6),
-                'pubnet_trades': 0, 'pubnet_usd': 0.0}
+                'pubnet_trades': 0, 'pubnet_usd': 0.0, 'offer_ops': {}}
     trades = usd = 0
+    offer_ops = Counter()
     for e in _read_lines(path, since):
-        # wind_down_sell is monitor liquidating a leader change, not a strategy decision.
-        if e.get('action') == 'wind_down_sell':
+        action = e.get('action') or ''
+        if action in _PUBNET_IGNORED_ACTIONS:
+            continue
+        if action.startswith(_PUBNET_LIFECYCLE_PREFIX):
+            offer_ops[action] += 1
             continue
         trades += 1
         usd += float(e.get('amount_usd') or 0.0)
+
+    # Any offer lifecycle at all means quote_executor is the execution path, and a maker's
+    # fills bypass this file whether or not some other line here happens to be a fill. The
+    # count is still reported rather than hidden, so a stray one is visible to --json.
+    if offer_ops:
+        note = (f'{path.name} records offer lifecycle, not fills; a maker detects its '
+                f'fills by reconciliation, so there is nothing here to count against '
+                f'{log_submitted} recorded fill(s)')
+        if trades:
+            note += f' ({trades} non-offer line(s) also present)'
+        return {'available': True, 'match': None, 'note': note,
+                'log_submitted': log_submitted, 'log_usd': round(log_usd, 6),
+                'pubnet_trades': trades, 'pubnet_usd': round(usd, 6),
+                'offer_ops': dict(offer_ops)}
+
     return {'available': True,
             'match': trades == log_submitted and abs(usd - log_usd) < 0.01,
             'note': None,
             'log_submitted': log_submitted, 'log_usd': round(log_usd, 6),
-            'pubnet_trades': trades, 'pubnet_usd': round(usd, 6)}
+            'pubnet_trades': trades, 'pubnet_usd': round(usd, 6),
+            'offer_ops': {}}
 
 
 def _caps_now():
@@ -399,9 +448,16 @@ def summary_line(name=None):
         reason, count = r['refusals'][0]
         parts.append(f'top refusal: {reason} ({count})')
     check = r.get('pubnet_cross_check') or {}
-    if check.get('available') and not check.get('match'):
+    # `is False`, not falsiness: None is "not comparable", reported on its own line below.
+    if check.get('available') and check.get('match') is False:
         parts.append(f"MISMATCH vs pubnet.log ({check['pubnet_trades']} trades / "
                      f"${check['pubnet_usd']:.2f})")
+    elif check.get('match') is None and check.get('offer_ops'):
+        # Not an audit of the fills, but evidence the money path ran at all -- which is
+        # the question someone reading this line about a fresh promotion actually has.
+        ops = ', '.join(f'{n} {action}'
+                        for action, n in sorted(check['offer_ops'].items()))
+        parts.append(f'pubnet.log: {ops} (offer lifecycle; not comparable to fills)')
     if (r.get('sizing') or {}).get('caps_changed_since_promotion'):
         parts.append('caps changed since promotion')
     return '; '.join(parts)

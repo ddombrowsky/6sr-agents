@@ -353,13 +353,19 @@ def _live_sync(state, agent_name, targets, row):
         record = expected.get(str(fill['offer_id'])) or {}
         price = float(record.get('price') or fill.get('price') or 0.0)
         side = record.get('side') or fill.get('side')
+        filled_usd = float(fill['filled_usd'])
+        # amount_usd is not decoration: live_report sums exactly this key to get the live
+        # notional, and without it every maker promotion reads back as "$0.00 live, ratio
+        # 0.000, live-sized +0.00%" no matter what actually filled -- the live-vs-paper
+        # comparison the promotion is supposed to be audited by, silently reading zero.
         state = _apply_fill(state, agent_name, side,
-                            price, float(fill['filled_usd']), mid,
-                            live_result={'submitted': True, 'detected': 'reconcile'})
+                            price, filled_usd, mid,
+                            live_result={'submitted': True, 'detected': 'reconcile',
+                                         'amount_usd': filled_usd})
         # Book it against the daily spend budget. Without this the cap is unwired on the
         # maker path entirely -- _record_spend is only reached from submit_trade.
         try:
-            st.record_fill_spend(float(fill['filled_usd']), side)
+            st.record_fill_spend(filled_usd, side)
         except Exception as e:
             print(f'[quote_executor] could not record spend: {e}')
         filled += 1

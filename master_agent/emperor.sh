@@ -33,6 +33,17 @@
 
 set -e
 
+ONCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --once) ONCE=1 ;;
+        *)
+            echo "usage: $0 [--once]" >&2
+            exit 1
+            ;;
+    esac
+done
+
 # Startup kill switch. While this file exists the script does nothing at all --
 # no interpreter probe, no env.sh, no monitor.py -- it just polls for the file's
 # removal, then carries on as normal. That makes it safe to wire emperor.sh in as
@@ -49,7 +60,7 @@ set -e
 # monitor.py's check_boundary_integrity() watches, and verify_and_commit_repo()
 # below would `git add -A` the sentinel straight into the history.
 UNMANAGED_FILE="${EMPEROR_UNMANAGED_FILE:-/opt/emperor.sh.UNMANAGED}"
-if [ -e "$UNMANAGED_FILE" ]; then
+if [ $ONCE = 0 -a -e "$UNMANAGED_FILE" ]; then
     echo "[emperor] $UNMANAGED_FILE exists -- UNMANAGED. Doing nothing;" \
          "polling every 60s. Remove that file to start."
     while [ -e "$UNMANAGED_FILE" ]; do
@@ -86,17 +97,6 @@ if [ -z "$PYTHON" ]; then
          "$PYTHON. Revisions and the emperor self-revision step will BOTH fail this run." >&2
 fi
 echo "[emperor] using interpreter: $PYTHON"
-
-ONCE=0
-for arg in "$@"; do
-    case "$arg" in
-        --once) ONCE=1 ;;
-        *)
-            echo "usage: $0 [--once]" >&2
-            exit 1
-            ;;
-    esac
-done
 
 cd /opt
 . ./env.sh

@@ -16,7 +16,7 @@ MODEL_NICKNAMES = {
     'buck': 'wonderful_buck_321/sixsr',
     'granite': 'granite4.1:8b',
 }
-MODEL = MODEL_NICKNAMES['glm']
+MODEL = MODEL_NICKNAMES['gpt']
 
 
 def _is_cloud_model(model: str) -> bool:
