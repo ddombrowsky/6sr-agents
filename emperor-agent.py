@@ -91,18 +91,66 @@ def dispatch(tool_call) -> dict:
 
 
 def _message_chars(msg) -> int:
-    """Size of one message, counting the reasoning channel as well as `content`.
+    """Size of one message, counting reasoning and tool calls as well as `content`.
 
     With _should_think() on, an assistant turn's `thinking` can outweigh its `content`,
-    and it is sent back on the next turn like everything else. Counting only `content`
-    under-reads the prompt -- harmless in the log line below, not harmless in
-    _truncate_messages, where it drops too few messages and spends another round trip
-    rediscovering that the prompt is still too long.
+    and it is sent back on the next turn like everything else. An assistant turn that
+    requested tools carries the call names and their JSON arguments too, which for a
+    tool like write_file is most of the message. Counting only `content` under-reads
+    the prompt -- harmless in the log line below, not harmless in _truncate_messages,
+    where it drops too few messages and spends another round trip rediscovering that
+    the prompt is still too long.
     """
-    return sum(len(str(msg.get(key) or '')) for key in ('content', 'thinking'))
+    chars = sum(len(str(msg.get(key) or '')) for key in ('content', 'thinking'))
+    for call in msg.get('tool_calls') or ():
+        fn = call.get('function') or {}
+        chars += len(str(fn.get('name') or ''))
+        chars += len(json.dumps(fn.get('arguments') or {}, default=str))
+    return chars
 
 
-_OVERFLOW_RE = re.compile(r'exceeded max context length by (\d+) tokens')
+# Measured against the server's own count: the turn in
+# emperor_logs/agent_20260901_230829.log estimated ~119k tokens for a prompt the server
+# scored at 145,759 -- about 3.3 chars/token, not the 4 this used to assume. Code and
+# JSON tokenize denser than prose, and this agent's context is mostly read_file output.
+_CHARS_PER_TOKEN = 3.3
+
+
+# The server states an overflow in one of two shapes:
+#   "... exceeded max context length by 4096 tokens"
+#   "The prompt is too long: 145759, model maximum context length: 131072"
+# Only the first names the overflow directly; the second gives both totals, so the delta
+# has to be subtracted out. Recognising just one of them costs twice: _truncate_messages
+# falls back to blindly halving the history, and -- because the gate in run_turn used the
+# substring 'prompt too long', which "prompt *is* too long" does not contain -- the 400
+# escaped run_turn entirely and killed the emperor window.
+_OVERFLOW_RES = (
+    re.compile(r'exceeded max context length by (\d+) tokens', re.I),
+    re.compile(r'prompt is too long:\s*(\d+),\s*model maximum context length:\s*(\d+)', re.I),
+)
+_OVERFLOW_MARKERS = (
+    'prompt too long',
+    'prompt is too long',
+    'exceeded max context length',
+    'context length exceeded',
+)
+
+
+def _is_overflow_error(error_text: str) -> bool:
+    """True if this ResponseError is the prompt outgrowing the context window."""
+    lowered = error_text.lower()
+    return any(marker in lowered for marker in _OVERFLOW_MARKERS)
+
+
+def _overflow_tokens(error_text: str):
+    """How many tokens over the limit the prompt was, or None if the error doesn't say."""
+    for pattern in _OVERFLOW_RES:
+        match = pattern.search(error_text)
+        if not match:
+            continue
+        groups = [int(g) for g in match.groups()]
+        return groups[0] if len(groups) == 1 else groups[0] - groups[1]
+    return None
 
 
 def _truncate_messages(messages: list, error_text: str) -> bool:
@@ -117,10 +165,10 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
     if droppable <= 0:
         return False
 
-    match = _OVERFLOW_RE.search(error_text)
-    if match:
-        # ~4 chars/token, with a margin since this is a rough estimate.
-        target_chars = int(match.group(1)) * 4 * 1.2
+    overflow = _overflow_tokens(error_text)
+    if overflow and overflow > 0:
+        # Margin on top, since _CHARS_PER_TOKEN is still an average.
+        target_chars = overflow * _CHARS_PER_TOKEN * 1.2
         removed_chars = 0
         removed = 0
         for msg in messages[keep_from:keep_from + droppable]:
@@ -131,6 +179,12 @@ def _truncate_messages(messages: list, error_text: str) -> bool:
     else:
         removed = max(1, droppable // 2)
 
+    # Never leave behind a tool result whose requesting assistant message was just
+    # dropped: an orphaned tool role is rejected outright, which would turn a
+    # recoverable overflow into a hard failure on the very next retry.
+    while removed < droppable and messages[keep_from + removed].get('role') == 'tool':
+        removed += 1
+
     del messages[keep_from:keep_from + removed]
     print(f'[warning] prompt too long; dropped {removed} older message(s) and retrying')
     return True
@@ -140,9 +194,15 @@ SERVER_ERROR_MAX_RETRIES = 3
 SERVER_ERROR_RETRY_DELAY = 2  # seconds
 
 
+# TOOL_SCHEMAS rides along with every single request but lives in no message, so it has
+# to be added back or the estimate is short by a constant few thousand tokens.
+_TOOL_SCHEMA_TOKENS = int(len(json.dumps(TOOL_SCHEMAS)) / _CHARS_PER_TOKEN)
+
+
 def _estimate_context_tokens(messages: list) -> int:
-    """Rough token estimate (~4 chars/token) of the current message list."""
-    return sum(_message_chars(msg) for msg in messages) // 4
+    """Rough token estimate of the whole prompt: the messages plus the tool schemas."""
+    message_chars = sum(_message_chars(msg) for msg in messages)
+    return int(message_chars / _CHARS_PER_TOKEN) + _TOOL_SCHEMA_TOKENS
 
 
 def run_turn(messages: list) -> str:
@@ -154,7 +214,7 @@ def run_turn(messages: list) -> str:
             response = client.chat(MODEL, messages=messages, tools=TOOL_SCHEMAS, think=_should_think())
         except ResponseError as e:
             error_text = str(e)
-            if 'prompt too long' in error_text.lower() and _truncate_messages(messages, error_text):
+            if _is_overflow_error(error_text) and _truncate_messages(messages, error_text):
                 server_error_retries = 0
                 continue
             if e.status_code >= 500:
