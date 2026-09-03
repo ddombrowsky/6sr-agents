@@ -130,6 +130,21 @@
   {
     "type": "function",
     "function": {
+      "name": "remember",
+      "description": "Persist a fact under a key so it survives into future runs of this agent. Everything remembered is loaded into the system prompt automatically at the start of every later run, so use this for conclusions a successor would otherwise have to re-derive by re-reading the filesystem: what you changed and why, a fault you diagnosed but could not fix, a step that must happen before the next cycle. Keep values one or two sentences; overwriting an existing key replaces it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {"type": "string", "description": "Short stable identifier, e.g. 'twelfth_pass_commit'"},
+          "value": {"type": "string", "description": "The fact to remember"}
+        },
+        "required": ["key", "value"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "recall",
       "description": "Look up a single previously remembered fact by its key. Most remembered facts are already included in the system prompt automatically; use this only to check a specific key or after list_memories.",
       "parameters": {

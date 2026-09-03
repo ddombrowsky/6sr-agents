@@ -8,6 +8,26 @@ from datetime import datetime
 
 sys.path.append('/opt/tools')
 
+# /opt/agents is on the path for memory_tools alone (imported just below). This module is
+# loaded by two different agents -- master-agent.py, which lives beside it in
+# /opt/master_agent, and emperor-agent.py, which lives in /opt/agents -- and only the
+# second one has a persistent memory. Adding the directory here rather than in
+# emperor-agent.py keeps this module the single superset of every tool either agent can
+# call, which is the point: /opt/agents/sr_agent_tools.py was a second, frozen copy of
+# this file, and eleven emperor passes' worth of improvements to read_file, apply_patch
+# and search went into this one while the emperor ran on that one.
+sys.path.append('/opt/agents')
+
+# Optional on purpose. memory_tools.py ships in /opt/agents, so this import succeeds in
+# the container and fails on a bare host checkout (where master_agent/ is a subdirectory
+# and /opt does not exist). Failing soft costs the four memory tools and nothing else --
+# the alternative is that importing this module at all becomes container-only, which
+# would take selftest_domain.py and every host-side syntax check down with it.
+try:
+    import memory_tools
+except ImportError:  # pragma: no cover - host-side checkouts only
+    memory_tools = None
+
 
 def get_uptime() -> str:
     result = subprocess.run(['uptime'], capture_output=True, text=True, check=True)
@@ -605,3 +625,17 @@ TOOLS = {
     'exec': exec,
     'search': search,
 }
+
+# Emperor-only, and filtered back out by master-agent.py (see _EMPEROR_ONLY_TOOL_NAMES
+# there). The emperor is the agent that runs once per window and is told to write things
+# down for its successor; the revision agent runs many times per cycle against one
+# strategy and has no use for a shared key-value store it would only pollute.
+EMPEROR_ONLY_TOOL_NAMES = frozenset({'remember', 'recall', 'forget', 'list_memories'})
+
+if memory_tools is not None:
+    TOOLS.update({
+        'remember': memory_tools.remember,
+        'recall': memory_tools.recall,
+        'forget': memory_tools.forget,
+        'list_memories': memory_tools.list_memories,
+    })

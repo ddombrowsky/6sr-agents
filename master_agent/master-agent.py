@@ -816,6 +816,20 @@ _DOMAIN_TOOL_NAMES = {
     }),
 }
 
+# Dropped unconditionally, before and independently of the per-domain filter below.
+# sr_agent_tools.py is deliberately the superset of what BOTH agents can call, so that
+# emperor-agent.py stops running on a second, frozen copy of it -- but the emperor's
+# persistent key-value memory is not part of this agent's job. It runs many times per
+# cycle, once per strategy, and a store whose whole value is that the next emperor pass
+# reads it should not be written by a few hundred revision turns that will never read it
+# back. Unconditional because sdex is not in _DOMAIN_TOOL_NAMES: the filter below is a
+# no-op on the default domain, so relying on it would leak these tools on exactly the
+# domain that runs the most.
+TOOLS = {name: fn for name, fn in TOOLS.items()
+         if name not in sr_agent_tools.EMPEROR_ONLY_TOOL_NAMES}
+TOOL_SCHEMAS = [t for t in TOOL_SCHEMAS
+                if t['function']['name'] not in sr_agent_tools.EMPEROR_ONLY_TOOL_NAMES]
+
 if _DOMAIN.NAME in _DOMAIN_TOOL_NAMES:
     _allowed_tool_names = _GENERIC_TOOL_NAMES | _DOMAIN_TOOL_NAMES[_DOMAIN.NAME]
     TOOLS = {name: fn for name, fn in TOOLS.items() if name in _allowed_tool_names}

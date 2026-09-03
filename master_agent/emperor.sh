@@ -281,15 +281,29 @@ You are the "emperor" review pass: higher-level than the master agent. You've
 just been given the log from a multi-hour run of /opt/monitor.py (the hourly
 strategy-culling/cloning loop) plus the current /opt/SYSTEM_STATE.md.
 
-Your job, using your read_file/write_file/exec tools:
+Your job, using your read_file/search/apply_patch/write_file/exec tools:
 
-1. Read /opt/master_agent/master-agent.py, /opt/master_agent/monitor.py,
-   /opt/master_agent/sr_agent_tools.py, and /opt/master_agent/strat_manager.py.
+0. BUDGET. Your context window is 131072 tokens and the log below has already
+   spent a large part of it. The four files in step 1 total about 5,700 lines
+   (~81k tokens) -- reading them whole does not fit and has ended three
+   previous runs of this pass with no edit made at all. So:
+     * Use `search` (grep -rn) to find the code the log points at. A symptom in
+       the log is a string you can grep for.
+     * Read with `read_file(path=..., line_start=N, line_end=M)`, in windows of
+       a few hundred lines around what you found. Reading a whole file is a last
+       resort, and never for master-agent.py (2,700 lines) or monitor.py (2,000).
+     * Edit with `apply_patch`, not `write_file`. write_file needs the entire new
+       file in your reply, which for these files costs more tokens than the read
+       did; apply_patch costs only the lines you are changing.
+   Prefer one well-understood fix you have room to verify over a survey of four
+   files you ran out of context to finish.
+1. Identify which of /opt/master_agent/master-agent.py, /opt/master_agent/monitor.py,
+   /opt/master_agent/sr_agent_tools.py and /opt/master_agent/strat_manager.py the log
+   is actually complaining about, and read only the relevant parts, per step 0.
 2. Based on what the monitor log below shows (errors, stalls, bad behavior,
    inefficiencies, or just opportunities for improvement), make concrete edits
-   to any of those four files that would improve the system. Use write_file to
-   apply them. If nothing meaningfully needs to change, it's fine to make no
-   edits.
+   to those files that would improve the system. If nothing meaningfully needs
+   to change, it's fine to make no edits -- say so and stop.
 3. If any new utility scripts are needed, add them to the /opt/tools directory.
 4. Commit whatever you changed:
      * If you changed anything under /opt/master_agent, commit it there (it

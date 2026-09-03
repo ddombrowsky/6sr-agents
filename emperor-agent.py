@@ -6,8 +6,62 @@ import time
 
 from ollama import Client, ResponseError
 
-import memory_tools
-import sr_agent_tools
+SELF_FILE = os.path.abspath(__file__)
+SELF_DIR = os.path.dirname(SELF_FILE)
+
+# WHERE THIS AGENT'S TOOLS COME FROM, and why it is not just `import sr_agent_tools`.
+#
+# There are two sr_agent_tools.py / tools.json pairs in a running container:
+#
+#   /opt/agents/       -- this directory. A frozen `copy.sh --to` deploy of the host
+#                         repo's root-level copies. Nothing in the container ever writes
+#                         to it.
+#   /opt/master_agent/ -- its own git repo, and the one emperor.sh's prompt names in
+#                         step 1. Every emperor pass reads and revises it.
+#
+# So this agent spent eleven passes hardening the tools it does not use. By 2026-09-03 the
+# gap was 13 tools against 23, and the three it was missing were precisely the ones that
+# make a large-codebase review affordable:
+#
+#   * read_file's line_start/line_end paging. Without it the only way to see a file is
+#     whole, and the four files emperor.sh asks for are 5,720 lines / 327KB ~= 81k tokens
+#     of a 131k window. Step 1 of the prompt, obeyed literally, spends 62% of the context
+#     before the agent has thought about anything.
+#   * a working apply_patch. /opt/agents/sr_agent_tools.py has the wrapper but not the
+#     `sys.path.append('/opt/tools')` that lets it find /opt/tools/apply_patch.py, so
+#     every call returned "apply_patch module not available" and the model fell back to
+#     re-reading the file whole so it could rewrite it whole.
+#   * search (grep -rn), so a targeted question does not need a file read at all.
+#
+# The three runs before this was found (2026-09-01, -09-02, -09-03) changed nothing at
+# all: one died on `The prompt is too long: 145759, model maximum context length: 131072`,
+# one emitted a malformed tool call and exited, and one burned its window on the read /
+# failed-patch / re-read loop above. Two of those three are directly this.
+#
+# Overridable so the root-level copies still run standalone on a host with no /opt, and
+# so a bisect can pin the old behaviour with EMPEROR_TOOL_STACK=/opt/agents.
+TOOL_STACK_DIR = os.environ.get('EMPEROR_TOOL_STACK') or '/opt/master_agent'
+if all(os.path.isfile(os.path.join(TOOL_STACK_DIR, f))
+       for f in ('sr_agent_tools.py', 'tools.json')):
+    # Ahead of SELF_DIR, which is sys.path[0] for a script. memory_tools.py exists only
+    # in SELF_DIR, so put that back explicitly rather than trusting the interpreter to
+    # have added it: `python emperor-agent.py` does, but runpy.run_path() and `python -m`
+    # do not, and the failure mode is an import error at line 1 of a 12-hour cycle.
+    sys.path.insert(0, TOOL_STACK_DIR)
+    if SELF_DIR not in sys.path:
+        sys.path.append(SELF_DIR)
+else:
+    print(f'[warning] no tool stack at {TOOL_STACK_DIR}; falling back to {SELF_DIR}. '
+          'Expect no read_file paging, no search, and a broken apply_patch.')
+    TOOL_STACK_DIR = SELF_DIR
+
+TOOLS_FILE = os.environ.get('EMPEROR_TOOLS_FILE') or os.path.join(TOOL_STACK_DIR, 'tools.json')
+
+# Deliberately below the sys.path work above: which sr_agent_tools this resolves to is the
+# entire point of this block, and moving these back up to the other imports silently
+# reinstates the bug.
+import memory_tools  # noqa: E402
+import sr_agent_tools  # noqa: E402
 
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
@@ -58,9 +112,6 @@ def _should_think() -> bool:
     if override in ('off', '0', 'false', 'no'):
         return False
     return _is_cloud_model(MODEL)
-SELF_FILE = os.path.abspath(__file__)
-TOOLS_FILE = os.path.join(os.path.dirname(SELF_FILE), 'tools.json')
-
 client = Client(
     host="http://172.17.0.1:11434",
     headers={'Authorization': 'Bearer ' + os.environ.get('OLLAMA_API_KEY')}
@@ -70,6 +121,22 @@ TOOLS = sr_agent_tools.TOOLS
 
 with open(TOOLS_FILE) as f:
     TOOL_SCHEMAS = json.load(f)
+
+# Printed on every run, into emperor_logs/agent_<stamp>.log. The mismatch above was
+# invisible for eleven passes because nothing ever said which stack was loaded -- the
+# logs of a crippled run and a healthy one were identical up to the first tool error.
+# A schema the model is offered but that maps to no callable is worth naming too:
+# `remember` was in the TOOLS dict and in neither tools.json for the life of this agent,
+# so the system prompt's closing instruction to "use the remember tool" named something
+# the model was never told existed.
+print(f'[info] tool stack: {os.path.abspath(sr_agent_tools.__file__)} '
+      f'({len(TOOLS)} callables), schemas: {TOOLS_FILE} ({len(TOOL_SCHEMAS)})')
+_schema_names = {t['function']['name'] for t in TOOL_SCHEMAS}
+for _missing in sorted(_schema_names - set(TOOLS)):
+    print(f'[warning] schema {_missing!r} has no implementation in this tool stack')
+for _unoffered in sorted(set(TOOLS) - _schema_names):
+    print(f'[warning] tool {_unoffered!r} is implemented but has no schema; '
+          'the model will never call it')
 
 
 def dispatch(tool_call) -> dict:
