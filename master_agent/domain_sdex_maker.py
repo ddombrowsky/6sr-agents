@@ -1424,11 +1424,29 @@ def _fill_stats(name, hours=24):
 # a strategy's rank a function of how long it has been alive, which is the same failure
 # YOUNG_GRACE_S exists to stop at the other end.
 #
-# 24h rather than something shorter: the tape crosses a 3 bp quote a few hundred times a
-# day across the population, so a 6h window would read as zero for most of the board and
-# collapse the tiebreak back into an arbitrary ordering. 24h is long enough that a working
-# maker is never zero and short enough that a dead one is.
-TIEBREAK_WINDOW_H = 24.0
+# 6h, and specifically THE SAME 6h stuck_report uses. This started at 24h on the argument
+# that a shorter window would read as zero for most of the board and collapse the tiebreak
+# into an arbitrary ordering. That argument was wrong, and the 13:23 cycle measured it:
+#
+#   window    strategies with >0 fills (of 243 tracked)
+#      1h      13
+#      3h      24
+#      6h      38
+#     12h      49
+#     24h      77
+#
+# 38 live candidates for 8 protected slots is not a collapse -- it is nearly 5x more than
+# the ranking needs. And 24h was demonstrably too coarse: that same cycle's top eight had
+# non-zero 24h fills by construction, yet FOUR of them (clone_ece1c8c42cd7,
+# clone_2f7d8c0e2356, clone_d891d01da981, clone_03f305662921) were simultaneously listed
+# by stuck_report as "0 fills in 6h". The loop was protecting strategies its own dead-end
+# report called dead, which is the exact failure the windowing was introduced to end --
+# just at a shorter timescale than the first attempt could see.
+#
+# Sharing the window with stuck_report is the point, not a coincidence: while the two
+# differ, some window exists in which the ranking and the report disagree about who is
+# alive, and that gap is where a dead strategy keeps its slot.
+TIEBREAK_WINDOW_H = 6.0
 
 
 def recent_activity(name, hours=TIEBREAK_WINDOW_H):
@@ -1511,12 +1529,18 @@ def stuck_report(performances, state, obs):
         raw_state = _read_json(STRATEGIES_DIR / name / 'state.json')
         if not isinstance(raw_state, dict):
             continue
-        fills, _volume, _buys, _sells, _gross = _fill_stats(name, hours=6)
+        # TIEBREAK_WINDOW_H, not a second literal 6: while the ranking and this report use
+        # different windows there is a band in which they disagree about who is alive, and
+        # that band is where a dead strategy keeps its protected slot. Measured on the
+        # 2026-09-04 13:23 cycle, where a 24h tiebreak protected four strategies this
+        # report was calling dead in the same log.
+        fills, _volume, _buys, _sells, _gross = _fill_stats(name, hours=TIEBREAK_WINDOW_H)
         quoted = int(raw_state.get('quoted_sides') or 0)
         if quoted > 0 and fills == 0:
             config = _read_json(STRATEGIES_DIR / name / 'config.json', {}) or {}
             lines.append(f"  {name}: quoting {quoted} side(s) at "
-                         f"{config.get('half_width_bp')} bp but 0 fills in 6h -- "
+                         f"{config.get('half_width_bp')} bp but 0 fills in "
+                         f"{TIEBREAK_WINDOW_H:g}h -- "
                          f"the tape never crossed it")
         # The XLM leg alone -- resting offers are NOT added, for the reason
         # _resting_offer_value documents: nothing was reserved when they were placed, so
