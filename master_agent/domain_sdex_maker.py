@@ -54,6 +54,19 @@ TEMPLATE_REPO = os.environ.get('MAKER_TEMPLATE_REPO', 'file:///opt/template_repo
 # started".
 STARTING_SCORE = 1000.0
 
+# How close two scores have to be before this domain calls them a tie, so monitor.py's
+# rank sort falls through to the trade-count tiebreak instead of ordering on noise. See
+# monitor.SCORE_TIE_EPS for the measurement; the short version is that a maker's score is
+# STARTING_SCORE plus a float sum of per-fill edges whose standard error, over the few
+# hundred fills a strategy accumulates between cycles, is $0.02-0.06. A cent is inside
+# that everywhere, so nothing real is being thrown away, and it is what stops a 4-fill
+# strategy holding a protected KEEP_TOP_N slot ahead of a 776-fill one on a $0.0004
+# difference.
+#
+# Affects ORDERING only. score_path still returns the exact score, and MIN_LIVE_SCORE
+# still tests the exact score, so this cannot round a strategy up onto the live flag.
+SCORE_TIE_EPS = 0.01
+
 # A hard requirement, not a convenience. quote_executor.sync_quotes and every primitive in
 # stellar_trader check PAPER_ONLY *inside* the function, so a smoke run of a candidate
 # main.py cannot rest a real offer no matter what it imports.
@@ -1394,6 +1407,38 @@ def _fill_stats(name, hours=24):
     except Exception:
         pass
     return fills, volume, buys, sells, spread
+
+
+# How far back the rank tiebreak looks, and the count it uses. Both OPTIONAL members --
+# monitor.py reads them with getattr and falls back to the lifetime count from activity()
+# when a domain declares neither, so no other domain is affected.
+#
+# Why a window rather than the lifetime count. SCORE_TIE_EPS made the documented
+# trade-count tiebreak fire for the first time (see monitor.SCORE_TIE_EPS), which was a
+# strict improvement -- it replaced ordering on sub-cent noise with ordering on evidence.
+# But the evidence it ordered on was `activity()`, a LIFETIME fill count, and the first
+# cycle after the change showed what that buys: the new top eight had lifetime counts of
+# 603/411/58/33/23/22/19/18 and 24-HOUR counts of 294/103/0/0/0/0/0/18. Six of the eight
+# protected slots went to strategies that had demonstrated something days ago and were
+# dead now, two of them flagged by stuck_report in the same cycle. A lifetime count makes
+# a strategy's rank a function of how long it has been alive, which is the same failure
+# YOUNG_GRACE_S exists to stop at the other end.
+#
+# 24h rather than something shorter: the tape crosses a 3 bp quote a few hundred times a
+# day across the population, so a 6h window would read as zero for most of the board and
+# collapse the tiebreak back into an arbitrary ordering. 24h is long enough that a working
+# maker is never zero and short enough that a dead one is.
+TIEBREAK_WINDOW_H = 24.0
+
+
+def recent_activity(name, hours=TIEBREAK_WINDOW_H):
+    """FILLS in the last `hours`. The tiebreak's opinion of "has this thing done anything
+    LATELY", as distinct from activity()'s "has it ever".
+
+    Deliberately the same counter stuck_report already uses, so the dead-end report and
+    the ranking cannot disagree about who is quoting into a tape that never crosses them.
+    """
+    return _fill_stats(name, hours=hours)[0]
 
 
 def _live_net(name, mid):

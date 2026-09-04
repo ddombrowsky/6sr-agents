@@ -72,6 +72,7 @@ read it, contrary to the claim recorded here.
 """
 import ast
 import json
+import math
 import os
 import shutil
 import signal
@@ -158,6 +159,89 @@ IDLE_GRACE_S = int(os.environ.get('IDLE_GRACE_S', 3 * 3600))
 # entry -- this is now DOMAIN's opinion, not the loop's, with the env var still able to
 # force a value for ops purposes.
 YOUNG_GRACE_S = int(os.environ.get('YOUNG_GRACE_S', DOMAIN.RANK_GRACE_S))
+
+# The width of a score difference that is NOT evidence. Two strategies whose scores differ
+# by less than this rank as equals, and the trade-count tiebreak below decides between
+# them; 0.0 (the default for any domain that does not declare one) restores the exact
+# previous behaviour.
+#
+# Why this exists. The sort key has had "action count, to break exact ties" as its third
+# element since the idle-strategy fix, and on a maker it has never once fired: score is
+# STARTING_SCORE plus a float sum of per-fill edges, so two strategies are never exactly
+# equal and key 3 is unreachable. Key 2 therefore decides every rank, at full float
+# precision, including differences that are pure noise.
+#
+# Measured on the 2026-09-04 11:29 population, per-fill edge standard deviations taken
+# from the strategies' own fill logs:
+#
+#   strategy               fills    edge$      SE$      t
+#   clone_9a01206e0398       600  +0.0796   0.0299   +2.67
+#   clone_d33603fa8c47       411  +0.0695   0.0558   +1.25
+#   clone_030330c63839        16  +0.0027   0.0042   +0.64      <- ranked 3rd
+#   clone_03f305662921         4  +0.0023   0.0012   +1.89      <- ranked 6th
+#   seed_ab4cfe9349eb        776  -0.0214   0.0217   -0.98      <- ranked 79th
+#
+# Ranks 3 through 8 were separated by about a quarter of a cent, against standard errors
+# an order of magnitude larger. The consequence was not cosmetic: KEEP_TOP_N protects 8
+# strategies, and six of those slots were held by strategies with under 35 fills while
+# every strategy with a sample size worth learning from was culled. The population was
+# selecting on noise and discarding its own evidence -- five of the top eight had zero
+# fills in the preceding 24h, which the "Maker dead ends" report flagged in the same log
+# without anything acting on it.
+#
+# A cent is the right size for the maker domain because $0.01 is roughly the smallest
+# total edge that a few hundred fills can distinguish from zero there (the SE column
+# above). It is the DOMAIN's opinion, not the loop's, for the same reason RANK_GRACE_S is
+# -- read with getattr so every domain that has not thought about it is unaffected.
+SCORE_TIE_EPS = float(os.environ.get('SCORE_TIE_EPS',
+                                     getattr(DOMAIN, 'SCORE_TIE_EPS', 0.0)))
+
+# Hours the rank tiebreak looks back over, when the domain has an opinion. 0 (the default
+# for a domain that declares neither this nor recent_activity) keeps the lifetime count
+# from DOMAIN.activity, i.e. the previous behaviour exactly.
+#
+# This is the second half of the SCORE_TIE_EPS fix and exists because the first half was
+# measured to be insufficient. The epsilon made the tiebreak fire, which replaced ordering
+# on sub-cent noise with ordering on a LIFETIME fill count -- better, but the 2026-09-04
+# 12:22 cycle then protected six strategies whose fills were all historical: top-eight
+# lifetime counts 603/411/58/33/23/22/19/18 against 24h counts of 294/103/0/0/0/0/0/18,
+# with two of the zeros flagged by the domain's own dead-end report in the same log.
+# Ranking on a lifetime total makes rank partly a function of age, which is the failure
+# YOUNG_GRACE_S guards against from the other direction.
+TIEBREAK_WINDOW_H = float(os.environ.get('TIEBREAK_WINDOW_H',
+                                         getattr(DOMAIN, 'TIEBREAK_WINDOW_H', 0.0)))
+
+
+def _recent_counts(names):
+    """{name: fills within TIEBREAK_WINDOW_H}, or {} when the domain has no opinion.
+
+    Swallowed per name rather than in bulk: this feeds a sort, and one strategy with an
+    unreadable log must degrade to "0 recent fills" for that strategy rather than drop the
+    whole population back to lifetime ordering without saying so.
+    """
+    recent = getattr(DOMAIN, 'recent_activity', None)
+    if TIEBREAK_WINDOW_H <= 0 or not callable(recent):
+        return {}
+    out = {}
+    for name in names:
+        try:
+            out[name] = int(recent(name, TIEBREAK_WINDOW_H))
+        except Exception:
+            out[name] = 0
+    return out
+
+
+def _rank_score(score):
+    """`score` rounded down to a multiple of SCORE_TIE_EPS, for ORDERING only.
+
+    Never used for display, for max_score, or for MIN_LIVE_SCORE: quantizing a promotion
+    gate would let a strategy a hair under the bar round up to it, which is the opposite
+    of what this is for. -inf (a strategy whose state could not be read this cycle) and
+    NaN pass through untouched so they keep sorting last.
+    """
+    if SCORE_TIE_EPS <= 0 or score != score or score in (float('inf'), -float('inf')):
+        return score
+    return math.floor(score / SCORE_TIE_EPS) * SCORE_TIE_EPS
 
 # Repos whose contents decide how real money moves. Watched every cycle by
 # check_boundary_integrity(); see that function for why. Not the domain's business: these
@@ -1726,17 +1810,55 @@ def run():
         #    beats every strategy holding the asset. See IDLE_GRACE_S for the measurement.
         #    This is what stops the loop cloning its own dead ends.
         # 2. Score, as always.
-        # 3. Action count, to break exact ties. Strategies inside the grace period all sit
-        #    at exactly their starting balance, so without this the ordering of a 45-way
-        #    tie is just the insertion order of strategy_state.json -- the same names won
-        #    and lost every cycle, and the "best" strategy handed to the revision agent
-        #    was arbitrary. Among equals, prefer the one that has demonstrated something.
-        performances.sort(key=lambda x: (x[0] not in idle_names, x[1],
+        # 2b. Score QUANTIZED to SCORE_TIE_EPS, so that key 3 can actually fire. See that
+        #    constant: the raw score is a float sum over fills and is therefore never
+        #    exactly equal between two strategies, which made key 3 dead code and let
+        #    differences far below the measurement noise decide who lives.
+        # 3. RECENT action count (TIEBREAK_WINDOW_H), to break ties. Strategies inside the
+        #    grace period all sit at exactly their starting balance, so without this the
+        #    ordering of a 45-way tie is just the insertion order of strategy_state.json
+        #    -- the same names won and lost every cycle, and the "best" strategy handed to
+        #    the revision agent was arbitrary. Among equals, prefer the one that has
+        #    demonstrated something LATELY; see TIEBREAK_WINDOW_H for why "lately" and not
+        #    "ever". Falls back to the lifetime count when the domain has no opinion.
+        # 4. Lifetime action count, to break ties in key 3. Most of a tie band has zero
+        #    recent fills, and among those the one with more history is still the better
+        #    bet -- this is the old key 3, kept as the innermost one so nothing that used
+        #    to be ordered becomes arbitrary again.
+        #
+        # Only the ORDERING is quantized. The score that is printed, stored in max_score
+        # and tested against MIN_LIVE_SCORE is the raw one, because those are statements
+        # about the strategy rather than comparisons between two of them.
+        recent_counts = _recent_counts(list(state))
+        performances.sort(key=lambda x: (x[0] not in idle_names, _rank_score(x[1]),
+                                         recent_counts.get(x[0], trade_counts.get(x[0], 0)),
                                          trade_counts.get(x[0], 0)), reverse=True)
-        print('Strategy performances (score):')
+        # Printed at a finer resolution than SCORE_TIE_EPS, and the header says how the
+        # order was decided. Both matter because this log is what the next emperor pass
+        # reads. At the old fixed 2dp a score of 999.999107 PRINTED as "1000.00" while
+        # _rank_score floored it to 999.99, so the board showed a 999.99 sitting above
+        # three 1000.00s and read as a broken sort. Rounding must not be able to cross a
+        # bucket boundary that the ordering respects.
+        #
+        # Within a bucket the raw scores still look unsorted -- that is the whole point of
+        # the epsilon, and the header is what stops the next reader "fixing" it.
+        if SCORE_TIE_EPS > 0:
+            digits = max(2, -int(math.floor(math.log10(SCORE_TIE_EPS))) + 2)
+            print(f'Strategy performances (score; ranked by score bucketed to '
+                  f'{SCORE_TIE_EPS:g}, then by fills -- see SCORE_TIE_EPS):')
+        else:
+            digits = 2
+            print('Strategy performances (score):')
+        # Both counts are printed when the tiebreak is windowed. Printing only the
+        # lifetime one while ordering on the recent one is the same trap the score digits
+        # above fix: a board whose visible numbers do not explain its own order gets
+        # "corrected" by the next reader.
         for name, score in performances:
             tag = '  [idle: never traded]' if name in idle_names else ''
-            print(f'  {name}: {score:.2f} ({trade_counts.get(name, 0)} trades){tag}')
+            counts = f'{trade_counts.get(name, 0)} trades'
+            if recent_counts:
+                counts += f', {recent_counts.get(name, 0)} in {TIEBREAK_WINDOW_H:g}h'
+            print(f'  {name}: {score:.{digits}f} ({counts}){tag}')
 
         # Fully swallowed, like the live/paper report below: a reporting bug must never
         # cost a monitoring cycle.

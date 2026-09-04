@@ -629,12 +629,38 @@ def replay(strategy_dir=None, days=7, spec='XLM', config=None, quote_fn=None,
             continue
         ticks += 1
         mid = row['dex_mid']
+        # cex_mid/basis_bp/tradeable_bp and `_row` are here to make this dict the SAME
+        # dict template_repo_maker.current_book() builds live. They were missing until
+        # 2026-09-04, and the asymmetry was worse than the omission: live already passed
+        # `_row`, so a revision that reached for book['_row']['cex_mid'] ran correctly
+        # against the real market and read None all the way through its own replay. The
+        # backtest then scored the strategy as if the signal contributed nothing, and the
+        # gate selected against the only measured predictor in the recorded data.
+        #
+        # No lookahead is introduced: every field comes off `row`, the tick the strategy
+        # is being asked to quote on, exactly like dex_bid/dex_ask already do.
+        #
+        # What that predictor is, measured over 41.7k recorded rows / 766h on 2026-09-04:
+        # basis_bp = (dex_mid - cex_mid) / cex_mid * 1e4, and the DEX mid MEAN-REVERTS
+        # toward the CEX mid. Forward 5-minute dex_mid return, by basis bucket:
+        #     basis in [-20, -3] bp (DEX cheap) -> +0.98 bp    n=7401
+        #     |basis| < 3 bp                    -> +0.19 bp    n=20935
+        #     basis in [+3, +20] bp (DEX rich)  -> -0.46 bp    n=12287
+        # The sign held in all four quarters of the window (the spread decayed from 1.9 bp
+        # to 0.6 bp, so refit before trusting a magnitude -- tools/basis_signal.py --study).
+        # Outside +/-20 bp it inverts and is NOT a mean-reversion signal; clip, do not
+        # extrapolate. Against a book whose gross capture is ~3.4 bp per unit volume and
+        # whose adverse selection eats 82-92% of it, ~1.4 bp of directional
+        # discrimination is the whole missing edge, not a rounding term.
         book = {'bid': row['dex_bid'], 'ask': row['dex_ask'], 'mid': mid,
                 'spread_bp': _spread_bp(row),
                 'bids': row.get('bids') or [], 'asks': row.get('asks') or [],
                 'bid_depth_usd': row.get('bid_depth_usd'),
                 'ask_depth_usd': row.get('ask_depth_usd'),
-                'ts': row['ts']}
+                'cex_mid': row.get('cex_mid'),
+                'basis_bp': row.get('basis_bp'),
+                'tradeable_bp': row.get('tradeable_bp'),
+                'ts': row['ts'], '_row': row}
         if row.get('bid_cum') and row.get('ask_cum'):
             ladder_ticks += 1
 

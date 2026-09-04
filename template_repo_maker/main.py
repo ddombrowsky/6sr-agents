@@ -38,6 +38,10 @@ history, and it must not touch the network. Everything it needs is in `book`:
     book['spread_bp']                          the current spread
     book['bids'], book['asks']                 the near ladder, [{'p','usd'}, ...]
     book['bid_depth_usd'], book['ask_depth_usd']
+    book['cex_mid']                            the contemporaneous centralized-exchange
+                                               mid, or None when the CEX feed was down
+    book['basis_bp']                           (dex_mid - cex_mid) / cex_mid * 1e4
+    book['tradeable_bp']                       basis net of round-trip friction
 
 and everything about the strategy's own position is in `state`:
 
@@ -70,6 +74,49 @@ recorded tape:
   * The edge decays to zero if the quote takes more than ~10 seconds to reach the book.
   * Adverse selection ate 82-92% of gross spread capture at every width. Inventory
     management was worth more than the width.
+  * THE ONE PREDICTOR IN THE RECORDED DATA IS `book['basis_bp']`, and until 2026-09-04 no
+    strategy could see it: the replay's book dropped the field, so anything built on it
+    scored as noise and was selected against. Measured over 41.7k rows / 766h, the DEX mid
+    MEAN-REVERTS toward the CEX mid -- forward 5-minute dex_mid return by bucket:
+
+        basis in [-20, -3] bp  (DEX cheap vs CEX)  ->  +0.98 bp   n=7401
+        |basis| < 3 bp                             ->  +0.19 bp   n=20935
+        basis in [+3, +20] bp  (DEX rich  vs CEX)  ->  -0.46 bp   n=12287
+
+    The sign held in every one of the four quarters of that window; the magnitude decayed
+    from a 1.9 bp cheap-minus-rich spread to 0.6 bp, so refit before trusting a number
+    (`python3 /opt/tools/basis_signal.py --study`). OUTSIDE +/-20 bp the relationship
+    inverts -- both tails go negative -- so clip the basis, never extrapolate it.
+
+    Adverse selection IS this signal seen from the losing side: the fill that picks you
+    off is disproportionately the one landing on your resting bid while the DEX is rich
+    and about to fall. Two ways to act on it were replayed over 14 days on 2026-09-04
+    (18,935 rows / 434,561 trades, template rule at 3 bp / $4 a side). ONE OF THEM WORKS:
+
+      * SKEWING the quote by the forecast -- MEASURED NOT TO PAY. k=1/2/4 all came in at
+        or below baseline (-0.60 / -0.63 / -0.59 against -0.57). The forecast is worth
+        tenths of a bp and the adverse move is worth ~1.4 bp, so repricing gives up
+        capture without dodging the fill. Do not spend a slot rediscovering this.
+      * STANDING DOWN the exposed side -- works. Declining the fill beats repricing it:
+        +0.20 net at a 6 bp threshold, +0.27 at 4 bp, against -0.57 baseline. It is not
+        just "trade less": at matched uptime a RANDOM gate scores -0.90 to -1.71 and the
+        REVERSED-sign gate -0.27 to -0.84. Only the correctly-signed gate turns positive.
+
+    It is additive with a plain book-spread gate (stand down when spread_bp is narrow):
+    spread>=7 alone +0.52, basis 6 alone +0.20, both +1.07 at +1.28 bp/fill.
+
+    HOW BIG, HONESTLY. Split those 14 days in half and they are opposite regimes -- the
+    baseline loses $2.26 in the first half and makes $1.68 in the second. The gates cut
+    the losing half's loss by 73% and are a WASH on total net in the winning half (they
+    earn more per fill on 35% fewer fills). Edge per fill improves in both halves
+    (-3.27 -> -1.42 bp, +2.73 -> +4.23 bp), and that is the statistic to believe. This
+    makes fills better; it does not make every regime profitable. No threshold is baked
+    in -- `basis_standdown_bp` defaults to 0 (OFF) and the grid was non-monotone, so it
+    is a knob for the population to search, not a constant to copy.
+
+    `/opt/tools/basis_signal.py` has both forms as pure functions, is safe to import from
+    quote() (it reads nothing and touches no network), and its `--study` mode refits the
+    coefficients against whatever history exists now.
 
 See MAKER_PHASE1.md.
 
@@ -208,11 +255,18 @@ def current_book():
     spread_bp = row.get('spread_bp')
     if spread_bp is None and row.get('dex_bid') and row.get('dex_ask'):
         spread_bp = round((row['dex_ask'] - row['dex_bid']) / row['dex_mid'] * 10000.0, 2)
+    # cex_mid/basis_bp/tradeable_bp are lifted out of the row explicitly rather than left
+    # for a strategy to dig out of `_row`, because maker_backtest.replay() builds the same
+    # three keys off the same recorded row. Reaching through `_row` used to work live and
+    # read None in replay; naming them here and there is what keeps the two books one book.
     return {'bid': row.get('dex_bid'), 'ask': row.get('dex_ask'),
             'mid': row.get('dex_mid'), 'spread_bp': spread_bp,
             'bids': row.get('bids') or [], 'asks': row.get('asks') or [],
             'bid_depth_usd': row.get('bid_depth_usd'),
             'ask_depth_usd': row.get('ask_depth_usd'),
+            'cex_mid': row.get('cex_mid'),
+            'basis_bp': row.get('basis_bp'),
+            'tradeable_bp': row.get('tradeable_bp'),
             'ts': row.get('ts'), '_row': row}
 
 

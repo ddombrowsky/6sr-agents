@@ -811,8 +811,9 @@ _DOMAIN_TOOL_NAMES = {
     'forecast': frozenset({'backtest_forecast_strategy'}),
     'kalshi': frozenset({'backtest_kalshi_strategy'}),
     'sdex_maker': frozenset({
-        'backtest_maker_strategy', 'get_tape_stats', 'get_friction', 'get_market_history',
-        'get_market_regime', 'get_dex_cex_basis', 'get_price_history',
+        'backtest_maker_strategy', 'sweep_maker_config', 'get_tape_stats', 'get_friction',
+        'get_market_history', 'get_market_regime', 'get_dex_cex_basis',
+        'get_price_history',
     }),
 }
 
@@ -2338,6 +2339,51 @@ def _explore_prompt_kalshi(strategy_name, strategy_path, leaderboard, tick_line)
     )
 
 
+# Shared tails for the two maker prompts. Kept as module constants rather than inlined
+# twice: the refine and explore paths must describe the same measured facts, and the last
+# time they drifted apart the explore path spent weeks telling spawns to write a decide()
+# the maker domain has never called.
+_MAKER_BASIS_BRIEF = (
+    'A SIGNAL THE POPULATION IS NOT USING. `book` now carries `cex_mid`, `basis_bp` and '
+    '`tradeable_bp` alongside the order-book fields, in live trading and in '
+    '`backtest_maker_strategy` alike (they were dropped from the replay until 2026-09-04, '
+    'which is why nothing in the population uses them -- anything built on them used to '
+    'score as noise). `basis_bp` is (dex_mid - cex_mid) / cex_mid * 1e4, and the DEX mid '
+    'mean-reverts toward the CEX mid. Measured over 41.7k recorded rows: a DEX cheap by '
+    '3-20 bp is followed by +0.98 bp over the next 5 minutes, a DEX rich by 3-20 bp by '
+    '-0.46 bp. The sign held in all four quarters of the window.\n\n'
+    'What was replayed over 14 days (18,935 rows / 434,561 trades), so you do not have to '
+    'rediscover it:\n'
+    '  * SKEWING the quote by the forecast DOES NOT PAY -- three lean strengths all came '
+    'in at or below baseline. Do not spend this slot on it.\n'
+    '  * STANDING DOWN the exposed side DOES: stop bidding when the DEX is rich beyond a '
+    'threshold, stop offering when it is cheap. +0.20 to +0.27 net against a -0.57 '
+    'baseline. At matched uptime a random gate scores -0.90 to -1.71 and a '
+    'reversed-sign gate -0.27 to -0.84, so this is the signal and not just quoting less.\n'
+    '  * It is ADDITIVE with a plain book-spread gate: spread>=7bp alone +0.52, basis '
+    'alone +0.20, both +1.07 at +1.28 bp/fill.\n'
+    '  * Honestly sized: split in half, those 14 days are opposite regimes. The gates cut '
+    'the losing half\'s loss by 73% and are a wash on total net in the winning half. Edge '
+    'PER FILL improves in both (-3.27 -> -1.42 bp, +2.73 -> +4.23 bp). It makes fills '
+    'better; it does not make every regime profitable.\n\n'
+    '`/opt/tools/basis_signal.py` has this as pure functions (`drift_bp`, `side_allowed`) '
+    'that are safe to import and call from `quote()` -- no file reads, no network, and '
+    'they replay identically. No threshold is baked in: `basis_standdown_bp` defaults to '
+    '0 (off) and the threshold grid was non-monotone, so treat the numbers above as a '
+    'direction to search, not constants to copy.\n\n'
+)
+
+_MAKER_SWEEP_BRIEF = (
+    'ON TUNING CONFIG: use `sweep_maker_config` rather than a write_file/'
+    'backtest_maker_strategy loop. It replays a whole grid of config values against the '
+    'same recorded book and tape in ONE call and returns the ranked table. The last few '
+    'revision cycles each spent 15-30 sequential tool calls hand-climbing one knob at a '
+    'time, which is slower, adds ~4k tokens of context per step, and searches one '
+    'dimension at a time so it cannot see an interaction. Sweep first, then write the '
+    'winning config once.\n\n'
+)
+
+
 def _refine_prompt_maker(strategy_name, parent_name, strategy_path, parent_score,
                           leaderboard, price_line) -> str:
     """The maker domain's clone case. Parallel to _refine_prompt, minus the
@@ -2366,11 +2412,13 @@ def _refine_prompt_maker(strategy_name, parent_name, strategy_path, parent_score
         f"edit to change quoting logic, not just config.json):\n```python\n{clone_main_py}\n```\n\n"
         f'Current leaderboard (strategy name -> score, all strategies currently '
         f'running, including any you revised in previous cycles): {json.dumps(leaderboard)}\n\n'
+        f'{_MAKER_BASIS_BRIEF}'
         f'Revise the clone at `{strategy_path}` however you think will improve on its '
         f'parent, then commit your changes to a new git branch inside that directory. '
         f'The entry point is `quote(book, state, config)` -- test your revision with '
         f'`backtest_maker_strategy` and check that `decide_source` is '
-        f'"main.py:quote" and `beats_null` is true before committing.'
+        f'"main.py:quote" and `beats_null` is true before committing.\n\n'
+        f'{_MAKER_SWEEP_BRIEF}'
     )
 
 
@@ -2430,6 +2478,8 @@ def _explore_prompt_maker(strategy_name, strategy_path, leaderboard, price_line)
         f'not a fallback) and `beats_null` must come back true. Run '
         f'`backtest_maker_strategy` and iterate until it passes. Do NOT add a '
         f'`decide()` wrapper -- the entry point is `quote()`, not `decide()`.\n\n'
+        f'{_MAKER_BASIS_BRIEF}'
+        f'{_MAKER_SWEEP_BRIEF}'
         f'Commit your changes to a new git branch inside `{strategy_path}` when done.'
     )
 

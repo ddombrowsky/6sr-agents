@@ -449,6 +449,46 @@ def backtest_maker_strategy(strategy_path: str, days: float = 7) -> str:
         return f'error: {type(e).__name__}: {e}'
 
 
+def sweep_maker_config(strategy_path: str, grid: dict, days: float = 7,
+                       split_halves: bool = True) -> str:
+    """Replay a maker over a whole grid of config values in one call.
+
+    The bulk form of backtest_maker_strategy, and the reason it exists is visible in any
+    recent revision log: tuning one knob by writing config.json and re-running the single
+    backtest costs 15-30 model round trips, re-loads the same 400k-trade tape every time,
+    and hill-climbs one dimension at a time on a surface whose knobs interact.
+
+    `grid` is {config_key: [values, ...]}; the cross product is replayed on top of the
+    strategy's own config.json, with the unmodified config included as a `baseline` row.
+    Nothing is written -- the caller writes the winning config once, itself.
+
+    `split_halves` re-runs the top rows on each half of the window separately. Left ON by
+    default deliberately: the top row of a grid is the best of N noisy draws and is biased
+    upward by the search that produced it, and the cheapest available check on that is
+    whether it survives in both halves of the tape.
+
+    Imported lazily for the same reason backtest_maker_strategy is.
+    """
+    try:
+        import maker_sweep
+        if isinstance(grid, str):
+            # Models pass a JSON string here about as often as a dict; both are the same
+            # request, and refusing one of them buys nothing but a wasted turn.
+            grid = json.loads(grid)
+        result = maker_sweep.sweep(strategy_path, grid, days=float(days),
+                                   split_halves=bool(split_halves))
+        if isinstance(result, dict) and result.get('decide_source') not in (
+                None, 'main.py:quote'):
+            result['WARNING'] = (
+                f"decide_source is {result.get('decide_source')!r}: quote() could NOT be "
+                f"imported from main.py, so EVERY row here describes the mechanical "
+                f"config-genome fallback rather than this strategy's code. Fix the "
+                f"structure first (see backtest_maker_strategy's warning), then re-sweep.")
+        return json.dumps(result)
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
+
+
 def backtest_kalshi_strategy(strategy_path: str, rebuild: bool = False) -> str:
     """Replay a Kalshi strategy over a fixed set of already-resolved real markets.
 
@@ -610,6 +650,7 @@ TOOLS = {
     'backtest_forecast_strategy': backtest_forecast_strategy,
     'backtest_yield_strategy': backtest_yield_strategy,
     'backtest_maker_strategy': backtest_maker_strategy,
+    'sweep_maker_config': sweep_maker_config,
     'get_tape_stats': get_tape_stats,
     'backtest_kalshi_strategy': backtest_kalshi_strategy,
     'get_price_history': get_price_history,

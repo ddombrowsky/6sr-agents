@@ -424,6 +424,38 @@
   {
     "type": "function",
     "function": {
+      "name": "sweep_maker_config",
+      "description": "Replay a market-making strategy over a GRID of config values in ONE call and return every result ranked by net edge. Use this instead of a write_file/backtest_maker_strategy loop whenever you are tuning config knobs -- it replays the cross product against the same recorded book and tape, so N configs cost one data load instead of N, and it lets you sweep two interacting knobs together (quote_size_usd against inventory_band_usd, half_width_bp against min_spread_bp) rather than hill-climbing one at a time. The strategy's unmodified config is included as the 'baseline' row. NOTHING IS WRITTEN: pick a row and write that config yourself. Reading the result: the top row is the best of N noisy draws and is biased upward by the search, so prefer net_bp_per_fill over net_edge_usd, check 'trades' (rows under 100 fills carry a WARNING and should not be ranked on), and prefer a row whose net_first_half and net_second_half are BOTH positive over one with a bigger total that is positive in only one half. Max 64 combinations.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "strategy_path": {
+            "type": "string",
+            "description": "Absolute path to the strategy directory."
+          },
+          "grid": {
+            "type": "object",
+            "description": "Config keys mapped to the list of values to try, e.g. {\"min_spread_bp\": [3, 5, 7, 9], \"quote_size_usd\": [2, 4]}. The full cross product is replayed on top of the strategy's own config.json."
+          },
+          "days": {
+            "type": "number",
+            "description": "Days of recorded book and tape to replay. Default 7."
+          },
+          "split_halves": {
+            "type": "boolean",
+            "description": "Also replay the top rows on each half of the window separately, to show whether a setting works in both. Default true."
+          }
+        },
+        "required": [
+          "strategy_path",
+          "grid"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "get_tape_stats",
       "description": "Executed-trade statistics for XLM/USDC over the last N hours, bucketed by trade size. Answers the sizing questions the order book cannot: how many trades per hour print at or above the size you would quote, how much volume that is, how one-sided the aggressing flow has been (taker_buy_pct), and what share was liquidity-pool flow no resting offer could have captured. Note the flow is roughly balanced over a week but wildly one-sided over any single hour, so do not calibrate an inventory rule on a short window.",
       "parameters": {
