@@ -123,6 +123,68 @@ _PUBNET_LIFECYCLE_PREFIX = 'offer_'
 _PUBNET_IGNORED_ACTIONS = frozenset({'wind_down_sell'})
 
 
+# Fallback direction table, for lines whose `live` record carries no side.
+#
+# An explicit table, not `action.startswith('buy')`, which is what _returns used to test.
+# A maker writes `maker_buy` and `maker_sell` (quote_executor._apply_fill) and neither
+# starts with "buy", so every maker BUY replayed as a sell: the live-sized book was run
+# backwards through the whole window, which is the number a maker's promotion is judged
+# on. Unknown actions return None and are skipped rather than defaulting to a side --
+# defaulting is exactly how this broke.
+_BUY_ACTIONS = frozenset({'buy', 'maker_buy'})
+_SELL_ACTIONS = frozenset({'sell', 'maker_sell', 'wind_down_sell'})
+
+
+def _direction(entry):
+    """+1 bought, -1 sold, None if this line's direction cannot be established.
+
+    `live.side` FIRST, because on the taker path it is the only reliable answer: the
+    action is a free-form label the strategy chooses and execute_trade takes the real
+    direction as a separate `side` argument ("normalized 'buy' | 'sell' -- the only thing
+    used to decide which balance to move"). template_repo/main.py already logs
+    `cover_stoploss`, a BUY whose name says nothing of the sort and which the old prefix
+    test replayed as a sell.
+
+    The action table is the fallback, for the maker path -- quote_executor's live record
+    carries `detected`/`amount_usd` but no side -- and for any line predating `live`.
+    """
+    side = (entry.get('live') or {}).get('side')
+    if side in ('buy', 'sell'):
+        return 1 if side == 'buy' else -1
+    action = entry.get('action') or ''
+    if action in _BUY_ACTIONS:
+        return 1
+    if action in _SELL_ACTIONS:
+        return -1
+    return None
+
+
+def _filled_usd(entry, live):
+    """What actually filled on this line, in USD.
+
+    `live.amount_usd` is authoritative whenever it is there. It is absent on every maker
+    line written before quote_executor started passing it, and those lines read back as
+    $0.00 filled -- on clone_9a01206e0398 that hid $118.07 of the $120.16 it really
+    filled, reporting realized_ratio 0.018 and a live-sized return of -0.01% against a
+    paper +1.06%.
+
+    The fallback is the line's OWN top-level amount_usd, and ONLY for a maker fill
+    (`detected == 'reconcile'`, which only quote_executor._apply_fill sets). There the
+    two are the same number: _apply_fill is handed the reconciled fill and logs it as the
+    trade's notional. It must never be applied to a taker line, where the top-level
+    amount_usd is what was REQUESTED and the fill is whatever survived stellar_trader's
+    caps -- reading a request as a fill is the overstatement this whole module exists to
+    catch. A line with neither still reads 0.0, which understates, and understating is
+    the safe direction for a promotion gate.
+    """
+    live = live or {}
+    if live.get('amount_usd') is not None:
+        return float(live['amount_usd'] or 0.0)
+    if live.get('detected') == 'reconcile':
+        return float(entry.get('amount_usd') or 0.0)
+    return 0.0
+
+
 def _pubnet_cross_check(name, since, log_submitted, log_usd):
     """Compare the paper log's recorded fills against stellar_trader's own ledger.
 
@@ -236,7 +298,7 @@ def report(name=None, since=None):
             unrecorded += 1
             continue
         attempts += 1
-        filled = float(lv.get('amount_usd') or 0.0)
+        filled = _filled_usd(e, lv)
         if lv.get('submitted'):
             submitted += 1
             live_usd += filled
@@ -359,7 +421,11 @@ def _returns(entries):
     amount_xlm = float(first.get('amount_xlm') or 0.0)
     usd = float(first.get('balance_usd') or 0.0)
     held = float(first.get('balance_xlm') or 0.0)
-    if (first.get('action') or '').startswith('buy'):
+    first_dir = _direction(first)
+    if first_dir is None:
+        return {'return_note': f'cannot establish the direction of the opening trade '
+                               f'({first.get("action")!r}); returns not computed'}
+    if first_dir > 0:
         usd, held = usd + amount_usd, held - amount_xlm
     else:
         usd, held = usd - amount_usd, held + amount_xlm
@@ -377,20 +443,41 @@ def _returns(entries):
         return {'return_note': 'could not reconstruct a starting net worth'}
 
     live_usd_bal, live_xlm = usd, held
+    # How much of the real fill flow the no-short/no-credit clamps below refused to
+    # replay. Reported, not silently absorbed: the clamp models a real constraint, but it
+    # is applied to fills that DEMONSTRABLY happened on-chain, starting from the PAPER
+    # book's inventory rather than the real account's. On a maker that is not a detail --
+    # clone_9a01206e0398 really sold 315.70 XLM against 298.55 bought (net -17.14), and
+    # the replay, starting from 12.97 paper XLM, dropped 58 XLM of those sells and ended
+    # +40.85 long instead. A live-sized return computed off a book that inverted the
+    # strategy's net position is not measuring the strategy, and the reader has to be
+    # able to see when that has happened.
+    clamped_sell_xlm = clamped_buy_usd = 0.0
     for e in xlm:
         lv = e.get('live') or {}
         if not lv.get('submitted'):
             continue
-        price = float(e.get('price') or 0)
-        filled = float(lv.get('amount_usd') or 0.0)
-        if price <= 0 or filled <= 0:
+        # fill_price, not price: the log's `price` is a REFERENCE -- the mid for a
+        # maker (quote_executor._apply_fill logs `mid or price`), the pre-slippage
+        # reference for a taker. Replaying transactions at mid prices a maker's buys and
+        # its sells at the same number, which erases the spread capture that is the
+        # entire source of its P&L: on clone_9a01206e0398 every fill sits 2-20 bp inside
+        # the mid and all of it was being discarded. Marking (price0/price_last below)
+        # stays on the mid, which is the right price to value inventory at.
+        price = float(e.get('fill_price') or e.get('price') or 0)
+        filled = _filled_usd(e, lv)
+        direction = _direction(e)
+        if price <= 0 or filled <= 0 or direction is None:
             continue
-        if (e.get('action') or '').startswith('buy'):
+        if direction > 0:
             spend = min(filled, live_usd_bal)
+            clamped_buy_usd += filled - spend
             live_usd_bal -= spend
             live_xlm += spend / price
         else:
-            sell = min(filled / price, live_xlm)
+            want = filled / price
+            sell = min(want, live_xlm)
+            clamped_sell_xlm += want - sell
             live_xlm -= sell
             live_usd_bal += sell * price
 
@@ -400,7 +487,7 @@ def _returns(entries):
     live_net = live_usd_bal + live_xlm * price_last
     paper_pct = (paper_net - start_net) / start_net * 100
     live_pct = (live_net - start_net) / start_net * 100
-    return {'start_net_worth': round(start_net, 6),
+    out = {'start_net_worth': round(start_net, 6),
             'paper_net_worth': round(paper_net, 6),
             'live_sized_net_worth': round(live_net, 6),
             'last_price': price_last,
@@ -409,6 +496,16 @@ def _returns(entries):
             'paper_return_pct': round(paper_pct, 4),
             'live_sized_return_pct': round(live_pct, 4),
             'return_gap_pct': round(paper_pct - live_pct, 4)}
+    if clamped_sell_xlm > 1e-9 or clamped_buy_usd > 1e-9:
+        out['replay_clamped'] = {
+            'sell_xlm': round(clamped_sell_xlm, 4),
+            'buy_usd': round(clamped_buy_usd, 6),
+            'note': ('real fills the replay could not book: it starts from the PAPER '
+                     'book\'s inventory and may not go short or spend past its cash, so '
+                     'this much of what actually filled on-chain was dropped. '
+                     'live_sized_return_pct is unreliable while this is material'),
+        }
+    return out
 
 
 def summary_line(name=None):
@@ -432,6 +529,17 @@ def summary_line(name=None):
     if r.get('paper_return_pct') is not None:
         parts.append(f"paper {r['paper_return_pct']:+.2f}% vs "
                      f"live-sized {r['live_sized_return_pct']:+.2f}%")
+        # Loud, and right after the number it disqualifies: a live-sized return computed
+        # off a replay that had to drop real fills is not a measurement of the strategy.
+        clamped = r.get('replay_clamped') or {}
+        if clamped:
+            dropped = ', '.join(
+                bit for bit in
+                (f"{clamped['sell_xlm']:.2f} XLM of sells" if clamped['sell_xlm'] else '',
+                 f"${clamped['buy_usd']:.2f} of buys" if clamped['buy_usd'] else '')
+                if bit)
+            parts.append(f"live-sized UNRELIABLE: replay dropped {dropped} that really "
+                         f"filled (paper-book inventory, no shorting)")
     elif r.get('return_note'):
         parts.append(r['return_note'])
     if r.get('borrowed_xlm'):
