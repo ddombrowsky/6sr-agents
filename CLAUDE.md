@@ -97,12 +97,24 @@ trading-agent system (`master_agent/`, `template_repo/`, `tools/`, `strategies/`
   `emperor-agent.py`, `sr_agent_tools.py` and `tools.json` in, backing up the previous
   copy into `v/agents/bak.<random>/` first (skipped entirely on a fresh volume, where
   there is nothing to back up). It also copies `master_agent/*`, `tools/*`, every
-  `template_repo*/*` in `SYNCED_DIRS` and `scripts/*.sh` across — with **flat globs**, so a
-  new file must be flat inside those directories or it will silently not deploy. A new
+  `template_repo*/*` in `SYNCED_DIRS` and `scripts/*.{sh,py}` across — with **flat globs**,
+  so a new file must be flat inside those directories or it will silently not deploy. A new
   template repo has to be added to `SYNCED_DIRS`; `create.sh` refuses to bootstrap a domain
   whose template is missing from it, because that volume would freeze at creation time.
-- `./copy.sh` (no args) — `v/` → root: copies `v/agents/*` to the repo root and
-  `v/{master_agent,tools,template_repo}/*` over their root-level counterparts.
+- `./copy.sh` (no args) — `v/` → root: copies `v/agents/*` to the repo root,
+  `v/{master_agent,tools,template_repo*}/*` over their root-level counterparts, and
+  `v/*.{sh,py}` back into `scripts/`.
+
+`scripts/` is the host-side home of the files that sit at the *top* of `v/`
+(== `/opt/…` in the container): `main.py`, `once.sh`, `st.sh`, `selftest.sh`,
+`startall-strats.sh`, `restart_monitor.py`, `pubnet_tally.py`, `pubnet_summary.py`. Both
+directions carry `.py` as well as `.sh` — a report added there deploys with no edit to
+`copy.sh`. Two things that direction deliberately skips: `scripts/env.sh` is **deleted**
+before the copy so a host key never lands in the volume, and `copy_files` skips symlinks,
+which is why `v/monitor.py`, `v/strat_manager.py`, `v/leaderboard.py` and
+`v/live_report.py` — links into `master_agent/`, recreated at the end of the `--to`
+branch — never come back as second real copies inside `scripts/` that would then drift
+from the modules they point at.
 
 The top-level `master_agent/`, `template_repo/`, and `tools/` directories in *this* repo
 (not `v/`) are the git-tracked mirror maintained by that no-arg direction, so their
