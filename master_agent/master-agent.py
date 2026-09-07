@@ -29,7 +29,7 @@ _FACTS = _DOMAIN.prompt_facts()
 
 MODEL_NICKNAMES = {
     'gpt': 'gpt-oss:120b-cloud',
-    'glm': 'glm-5.2:cloud',
+    'glm': 'glm-5.3-flash:cloud',
     'qwen': 'qwen3.5',
     'buck': 'wonderful_buck_321/sixsr',
     'granite': 'granite4.1:8b',
