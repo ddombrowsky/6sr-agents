@@ -47,21 +47,42 @@ logs a short-sell exactly like any other sell, so the per-trade ledger below can
 them apart; that liability is reported separately rather than guessed at per-trade. See
 _read_short_buffer.
 
+Every view ends with claudio's currently resting offers, read from Horizon (see
+_open_offers). Those are the other half of a maker's real position: the fills above are
+what already happened, the open orders are what the account is still exposed to, and
+neither log on disk is authoritative about the second -- an offer we believe is resting
+may have filled, and one we believe was cancelled may not have been.
+
   python3 /opt/pubnet_tally.py                  # one summary line per strategy + grand total
   python3 /opt/pubnet_tally.py <name>           # full trade-by-trade running tally for one strategy
   python3 /opt/pubnet_tally.py <name> --fills   # same, but hide the offer lifecycle rows
   python3 /opt/pubnet_tally.py --all            # merged running tally across every strategy, in time order
   python3 /opt/pubnet_tally.py --json           # machine-readable summary
+  python3 /opt/pubnet_tally.py --no-orders      # skip the open-orders section (no Horizon call)
 """
+import calendar
 import json
+import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
 TRADES_DIR = Path('/opt/trades')
 SHORT_BUFFER_PATH = TRADES_DIR / '.short_buffer.json'
 LIVE_STRATEGY_FILE = Path('/opt/live_strategy.json')
+
+HORIZON = 'https://horizon.stellar.org'
+IDENTITY = 'claudio'
+# Fallback only -- the address is resolved from the `stellar` CLI first, so this cannot
+# quietly report on the wrong account if the identity is ever re-keyed. Same pair of
+# constants pubnet_summary.py carries, for the same reason.
+FALLBACK_ADDRESS = 'GBTFQJ6VARJYI2C6JLPUXQ4CAKRNJF3KEYXXJ5T74DV47RSSNIJCH5VM'
+USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN'
+USDC_SPEC = f'USDC:{USDC_ISSUER}'
+OFFERS_TIMEOUT = 20
 
 # Which action names move a position, and in which direction.
 #
@@ -402,6 +423,178 @@ def _current_xlm_price(fallback=None):
     return fallback
 
 
+def _resolve_address(override=None):
+    """claudio's pubnet address: the `stellar` CLI first, FALLBACK_ADDRESS if it isn't
+    there. Returns (address, source) so the report can say which it used -- a tally
+    printed against the hardcoded address after a re-key would be silently wrong."""
+    if override:
+        return override, 'command line'
+    try:
+        result = subprocess.run(['stellar', 'keys', 'address', IDENTITY],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip(), f'`stellar keys address {IDENTITY}`'
+    except Exception:
+        pass
+    return FALLBACK_ADDRESS, 'hardcoded fallback (stellar CLI unavailable)'
+
+
+def _asset_spec(obj, prefix=''):
+    """Canonical 'XLM' or 'CODE:ISSUER' out of Horizon's asset_type/code/issuer triple."""
+    if obj.get(prefix + 'asset_type') == 'native':
+        return 'XLM'
+    code, issuer = obj.get(prefix + 'asset_code'), obj.get(prefix + 'asset_issuer')
+    return f'{code}:{issuer}' if code and issuer else '?'
+
+
+def _open_offers(address=None):
+    """Every offer claudio currently has resting, straight from Horizon.
+
+    ON-CHAIN TRUTH, not a local ledger, and that is the whole point of showing it here:
+    the tally above is reconstructed from log lines, and a log line says what this system
+    *believes* it did. An offer it thinks is resting may have filled and an offer it
+    thinks it cancelled may still be on the book.
+
+    Read with urllib against Horizon rather than by importing stellar_trader.open_offers,
+    for the two reasons the rest of this file is written the way it is: this report has no
+    business importing the trading stack (or requiring `requests`), and open_offers()
+    filters to the XLM/USDC pair this system trades, whereas the question here is what is
+    resting on the account at all -- including anything this code did not put there.
+
+    Returns (offers, error). `error` is a string when Horizon could not be reached, which
+    callers must show rather than print an empty list: "unknown" is not "none resting".
+    """
+    address = address or _resolve_address()[0]
+    query = urllib.parse.urlencode({'limit': 200, 'order': 'asc'})
+    try:
+        with urllib.request.urlopen(f'{HORIZON}/accounts/{address}/offers?{query}',
+                                    timeout=OFFERS_TIMEOUT) as resp:
+            records = json.load(resp).get('_embedded', {}).get('records') or []
+    except Exception as e:
+        return [], f'{type(e).__name__}: {e}'
+
+    offers = []
+    for record in records:
+        selling = _asset_spec(record.get('selling') or {})
+        buying = _asset_spec(record.get('buying') or {})
+        try:
+            amount = float(record.get('amount') or 0.0)
+            price = float(record.get('price') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        # `amount` is denominated in the asset being sold and `price` is buying-units per
+        # selling-unit, so amount * price is what the offer would receive if it filled in
+        # full. Only one of the two legs is USDC on this account's book, so the USD
+        # notional is whichever side that is -- and None for a pair with no USDC leg,
+        # rather than a guessed mark.
+        proceeds = amount * price
+        if selling == USDC_SPEC:
+            usd = amount
+        elif buying == USDC_SPEC:
+            usd = proceeds
+        else:
+            usd = None
+        # 'ask' and 'bid' are the maker's own vocabulary for the XLM/USDC book (matching
+        # stellar_trader.open_offers): selling XLM is an ask, buying XLM is a bid. Any
+        # other pair gets no side label rather than a wrong one.
+        if selling == 'XLM':
+            side = 'ask'
+        elif buying == 'XLM':
+            side = 'bid'
+        else:
+            side = '-'
+        offers.append({
+            'id': str(record.get('id')),
+            'side': side,
+            'selling': selling,
+            'buying': buying,
+            'amount': amount,
+            'price': price,
+            'proceeds': proceeds,
+            'usd': usd,
+            # XLM per USDC on a bid, USDC per XLM on an ask: quoted the way the book is,
+            # so the two sides of a maker's quote are directly comparable.
+            'price_xlm_usdc': (price if selling == 'XLM'
+                               else (1.0 / price if (buying == 'XLM' and price) else None)),
+            'last_modified': _epoch_iso(record.get('last_modified_time')),
+        })
+    offers.sort(key=lambda o: (o['side'], -(o['price_xlm_usdc'] or 0.0)))
+    return offers, None
+
+
+def _epoch_iso(text):
+    """Horizon's '2026-09-07T12:34:56Z' -> epoch seconds, 0 if absent or unparseable.
+
+    calendar.timegm, not time.mktime -- these stamps are UTC and mktime reads its
+    argument as local time, which would age every offer by the running UTC offset (four
+    hours here, and an hour more or less twice a year). Same note pubnet_summary._epoch
+    carries.
+    """
+    if not text:
+        return 0
+    try:
+        return calendar.timegm(time.strptime(text, '%Y-%m-%dT%H:%M:%SZ'))
+    except Exception:
+        return 0
+
+
+def _fmt_age(ts):
+    if not ts:
+        return '?'
+    seconds = max(0, int(time.time() - ts))
+    if seconds < 3600:
+        return f'{seconds // 60}m'
+    if seconds < 86400:
+        return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
+    return f'{seconds // 86400}d{(seconds % 86400) // 3600:02d}h'
+
+
+def _print_open_offers(offers=None, error=None, address=None, address_source=None):
+    """The open-orders section every text view ends with.
+
+    Deliberately last and deliberately separate from the P&L above: a resting offer is
+    not a fill, contributes nothing to realized or unrealized P&L, and must never be
+    added into any of the totals -- that conflation is the bug this file's docstring
+    opens with.
+    """
+    if offers is None and error is None:
+        address, address_source = _resolve_address() if address is None else (address, address_source)
+        offers, error = _open_offers(address)
+    print(f"\nOPEN ORDERS  {IDENTITY} {address or '?'}"
+          + (f"  (via {address_source})" if address_source else ''))
+    if error:
+        print(f"  UNKNOWN -- could not read Horizon: {error}")
+        print("  (not the same as 'none resting'; the account may well have live offers)")
+        return
+    if not offers:
+        print('  none resting')
+        return
+    print(f"  {'id':14} {'side':5} {'pair':26} {'amount':>14} {'price':>12} "
+          f"{'usd':>9} {'age':>8}")
+    for o in offers:
+        pair = f"{_short_spec(o['selling'])} -> {_short_spec(o['buying'])}"
+        price = o['price_xlm_usdc'] if o['price_xlm_usdc'] is not None else o['price']
+        usd = f"{o['usd']:9.4f}" if o['usd'] is not None else f"{'-':>9}"
+        print(f"  {o['id'][:14]:14} {o['side']:5} {pair:26} "
+              f"{o['amount']:14.4f} {price:12.6f} {usd} {_fmt_age(o['last_modified']):>8}")
+    per_side = {}
+    for o in offers:
+        if o['usd'] is not None:
+            per_side[o['side']] = per_side.get(o['side'], 0.0) + o['usd']
+    if per_side:
+        summary = ', '.join(f'{side} {usd:.4f} USD' for side, usd in sorted(per_side.items()))
+        print(f"  {len(offers)} resting; notional if fully filled: {summary}")
+    print('  (resting offers, not fills -- no part of any P&L total above)')
+
+
+def _short_spec(spec, width=12):
+    """'USDC:GA5Z...KZVN' rather than the full 56-character issuer."""
+    if ':' not in spec:
+        return spec
+    code, issuer = spec.split(':', 1)
+    return f'{code}:{issuer[:4]}..{issuer[-4:]}' if len(issuer) > width else spec
+
+
 def _print_buffer_footer(fallback_price=None, baseline_total=None, baseline_label='TOTAL',
                           total_xlm_qty=None):
     """Shared text-mode footer for print_verbose/print_summary/print_merged so the short
@@ -489,7 +682,7 @@ def print_verbose(name, events, show_offers=True):
         total_xlm_qty=(xlm_ledger.qty if xlm_ledger else 0.0) if is_live else None)
 
 
-def print_summary(names, as_json=False):
+def print_summary(names, as_json=False, show_orders=True):
     rows = []
     grand_total = 0.0
     fallback_price, fallback_ts = None, -1
@@ -541,6 +734,11 @@ def print_summary(names, as_json=False):
                     if buffer['baseline_xlm'] is not None and live_xlm_qty is not None else None)
 
     if as_json:
+        # Resting offers are fetched here rather than by main() so the JSON view carries
+        # them too, and are reported as a sibling of the P&L -- never folded into
+        # grand_total_pl, which counts fills only.
+        address, address_source = _resolve_address() if show_orders else (None, None)
+        offers, offers_error = _open_offers(address) if show_orders else ([], None)
         print(json.dumps({
             'strategies': rows,
             'grand_total_pl': round(grand_total, 4),
@@ -563,6 +761,15 @@ def print_summary(names, as_json=False):
                 'note': ('baseline_xlm + live strategy\'s own trade-log net; net of short '
                          'buffer; baseline is hand-set and only valid for the strategy live '
                          'when it was set'),
+            },
+            'open_orders': {
+                'checked': show_orders,
+                'account': address,
+                'account_source': address_source,
+                # null (not []) when Horizon could not be read: "unknown" is not "none".
+                'offers': None if offers_error else offers,
+                'error': offers_error,
+                'note': ('resting offers on-chain, not fills; no part of any P&L above'),
             },
         }, indent=2))
         return
@@ -628,6 +835,7 @@ def main():
     merged = '--all' in sys.argv
     fills_only = '--fills' in sys.argv
     show_offers = '--offers' in sys.argv
+    show_orders = '--no-orders' not in sys.argv
 
     names = _strategy_names()
     if not names:
@@ -642,7 +850,14 @@ def main():
     elif merged:
         print_merged(names, show_offers=show_offers)
     else:
-        print_summary(names, as_json=as_json)
+        print_summary(names, as_json=as_json, show_orders=show_orders)
+        if as_json:
+            return  # the JSON payload already carries open_orders
+
+    # Last, after every view: what the account still has resting. One call site so the
+    # section cannot drift between the three text views.
+    if show_orders:
+        _print_open_offers()
 
 
 if __name__ == '__main__':
