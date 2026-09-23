@@ -1184,7 +1184,44 @@ def ensure_trading_cushion(target_usd=None) -> dict:
     return {'topped_up_usd': spent, 'chunks': chunks, 'reason': None}
 
 
-def wind_down() -> dict:
+def _cushion_handover_usd(requested):
+    """How much XLM value wind_down may hand to the incoming leader instead of selling.
+
+    A leader change flattens the outgoing strategy and then, seconds later, calls
+    ensure_trading_cushion() to buy back up to MIN_LIVE_TRADING_CUSHION_USD of the very
+    asset it just sold. Both legs cross the spread, so the overlap is pure friction.
+    Observed 2026-08-24: clone_f43df64b3ded wind_down_sold 41.6662 XLM in two chunks at
+    15:21:50-56 ($8.00, $0.192001/XLM); clone_3e987c5823b9 bought 104.0068 XLM back in
+    five chunks at 15:22:01-32 ($20.00, $0.192295/XLM). Re-buying just the 41.6662 XLM
+    cost $8.0122 -- $0.0122 (~15bp) and four avoidable swaps, every leader change.
+
+    So the sell leg stops at whatever the buy leg is about to re-fund. Two clamps, and
+    they are the reason this is a function rather than a parameter used as passed:
+
+      * MIN_LIVE_TRADING_CUSHION_USD is the ceiling. keep_usd arrives from a domain
+        module, which the revision agent may rewrite; wind_down is the money boundary,
+        so a caller cannot turn "hold back the cushion" into "hold back the position".
+      * Zero unless the cushion buy would actually happen. ensure_trading_cushion
+        refuses under PAPER_ONLY and while halted, and a retained cushion nobody re-buys
+        is just an unflattened position -- exactly what wind_down exists to prevent. On
+        those paths the flatten stays total.
+
+    Callers that promote nobody afterwards leave keep_usd at 0 and are unaffected:
+    domain_sdex_maker.retire_live is one (that domain declares no ensure_trading_cushion,
+    so monitor's getattr finds nothing and no cushion is ever bought back).
+    """
+    try:
+        requested = float(requested or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if requested <= 0:
+        return 0.0
+    if _paper_only() or _halted():
+        return 0.0
+    return min(requested, MIN_LIVE_TRADING_CUSHION_USD)
+
+
+def wind_down(keep_usd=0.0) -> dict:
     """Liquidate claudio's real XLM position back to USDC, down to the operating floor.
 
     Called by monitor.py's promote_live_strategy when swapping the live strategy — not
@@ -1225,18 +1262,28 @@ def wind_down() -> dict:
     the asset permanently, suspends non-XLM buys, and halts everything past
     MAX_STUCK_USD, which is what makes that trade-off safe.
 
-    Returns {'liquidated', 'remaining_xlm', 'chunks', 'reason', 'legs', 'stuck'}.
-    monitor.promote_live_strategy gates on 'liquidated' and reports 'remaining_xlm';
-    both now measure the *sellable* balance, i.e. net of MIN_TRUSTLINE_RESERVE_XLM. That is
-    the load-bearing half of the floor: measuring 'liquidated' against raw spendable
+    keep_usd holds back that much XLM *value* from the native leg -- and only the native
+    leg; every non-XLM leg is still flattened completely, because nothing buys those back.
+    It is for the leader-change path only, where the incoming strategy's cushion buy would
+    otherwise immediately reverse this sell; see _cushion_handover_usd for the clamps and
+    the incident. Default 0.0 keeps every other caller's flatten total. 'liquidated' is
+    measured net of the retained amount, so the handover still completes the leader change.
+
+    Returns {'liquidated', 'remaining_xlm', 'retained_xlm', 'chunks', 'reason', 'legs',
+    'stuck'}. monitor.promote_live_strategy gates on 'liquidated' and reports
+    'remaining_xlm'; both now measure the *sellable* balance, i.e. net of
+    MIN_TRUSTLINE_RESERVE_XLM. That is the load-bearing half of the floor: measuring 'liquidated' against raw spendable
     would leave it permanently False once the floor is reached, and a leader change
     would then never complete -- trading one stuck state for a worse one.
     """
     if _paper_only():
-        return {"liquidated": False, "remaining_xlm": 0.0, "chunks": 0,
+        return {"liquidated": False, "remaining_xlm": 0.0, "retained_xlm": 0.0,
+                "chunks": 0,
                 "reason": "PAPER_ONLY is set; refusing to liquidate a real position",
                 "legs": [], "stuck": []}
 
+    keep_usd = _cushion_handover_usd(keep_usd)
+    keep_xlm = 0.0
     chunks = 0
     legs = []
 
@@ -1288,18 +1335,29 @@ def wind_down() -> dict:
 
         price = get_price()
         if price is None:
-            return {"liquidated": False, "remaining_xlm": remaining, "chunks": chunks,
+            return {"liquidated": False, "remaining_xlm": remaining,
+                    "retained_xlm": min(remaining, keep_xlm), "chunks": chunks,
                     "reason": "no price available", "legs": legs,
                     "stuck": [l['spec'] for l in legs if l['stuck']]}
 
-        chunk_usd = min(remaining * price, MAX_TRADE_USD)
+        # Re-priced every pass rather than converted once: the loop can run for minutes
+        # across MAX_TRADE_USD chunks, and the cushion is a USD target on both legs.
+        keep_xlm = keep_usd / price if keep_usd else 0.0
+        sellable = remaining - keep_xlm
+        if sellable <= _XLM_DUST:
+            # Position already at or under the cushion the promotion is about to buy:
+            # hand it over whole rather than selling it and buying it straight back.
+            break
+
+        chunk_usd = min(sellable * price, MAX_TRADE_USD)
         send_amount = chunk_usd / price
         dest_min = chunk_usd * (1 - _SLIPPAGE)
         try:
             tx_hash = _swap(spend_spec="XLM", send_amount=send_amount,
                             dest_spec=_USDC_SPEC, dest_min=dest_min)
         except Exception as e:
-            return {"liquidated": False, "remaining_xlm": remaining, "chunks": chunks,
+            return {"liquidated": False, "remaining_xlm": remaining,
+                    "retained_xlm": min(remaining, keep_xlm), "chunks": chunks,
                     "reason": str(e), "legs": legs,
                     "stuck": [l['spec'] for l in legs if l['stuck']]}
 
@@ -1307,12 +1365,19 @@ def wind_down() -> dict:
         chunks += 1
 
     remaining_xlm = _sellable_xlm(_account(_source_address()))
+    retained_xlm = min(remaining_xlm, keep_xlm)
     stuck = [l['spec'] for l in legs if l['stuck']]
-    if remaining_xlm > _XLM_DUST:
-        return {"liquidated": False, "remaining_xlm": remaining_xlm, "chunks": chunks,
+    # Net of what is being handed over, for the same reason 'liquidated' has always been
+    # measured net of MIN_TRUSTLINE_RESERVE_XLM: a verdict that counted the retained
+    # cushion as un-flattened would be permanently False and no leader change would ever
+    # complete.
+    if remaining_xlm - retained_xlm > _XLM_DUST:
+        return {"liquidated": False, "remaining_xlm": remaining_xlm,
+                "retained_xlm": retained_xlm, "chunks": chunks,
                 "reason": "chunk limit reached this cycle, will retry",
                 "legs": legs, "stuck": stuck}
-    return {"liquidated": True, "remaining_xlm": remaining_xlm, "chunks": chunks,
+    return {"liquidated": True, "remaining_xlm": remaining_xlm,
+            "retained_xlm": retained_xlm, "chunks": chunks,
             "reason": f'{len(stuck)} leg(s) stuck' if stuck else None,
             "legs": legs, "stuck": stuck}
 
